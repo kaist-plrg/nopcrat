@@ -24,6 +24,7 @@
 #![warn(unused_extern_crates)]
 #![feature(rustc_private)]
 #![feature(iter_intersperse)]
+#![feature(map_try_insert)]
 
 extern crate rustc_data_structures;
 extern crate rustc_driver;
