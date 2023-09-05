@@ -1,0 +1,12 @@
+[package]
+name = "nopcrat"
+version = "1.0.0"
+authors = ["Jaemin Hong <hjm0901@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4.2", features = ["derive"] }
+rustfix = "0.6.1"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
