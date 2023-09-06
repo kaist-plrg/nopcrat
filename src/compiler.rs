@@ -2,11 +2,11 @@ use std::{collections::BTreeMap, path::Path};
 
 use etrace::some_or;
 use rustc_hir::{
-    def::Res, def_id::DefId, intravisit, intravisit::Visitor, ForeignItemKind, HirId, ItemKind,
-    QPath, TyKind, VariantData,
+    def::Res, def_id::DefId, intravisit, intravisit::Visitor, FnDecl, FnRetTy, ForeignItemKind,
+    HirId, ItemKind, QPath, TyKind, VariantData,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
-use rustc_span::Span;
+use rustc_span::{source_map::SourceMap, Span};
 
 use crate::compile_util;
 
@@ -66,8 +66,8 @@ pub fn rename_unnamed(path: &Path) {
             next_idx += 1;
 
             for item in items {
-                let p = compile_util::span_to_path(item.span, source_map).unwrap();
-                let v = suggestions.entry(p).or_default();
+                let file = compile_util::span_to_path(item.span, source_map).unwrap();
+                let v = suggestions.entry(file).or_default();
 
                 let snippet = compile_util::span_to_snippet(item.ident.span, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, &new_name);
@@ -122,6 +122,29 @@ impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FunSig {
+    name: String,
+    params: Vec<String>,
+    ret: String,
+}
+
+impl FunSig {
+    fn new(name: String, decl: &FnDecl<'_>, source_map: &SourceMap) -> Self {
+        let params = decl
+            .inputs
+            .iter()
+            .map(|ty| source_map.span_to_snippet(ty.span).unwrap())
+            .collect();
+        let ret = if let FnRetTy::Return(ty) = &decl.output {
+            source_map.span_to_snippet(ty.span).unwrap()
+        } else {
+            "()".to_string()
+        };
+        Self { name, params, ret }
+    }
+}
+
 pub fn deduplicate(path: &Path) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
@@ -129,9 +152,10 @@ pub fn deduplicate(path: &Path) {
         let hir = tcx.hir();
 
         let mut functions = BTreeMap::new();
-        let mut foreigns: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut ffunctions: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut ftypes: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut uspans = BTreeMap::new();
-        let mut types: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut structs: BTreeMap<_, Vec<_>> = BTreeMap::new();
         let mut impls = BTreeMap::new();
         let mut dir = path.to_path_buf();
         dir.pop();
@@ -139,25 +163,32 @@ pub fn deduplicate(path: &Path) {
         for id in hir.items() {
             let item = hir.item(id);
             let name = item.ident.name.to_ident_string();
-            let p = some_or!(compile_util::span_to_path(item.span, source_map), continue);
+            let file = some_or!(compile_util::span_to_path(item.span, source_map), continue);
             match &item.kind {
-                ItemKind::Fn(_, _, _) => {
-                    let rp = mk_rust_path(&dir, &p, &name);
-                    functions.insert(name, rp);
+                ItemKind::Fn(sig, _, _) => {
+                    let rp = mk_rust_path(&dir, &file, &name);
+                    let sig = FunSig::new(name, sig.decl, source_map);
+                    functions.insert(sig, rp);
                 }
                 ItemKind::ForeignMod { items, .. } => {
-                    let v = foreigns.entry(p).or_default();
+                    let fv = ffunctions.entry(file.clone()).or_default();
+                    let ft = ftypes.entry(file).or_default();
                     for item in items.iter() {
                         let item = hir.foreign_item(item.id);
-                        if !matches!(item.kind, ForeignItemKind::Fn(_, _, _)) {
-                            continue;
-                        }
                         let name = item.ident.name.to_ident_string();
-                        v.push((name, item.span));
+                        let span = source_map.span_extend_to_line(item.span);
+                        match &item.kind {
+                            ForeignItemKind::Fn(decl, _, _) => {
+                                let sig = FunSig::new(name, decl, source_map);
+                                fv.push((sig, span));
+                            }
+                            ForeignItemKind::Type => ft.push((name, span)),
+                            _ => {}
+                        }
                     }
                 }
                 ItemKind::Struct(_, _) | ItemKind::Union(_, _) => {
-                    types.entry(name).or_default().push((p, item.span));
+                    structs.entry(name).or_default().push((file, item.span));
                 }
                 ItemKind::Enum(_, _) => unreachable!("{:?}", item),
                 ItemKind::Impl(i) => {
@@ -165,13 +196,13 @@ pub fn deduplicate(path: &Path) {
                         let seg = path.segments.last().unwrap();
                         let name = seg.ident.name.to_ident_string().to_string();
                         let span = source_map.span_extend_to_line(item.span);
-                        impls.insert((p, name), span);
+                        impls.insert((file, name), span);
                     }
                 }
                 ItemKind::Use(path, _) => {
                     let seg = path.segments.last().unwrap();
                     if seg.ident.name.to_ident_string() == "libc" {
-                        uspans.insert(p, item.span.shrink_to_hi());
+                        uspans.insert(file, item.span.shrink_to_hi());
                     }
                 }
                 _ => {}
@@ -180,23 +211,18 @@ pub fn deduplicate(path: &Path) {
 
         let mut suggestions: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
-        for (p, fs) in foreigns {
+        for (p, fs) in ffunctions {
             let mut v = vec![];
+            let uspan = uspans.get(&p).unwrap();
 
-            let fspan = uspans.get(&p).unwrap();
-            let (rps, spans): (Vec<_>, Vec<_>) = fs
-                .into_iter()
-                .filter_map(|(f, span)| functions.get(&f).map(|rp| (rp, span)))
-                .unzip();
+            for (sig, span) in fs {
+                let rp = some_or!(functions.get(&sig), continue);
 
-            for rp in rps {
                 let stmt = format!("\nuse {};", rp);
-                let snippet = compile_util::span_to_snippet(*fspan, source_map);
+                let snippet = compile_util::span_to_snippet(*uspan, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, &stmt);
                 v.push(suggestion);
-            }
 
-            for span in spans {
                 let snippet = compile_util::span_to_snippet(span, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, "");
                 v.push(suggestion);
@@ -207,20 +233,41 @@ pub fn deduplicate(path: &Path) {
             }
         }
 
-        for (name, mut ts) in types {
-            let path = ts.pop().unwrap().0;
-            let rp = mk_rust_path(&dir, &path, &name);
-            for (path, span) in ts {
-                let v = suggestions.entry(path.clone()).or_default();
+        let mut struct_map = BTreeMap::new();
 
-                let fspan = uspans.get(&path).unwrap();
+        for (name, mut ts) in structs {
+            let file = ts.pop().unwrap().0;
+            let rp = mk_rust_path(&dir, &file, &name);
+            struct_map.insert(name.clone(), rp.clone());
+
+            for (file, span) in ts {
+                let v = suggestions.entry(file.clone()).or_default();
+
+                let uspan = uspans.get(&file).unwrap();
                 let stmt = format!("\nuse {};", rp);
-                let snippet = compile_util::span_to_snippet(*fspan, source_map);
+                let snippet = compile_util::span_to_snippet(*uspan, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, &stmt);
                 v.push(suggestion);
 
-                let impl_span = impls.get(&(path.clone(), name.clone())).unwrap();
+                let impl_span = impls.get(&(file.clone(), name.clone())).unwrap();
                 let span = span.with_lo(impl_span.lo());
+                let snippet = compile_util::span_to_snippet(span, source_map);
+                let suggestion = compile_util::make_suggestion(snippet, "");
+                v.push(suggestion);
+            }
+        }
+
+        for (file, ts) in ftypes {
+            let v = suggestions.entry(file.clone()).or_default();
+            let uspan = uspans.get(&file).unwrap();
+            for (ty, span) in ts {
+                let rp = some_or!(struct_map.get(&ty), continue);
+
+                let stmt = format!("\nuse {};", rp);
+                let snippet = compile_util::span_to_snippet(*uspan, source_map);
+                let suggestion = compile_util::make_suggestion(snippet, &stmt);
+                v.push(suggestion);
+
                 let snippet = compile_util::span_to_snippet(span, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, "");
                 v.push(suggestion);
