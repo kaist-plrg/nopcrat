@@ -198,7 +198,7 @@ impl Emitter for SilentEmitter {
     }
 }
 
-const DEPS: [&str; 0] = [];
+const DEPS: [&str; 2] = ["c2rust_bitfields", "c2rust_asm_casts"];
 
 fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];

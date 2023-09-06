@@ -1,0 +1,8 @@
+[package]
+name = "x"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+c2rust-bitfields = "0.3"
+c2rust-asm-casts = "0.2"
