@@ -3,17 +3,19 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{Arc, Mutex},
 };
 
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
-    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler,
+    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler, Level,
 };
+use rustc_feature::UnstableFeatures;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_interface::Config;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{
-    config::{CheckCfg, ErrorOutputType, Input, Options},
+    config::{CheckCfg, CrateType, ErrorOutputType, Input, Options},
     EarlyErrorHandler,
 };
 use rustc_span::{
@@ -46,6 +48,8 @@ pub fn make_config(input: Input) -> Config {
             maybe_sysroot: Some(PathBuf::from(sys_root())),
             search_paths: opts.search_paths,
             externs: opts.externs,
+            unstable_features: UnstableFeatures::Allow,
+            crate_types: vec![CrateType::Rlib],
             ..Options::default()
         },
         crate_cfg: FxHashSet::default(),
@@ -65,6 +69,16 @@ pub fn make_config(input: Input) -> Config {
         make_codegen_backend: None,
         registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
     }
+}
+
+pub fn make_counting_config(input: Input) -> (Config, Arc<Mutex<usize>>) {
+    let mut config = make_config(input);
+    let arc = Arc::new(Mutex::new(0));
+    let emitter = CountingEmitter(arc.clone());
+    config.parse_sess_created = Some(Box::new(|ps| {
+        ps.span_diagnostic = Handler::with_emitter(Box::new(emitter));
+    }));
+    (config, arc)
 }
 
 pub fn str_to_input(code: &str) -> Input {
@@ -136,6 +150,31 @@ pub fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
             source_map.span_to_snippet(span).unwrap(),
             "".into(),
         ),
+    }
+}
+
+struct CountingEmitter(Arc<Mutex<usize>>);
+
+impl Translate for CountingEmitter {
+    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
+        None
+    }
+
+    fn fallback_fluent_bundle(&self) -> &FluentBundle {
+        panic!()
+    }
+}
+
+impl Emitter for CountingEmitter {
+    fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
+        if matches!(diag.level(), Level::Error { .. }) {
+            println!("{:?}", diag);
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+        None
     }
 }
 

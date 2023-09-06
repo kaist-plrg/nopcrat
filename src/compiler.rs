@@ -12,6 +12,16 @@ use crate::compile_util;
 
 const UNNAMED: &str = "C2RustUnnamed";
 
+pub fn check(path: &Path) -> bool {
+    let input = compile_util::path_to_input(path);
+    let (config, arc) = compile_util::make_counting_config(input);
+    compile_util::run_compiler(config, |_, tcx| {
+        let _ = tcx.analysis(());
+    });
+    let errors = *arc.lock().unwrap();
+    errors == 0
+}
+
 pub fn rename_unnamed(path: &Path) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
@@ -112,7 +122,7 @@ impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
     }
 }
 
-pub fn run(path: &Path) {
+pub fn deduplicate(path: &Path) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
     let suggestions = compile_util::run_compiler(config, |source_map, tcx| {
@@ -180,7 +190,7 @@ pub fn run(path: &Path) {
                 .unzip();
 
             for rp in rps {
-                let stmt = format!("use {};\n", rp);
+                let stmt = format!("\nuse {};", rp);
                 let snippet = compile_util::span_to_snippet(*fspan, source_map);
                 let suggestion = compile_util::make_suggestion(snippet, &stmt);
                 v.push(suggestion);
