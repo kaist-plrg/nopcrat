@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 c2rust-bitfields = "0.3"
 c2rust-asm-casts = "0.2"
+f128 = "0.2"
+num-traits = "0.2"

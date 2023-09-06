@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use etrace::ok_or;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler, Level,
@@ -198,30 +199,23 @@ impl Emitter for SilentEmitter {
     }
 }
 
-const DEPS: [&str; 2] = ["c2rust_bitfields", "c2rust_asm_casts"];
-
 fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];
 
-    if !DEPS.is_empty() {
-        let dep = "deps_crate/target/debug/deps";
+    let dep = "deps_crate/target/debug/deps";
+    if let Ok(dir) = std::fs::read_dir(dep) {
         args.push("-L".to_string());
         args.push(format!("dependency={}", dep));
 
-        let files: BTreeMap<_, _> = std::fs::read_dir(dep)
-            .unwrap()
-            .filter_map(|f| {
-                let f = f.ok()?;
-                let f = f.file_name().to_str().unwrap().to_string();
-                if !f.ends_with(".rlib") {
-                    return None;
-                }
-                let i = f.find('-')?;
-                Some((f[3..i].to_string(), f))
-            })
-            .collect();
-        for d in &DEPS {
-            let d = format!("{}={}/{}", d, dep, files.get(&d.to_string()).unwrap());
+        for f in dir {
+            let f = ok_or!(f, continue);
+            let f = f.file_name().to_str().unwrap().to_string();
+            if !f.ends_with(".rlib") {
+                continue;
+            }
+            let i = f.find('-').unwrap();
+            let name = f[3..i].to_string();
+            let d = format!("{}={}/{}", name, dep, f);
             args.push("--extern".to_string());
             args.push(d);
         }
