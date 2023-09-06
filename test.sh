@@ -12,7 +12,7 @@ to=$2
 rm -rf $to
 cp -r $from $to
 
-cargo run --release -- $to/c2rust-lib.rs
+cargo run --release --bin resolve -- $to/c2rust-lib.rs
 
 # nightly=`cat $to/rust-toolchain`
 # RUSTFLAGS=-Awarnings cargo +$nightly build --manifest-path $to/Cargo.toml

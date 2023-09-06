@@ -41,3 +41,4 @@ extern crate rustc_span;
 
 pub mod compile_util;
 pub mod compiler;
+pub mod resolve;
