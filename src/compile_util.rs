@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -9,7 +10,8 @@ use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_interface::{interface::Compiler, Config};
+use rustc_interface::Config;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::{
     config::{CheckCfg, ErrorOutputType, Input, Options},
     EarlyErrorHandler,
@@ -20,8 +22,21 @@ use rustc_span::{
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
-pub fn run_compiler<R: Send, F: FnOnce(&Compiler) -> R + Send>(config: Config, f: F) -> Option<R> {
-    rustc_driver::catch_fatal_errors(|| rustc_interface::run_compiler(config, f)).ok()
+pub fn run_compiler<R: Send, F: FnOnce(&SourceMap, TyCtxt<'_>) -> R + Send>(
+    config: Config,
+    f: F,
+) -> Option<R> {
+    rustc_driver::catch_fatal_errors(|| {
+        rustc_interface::run_compiler(config, |compiler| {
+            compiler.enter(|queries| {
+                queries.global_ctxt().ok()?.enter(|tcx| {
+                    let source_map = compiler.session().source_map();
+                    Some(f(source_map, tcx))
+                })
+            })
+        })
+    })
+    .ok()?
 }
 
 pub fn make_config(input: Input) -> Config {
@@ -68,6 +83,14 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
         Some(p)
     } else {
         None
+    }
+}
+
+pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &BTreeMap<P, Vec<Suggestion>>) {
+    for (path, suggestions) in suggestions {
+        let code = String::from_utf8(fs::read(path).unwrap()).unwrap();
+        let fixed = rustfix::apply_suggestions(&code, suggestions).unwrap();
+        fs::write(path, fixed.as_bytes()).unwrap();
     }
 }
 
