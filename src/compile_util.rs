@@ -51,6 +51,7 @@ pub fn make_config(input: Input) -> Config {
             externs: opts.externs,
             unstable_features: UnstableFeatures::Allow,
             crate_types: vec![CrateType::Rlib],
+            debug_assertions: false,
             ..Options::default()
         },
         crate_cfg: FxHashSet::default(),
