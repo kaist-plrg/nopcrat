@@ -1,10 +1,11 @@
-use std::{collections::HashSet, ops::Deref, path::Path};
+use std::{collections::BTreeSet, ops::Deref, path::Path};
 
 use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
         visit::Visitor, BasicBlock, BasicBlockData, Body, CallReturnPlaces, Location, Place,
-        Rvalue, Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
+        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorEdges,
+        TerminatorKind,
     },
     ty::TyKind,
 };
@@ -40,17 +41,21 @@ fn analyze(input: Input) {
             let def_id = item.item_id().owner_id.def_id.to_def_id();
             let body = tcx.optimized_mir(def_id);
 
-            let mut visitor = WriteVisitor::new();
-            visitor.visit_body(body);
-            let mut writes = visitor.0;
+            let ctxt = Ctxt { params };
 
-            let results = ReadAnalysis.into_engine(tcx, body).iterate_to_fixpoint();
+            let mut visitor = WriteVisitor::new(ctxt.clone());
+            visitor.visit_body(body);
+            let mut writes = visitor.places;
+
+            let results = ReadAnalysis::new(ctxt.clone())
+                .into_engine(tcx, body)
+                .iterate_to_fixpoint();
             let mut cursor = results.into_results_cursor(body);
             cursor.seek_to_block_start(BasicBlock::from_usize(0));
             let reads = &cursor.get().0;
 
             writes.retain(|place| {
-                let local = place.local.as_usize();
+                let local = place.local;
                 0 < local && local <= params && !reads.contains(place)
             });
 
@@ -58,7 +63,9 @@ fn analyze(input: Input) {
                 continue;
             }
 
-            let mut results = WriteAnalysis.into_engine(tcx, body).iterate_to_fixpoint();
+            let mut results = WriteAnalysis::new(ctxt)
+                .into_engine(tcx, body)
+                .iterate_to_fixpoint();
             let mut visitor = ReturnVisitor::new();
             results.visit_reachable_with(body, &mut visitor);
             let mut must_writes = visitor
@@ -97,70 +104,118 @@ fn analyze(input: Input) {
     });
 }
 
-struct WriteVisitor<'tcx>(HashSet<Place<'tcx>>);
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlacePath {
+    local: usize,
+    projections: Vec<usize>,
+}
 
-impl WriteVisitor<'_> {
-    fn new() -> Self {
-        Self(HashSet::new())
+impl std::fmt::Debug for PlacePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.local)?;
+        for proj in &self.projections {
+            write!(f, ".{}", proj)?;
+        }
+        Ok(())
     }
 }
 
-impl<'tcx> Visitor<'tcx> for WriteVisitor<'tcx> {
+impl From<&Place<'_>> for PlacePath {
+    fn from(place: &Place<'_>) -> Self {
+        let local = place.local.index();
+        let mut projections = vec![];
+        for proj in place.projection.iter() {
+            match proj {
+                ProjectionElem::Deref => {}
+                ProjectionElem::Field(idx, _) => projections.push(idx.index()),
+                _ => panic!("{:?}", place),
+            }
+        }
+        Self { local, projections }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Ctxt {
+    params: usize,
+}
+
+impl Ctxt {
+    fn is_ptr_param(&self, place: &Place<'_>) -> bool {
+        (1..=self.params).contains(&place.local.index()) && place.is_indirect_first_projection()
+    }
+}
+
+struct WriteVisitor {
+    ctxt: Ctxt,
+    places: BTreeSet<PlacePath>,
+}
+
+impl WriteVisitor {
+    fn new(ctxt: Ctxt) -> Self {
+        Self {
+            ctxt,
+            places: BTreeSet::new(),
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for WriteVisitor {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
-        if place.is_indirect_first_projection() {
-            self.0.insert(*place);
+        if self.ctxt.is_ptr_param(place) {
+            self.places.insert(From::from(place));
         }
         self.super_assign(place, rvalue, location);
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MayPlaceSet<'tcx>(HashSet<Place<'tcx>>);
+struct MayPlaceSet(BTreeSet<PlacePath>);
 
-impl<'tcx> MayPlaceSet<'tcx> {
+impl MayPlaceSet {
     fn bottom() -> Self {
-        Self(HashSet::new())
+        Self(BTreeSet::new())
     }
 }
 
-impl JoinSemiLattice for MayPlaceSet<'_> {
+impl JoinSemiLattice for MayPlaceSet {
     fn join(&mut self, other: &Self) -> bool {
         let mut b = false;
         for place in &other.0 {
-            b |= self.0.insert(*place);
+            b |= self.0.insert(place.clone());
         }
         b
     }
 }
 
-impl<'tcx> GenKill<Place<'tcx>> for MayPlaceSet<'tcx> {
-    fn gen(&mut self, place: Place<'tcx>) {
+impl GenKill<PlacePath> for MayPlaceSet {
+    fn gen(&mut self, place: PlacePath) {
         self.0.insert(place);
     }
 
-    fn kill(&mut self, place: Place<'tcx>) {
+    fn kill(&mut self, place: PlacePath) {
         self.0.remove(&place);
     }
 }
 
-impl<T> DebugWithContext<T> for MayPlaceSet<'_> {}
+impl<T> DebugWithContext<T> for MayPlaceSet {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MustPlaceSet<'tcx> {
+enum MustPlaceSet {
     All,
-    Set(HashSet<Place<'tcx>>),
+    Set(BTreeSet<PlacePath>),
 }
 
-impl<'tcx> MustPlaceSet<'tcx> {
+impl MustPlaceSet {
     fn bottom() -> Self {
         Self::All
     }
 
     fn top() -> Self {
-        Self::Set(HashSet::new())
+        Self::Set(BTreeSet::new())
     }
 
-    fn into_set(self) -> Option<HashSet<Place<'tcx>>> {
+    fn into_set(self) -> Option<BTreeSet<PlacePath>> {
         match self {
             Self::All => None,
             Self::Set(set) => Some(set),
@@ -168,7 +223,7 @@ impl<'tcx> MustPlaceSet<'tcx> {
     }
 }
 
-impl JoinSemiLattice for MustPlaceSet<'_> {
+impl JoinSemiLattice for MustPlaceSet {
     fn join(&mut self, other: &Self) -> bool {
         match (&mut *self, other) {
             (_, Self::All) => false,
@@ -185,27 +240,35 @@ impl JoinSemiLattice for MustPlaceSet<'_> {
     }
 }
 
-impl<'tcx> GenKill<Place<'tcx>> for MustPlaceSet<'tcx> {
-    fn gen(&mut self, place: Place<'tcx>) {
+impl GenKill<PlacePath> for MustPlaceSet {
+    fn gen(&mut self, place: PlacePath) {
         if let Self::Set(set) = self {
             set.insert(place);
         }
     }
 
-    fn kill(&mut self, place: Place<'tcx>) {
+    fn kill(&mut self, place: PlacePath) {
         if let Self::Set(set) = self {
             set.remove(&place);
         }
     }
 }
 
-impl<T> DebugWithContext<T> for MustPlaceSet<'_> {}
+impl<T> DebugWithContext<T> for MustPlaceSet {}
 
-struct ReadAnalysis;
+struct ReadAnalysis {
+    ctxt: Ctxt,
+}
+
+impl ReadAnalysis {
+    fn new(ctxt: Ctxt) -> Self {
+        Self { ctxt }
+    }
+}
 
 impl<'tcx> AnalysisDomain<'tcx> for ReadAnalysis {
     type Direction = Backward;
-    type Domain = MayPlaceSet<'tcx>;
+    type Domain = MayPlaceSet;
 
     const NAME: &'static str = "read_before_write";
 
@@ -225,12 +288,12 @@ impl<'tcx> Analysis<'tcx> for ReadAnalysis {
     ) {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, rvalue) = place_rvalue.deref();
-            if place.is_indirect_first_projection() {
-                state.kill(*place);
+            if self.ctxt.is_ptr_param(place) {
+                state.kill(From::from(place));
             }
             for place in rvalue_to_places(rvalue) {
-                if place.is_indirect_first_projection() {
-                    state.gen(place);
+                if self.ctxt.is_ptr_param(&place) {
+                    state.gen(From::from(&place));
                 }
             }
         }
@@ -254,11 +317,19 @@ impl<'tcx> Analysis<'tcx> for ReadAnalysis {
     }
 }
 
-struct WriteAnalysis;
+struct WriteAnalysis {
+    ctxt: Ctxt,
+}
+
+impl WriteAnalysis {
+    fn new(ctxt: Ctxt) -> Self {
+        Self { ctxt }
+    }
+}
 
 impl<'tcx> AnalysisDomain<'tcx> for WriteAnalysis {
     type Direction = Forward;
-    type Domain = MustPlaceSet<'tcx>;
+    type Domain = MustPlaceSet;
 
     const NAME: &'static str = "read_before_write";
 
@@ -280,8 +351,8 @@ impl<'tcx> Analysis<'tcx> for WriteAnalysis {
     ) {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, _) = place_rvalue.deref();
-            if place.is_indirect_first_projection() {
-                state.gen(*place);
+            if self.ctxt.is_ptr_param(place) {
+                state.gen(From::from(place));
             }
         }
     }
