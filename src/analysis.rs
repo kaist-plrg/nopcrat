@@ -1,13 +1,16 @@
 use std::{collections::HashSet, ops::Deref, path::Path};
 
 use rustc_hir::ItemKind;
-use rustc_middle::mir::{
-    visit::Visitor, BasicBlock, BasicBlockData, Body, CallReturnPlaces, Location, Place, Rvalue,
-    Statement, StatementKind, Terminator, TerminatorEdges,
+use rustc_middle::{
+    mir::{
+        visit::Visitor, BasicBlock, BasicBlockData, Body, CallReturnPlaces, Location, Place,
+        Rvalue, Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
+    },
+    ty::TyKind,
 };
 use rustc_mir_dataflow::{
-    fmt::DebugWithContext, lattice::JoinSemiLattice, Analysis, AnalysisDomain, Backward, Results,
-    ResultsVisitor,
+    fmt::DebugWithContext, lattice::JoinSemiLattice, Analysis, AnalysisDomain, Backward, Forward,
+    GenKill, Results, ResultsVisitor,
 };
 use rustc_session::config::Input;
 
@@ -55,14 +58,41 @@ fn analyze(input: Input) {
                 continue;
             }
 
+            let mut results = WriteAnalysis.into_engine(tcx, body).iterate_to_fixpoint();
+            let mut visitor = ReturnVisitor::new();
+            results.visit_reachable_with(body, &mut visitor);
+            let mut must_writes = visitor
+                .0
+                .unwrap_or_else(MustPlaceSet::top)
+                .into_set()
+                .unwrap();
+            must_writes.retain(|place| writes.contains(place));
+
+            let mut may_writes = writes;
+            may_writes.retain(|place| !must_writes.contains(place));
+
             let file = compile_util::span_to_path(item.span, source_map);
             let name = item.ident.name.to_ident_string();
             println!(
-                "{} {} {:?}",
+                "{} {} {:?} {:?}",
                 file.unwrap_or_default().as_os_str().to_str().unwrap(),
                 name,
-                writes
+                must_writes,
+                may_writes
             );
+
+            for (i, local) in body.local_decls.iter().enumerate() {
+                if i > params {
+                    break;
+                }
+                if let TyKind::RawPtr(tm) = local.ty.kind() {
+                    if let Some(adt_def) = tm.ty.ty_adt_def() {
+                        if adt_def.is_struct() {
+                            println!("{}: {:?}", i, adt_def.variants());
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -85,23 +115,15 @@ impl<'tcx> Visitor<'tcx> for WriteVisitor<'tcx> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlaceSet<'tcx>(HashSet<Place<'tcx>>);
+struct MayPlaceSet<'tcx>(HashSet<Place<'tcx>>);
 
-impl<'tcx> PlaceSet<'tcx> {
+impl<'tcx> MayPlaceSet<'tcx> {
     fn bottom() -> Self {
         Self(HashSet::new())
     }
-
-    fn gen(&mut self, place: Place<'tcx>) {
-        self.0.insert(place);
-    }
-
-    fn kill(&mut self, place: Place<'tcx>) {
-        self.0.remove(&place);
-    }
 }
 
-impl JoinSemiLattice for PlaceSet<'_> {
+impl JoinSemiLattice for MayPlaceSet<'_> {
     fn join(&mut self, other: &Self) -> bool {
         let mut b = false;
         for place in &other.0 {
@@ -111,18 +133,84 @@ impl JoinSemiLattice for PlaceSet<'_> {
     }
 }
 
-impl<T> DebugWithContext<T> for PlaceSet<'_> {}
+impl<'tcx> GenKill<Place<'tcx>> for MayPlaceSet<'tcx> {
+    fn gen(&mut self, place: Place<'tcx>) {
+        self.0.insert(place);
+    }
+
+    fn kill(&mut self, place: Place<'tcx>) {
+        self.0.remove(&place);
+    }
+}
+
+impl<T> DebugWithContext<T> for MayPlaceSet<'_> {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MustPlaceSet<'tcx> {
+    All,
+    Set(HashSet<Place<'tcx>>),
+}
+
+impl<'tcx> MustPlaceSet<'tcx> {
+    fn bottom() -> Self {
+        Self::All
+    }
+
+    fn top() -> Self {
+        Self::Set(HashSet::new())
+    }
+
+    fn into_set(self) -> Option<HashSet<Place<'tcx>>> {
+        match self {
+            Self::All => None,
+            Self::Set(set) => Some(set),
+        }
+    }
+}
+
+impl JoinSemiLattice for MustPlaceSet<'_> {
+    fn join(&mut self, other: &Self) -> bool {
+        match (&mut *self, other) {
+            (_, Self::All) => false,
+            (Self::All, _) => {
+                *self = other.clone();
+                true
+            }
+            (Self::Set(s1), Self::Set(s2)) => {
+                let len = s1.len();
+                s1.retain(|p| s2.contains(p));
+                s1.len() < len
+            }
+        }
+    }
+}
+
+impl<'tcx> GenKill<Place<'tcx>> for MustPlaceSet<'tcx> {
+    fn gen(&mut self, place: Place<'tcx>) {
+        if let Self::Set(set) = self {
+            set.insert(place);
+        }
+    }
+
+    fn kill(&mut self, place: Place<'tcx>) {
+        if let Self::Set(set) = self {
+            set.remove(&place);
+        }
+    }
+}
+
+impl<T> DebugWithContext<T> for MustPlaceSet<'_> {}
 
 struct ReadAnalysis;
 
 impl<'tcx> AnalysisDomain<'tcx> for ReadAnalysis {
     type Direction = Backward;
-    type Domain = PlaceSet<'tcx>;
+    type Domain = MayPlaceSet<'tcx>;
 
     const NAME: &'static str = "read_before_write";
 
     fn bottom_value(&self, _: &Body<'tcx>) -> Self::Domain {
-        PlaceSet::bottom()
+        MayPlaceSet::bottom()
     }
 
     fn initialize_start_block(&self, _: &Body<'tcx>, _: &mut Self::Domain) {}
@@ -144,6 +232,56 @@ impl<'tcx> Analysis<'tcx> for ReadAnalysis {
                 if place.is_indirect_first_projection() {
                     state.gen(place);
                 }
+            }
+        }
+    }
+
+    fn apply_terminator_effect<'mir>(
+        &mut self,
+        _: &mut Self::Domain,
+        terminator: &'mir Terminator<'tcx>,
+        _: Location,
+    ) -> TerminatorEdges<'mir, 'tcx> {
+        terminator.edges()
+    }
+
+    fn apply_call_return_effect(
+        &mut self,
+        _: &mut Self::Domain,
+        _: BasicBlock,
+        _: CallReturnPlaces<'_, '_>,
+    ) {
+    }
+}
+
+struct WriteAnalysis;
+
+impl<'tcx> AnalysisDomain<'tcx> for WriteAnalysis {
+    type Direction = Forward;
+    type Domain = MustPlaceSet<'tcx>;
+
+    const NAME: &'static str = "read_before_write";
+
+    fn bottom_value(&self, _: &Body<'tcx>) -> Self::Domain {
+        MustPlaceSet::bottom()
+    }
+
+    fn initialize_start_block(&self, _: &Body<'tcx>, state: &mut Self::Domain) {
+        *state = MustPlaceSet::top();
+    }
+}
+
+impl<'tcx> Analysis<'tcx> for WriteAnalysis {
+    fn apply_statement_effect(
+        &mut self,
+        state: &mut Self::Domain,
+        statement: &Statement<'tcx>,
+        _: Location,
+    ) {
+        if let StatementKind::Assign(place_rvalue) = &statement.kind {
+            let (place, _) = place_rvalue.deref();
+            if place.is_indirect_first_projection() {
+                state.gen(*place);
             }
         }
     }
@@ -200,14 +338,42 @@ fn rvalue_to_places<'tcx>(rvalue: &Rvalue<'tcx>) -> Vec<Place<'tcx>> {
     places
 }
 
+struct ReturnVisitor<'tcx, A: Analysis<'tcx>>(Option<A::Domain>);
+
+impl<'tcx, A: Analysis<'tcx>> ReturnVisitor<'tcx, A> {
+    fn new() -> Self {
+        Self(None)
+    }
+}
+
+impl<'mir, 'tcx, A: Analysis<'tcx>> ResultsVisitor<'mir, 'tcx, Results<'tcx, A>>
+    for ReturnVisitor<'tcx, A>
+{
+    type FlowState = A::Domain;
+
+    fn visit_terminator_before_primary_effect(
+        &mut self,
+        _: &Results<'tcx, A>,
+        state: &Self::FlowState,
+        terminator: &'mir Terminator<'tcx>,
+        _: Location,
+    ) {
+        if matches!(&terminator.kind, TerminatorKind::Return) {
+            self.0 = Some(state.clone());
+        }
+    }
+}
+
 struct DebugVisitor;
 
-impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for DebugVisitor {
-    type FlowState = PlaceSet<'tcx>;
+impl<'mir, 'tcx, D: std::fmt::Debug, A: Analysis<'tcx, Domain = D>>
+    ResultsVisitor<'mir, 'tcx, Results<'tcx, A>> for DebugVisitor
+{
+    type FlowState = D;
 
     fn visit_block_start(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         _: &Self::FlowState,
         _: &'mir BasicBlockData<'tcx>,
         block: BasicBlock,
@@ -217,7 +383,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for Deb
 
     fn visit_statement_before_primary_effect(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         state: &Self::FlowState,
         statement: &'mir Statement<'tcx>,
         _: Location,
@@ -228,7 +394,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for Deb
 
     fn visit_statement_after_primary_effect(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         state: &Self::FlowState,
         _: &'mir Statement<'tcx>,
         _: Location,
@@ -238,7 +404,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for Deb
 
     fn visit_terminator_before_primary_effect(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         state: &Self::FlowState,
         terminator: &'mir Terminator<'tcx>,
         _: Location,
@@ -249,7 +415,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for Deb
 
     fn visit_terminator_after_primary_effect(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         state: &Self::FlowState,
         _: &'mir Terminator<'tcx>,
         _: Location,
@@ -259,7 +425,7 @@ impl<'mir, 'tcx> ResultsVisitor<'mir, 'tcx, Results<'tcx, ReadAnalysis>> for Deb
 
     fn visit_block_end(
         &mut self,
-        _: &Results<'tcx, ReadAnalysis>,
+        _: &Results<'tcx, A>,
         _: &Self::FlowState,
         _: &'mir BasicBlockData<'tcx>,
         block: BasicBlock,
