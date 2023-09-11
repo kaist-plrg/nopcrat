@@ -1,5 +1,10 @@
-use std::{collections::BTreeSet, ops::Deref, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+    path::Path,
+};
 
+use rustc_abi::VariantIdx;
 use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
@@ -7,7 +12,7 @@ use rustc_middle::{
         ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorEdges,
         TerminatorKind,
     },
-    ty::TyKind,
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::{
     fmt::DebugWithContext, lattice::JoinSemiLattice, Analysis, AnalysisDomain, Backward, Forward,
@@ -41,7 +46,20 @@ fn analyze(input: Input) {
             let def_id = item.item_id().owner_id.def_id.to_def_id();
             let body = tcx.optimized_mir(def_id);
 
-            let ctxt = Ctxt { params };
+            let mut param_tys = BTreeMap::new();
+            for (i, local) in body.local_decls.iter().enumerate() {
+                if i == 0 {
+                    continue;
+                }
+                if i > params {
+                    break;
+                }
+                if let TyKind::RawPtr(tm) = local.ty.kind() {
+                    param_tys.insert(i, Type::from_ty(&tm.ty, tcx));
+                }
+            }
+
+            let ctxt = Ctxt::new(params, param_tys);
 
             let mut visitor = WriteVisitor::new(ctxt.clone());
             visitor.visit_body(body);
@@ -55,7 +73,7 @@ fn analyze(input: Input) {
             let reads = &cursor.get().0;
 
             writes.retain(|place| {
-                let local = place.local;
+                let local = place.local();
                 0 < local && local <= params && !reads.contains(place)
             });
 
@@ -87,34 +105,52 @@ fn analyze(input: Input) {
                 must_writes,
                 may_writes
             );
-
-            for (i, local) in body.local_decls.iter().enumerate() {
-                if i > params {
-                    break;
-                }
-                if let TyKind::RawPtr(tm) = local.ty.kind() {
-                    if let Some(adt_def) = tm.ty.ty_adt_def() {
-                        if adt_def.is_struct() {
-                            println!("{}: {:?}", i, adt_def.variants());
-                        }
-                    }
-                }
-            }
         }
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Type {
+    Struct(BTreeMap<usize, Type>),
+    NonStruct,
+}
+
+impl Type {
+    fn from_ty<'tcx>(ty: &Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
+        if let TyKind::Adt(adt_def, generic_args) = ty.kind() {
+            if adt_def.is_struct() {
+                let variant = adt_def.variant(VariantIdx::from_usize(0));
+                return Self::Struct(
+                    variant
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, field)| (i, Self::from_ty(&field.ty(tcx, generic_args), tcx)))
+                        .collect(),
+                );
+            }
+        }
+        Self::NonStruct
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PlacePath {
-    local: usize,
-    projections: Vec<usize>,
+struct PlacePath(Vec<usize>);
+
+impl PlacePath {
+    fn local(&self) -> usize {
+        self.0[0]
+    }
 }
 
 impl std::fmt::Debug for PlacePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.local)?;
-        for proj in &self.projections {
-            write!(f, ".{}", proj)?;
+        for (i, n) in self.0.iter().enumerate() {
+            if i == 0 {
+                write!(f, "{}", n)?;
+            } else {
+                write!(f, ".{}", n)?;
+            }
         }
         Ok(())
     }
@@ -122,8 +158,7 @@ impl std::fmt::Debug for PlacePath {
 
 impl From<&Place<'_>> for PlacePath {
     fn from(place: &Place<'_>) -> Self {
-        let local = place.local.index();
-        let mut projections = vec![];
+        let mut projections = vec![place.local.index()];
         for proj in place.projection.iter() {
             match proj {
                 ProjectionElem::Deref => {}
@@ -131,18 +166,57 @@ impl From<&Place<'_>> for PlacePath {
                 _ => panic!("{:?}", place),
             }
         }
-        Self { local, projections }
+        Self(projections)
+    }
+}
+
+fn expands_path(
+    path: &[usize],
+    tys: &BTreeMap<usize, Type>,
+    mut curr: Vec<usize>,
+) -> Vec<Vec<usize>> {
+    if let Some(first) = path.first() {
+        curr.push(*first);
+        if let Type::Struct(fields) = tys.get(first).unwrap() {
+            expands_path(&path[1..], fields, curr)
+        } else {
+            vec![curr]
+        }
+    } else {
+        tys.iter()
+            .flat_map(|(n, ty)| {
+                let mut curr = curr.clone();
+                curr.push(*n);
+                if let Type::Struct(fields) = ty {
+                    expands_path(path, fields, curr)
+                } else {
+                    vec![curr]
+                }
+            })
+            .collect()
     }
 }
 
 #[derive(Debug, Clone)]
 struct Ctxt {
     params: usize,
+    param_tys: BTreeMap<usize, Type>,
 }
 
 impl Ctxt {
+    fn new(params: usize, param_tys: BTreeMap<usize, Type>) -> Self {
+        Self { params, param_tys }
+    }
+
     fn is_ptr_param(&self, place: &Place<'_>) -> bool {
         (1..=self.params).contains(&place.local.index()) && place.is_indirect_first_projection()
+    }
+
+    fn expands_path(&self, place: &PlacePath) -> Vec<PlacePath> {
+        expands_path(&place.0, &self.param_tys, vec![])
+            .into_iter()
+            .map(PlacePath)
+            .collect()
     }
 }
 
@@ -163,7 +237,9 @@ impl WriteVisitor {
 impl<'tcx> Visitor<'tcx> for WriteVisitor {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         if self.ctxt.is_ptr_param(place) {
-            self.places.insert(From::from(place));
+            for place in self.ctxt.expands_path(&From::from(place)) {
+                self.places.insert(place);
+            }
         }
         self.super_assign(place, rvalue, location);
     }
@@ -289,11 +365,11 @@ impl<'tcx> Analysis<'tcx> for ReadAnalysis {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, rvalue) = place_rvalue.deref();
             if self.ctxt.is_ptr_param(place) {
-                state.kill(From::from(place));
+                state.kill_all(self.ctxt.expands_path(&From::from(place)));
             }
             for place in rvalue_to_places(rvalue) {
                 if self.ctxt.is_ptr_param(&place) {
-                    state.gen(From::from(&place));
+                    state.gen_all(self.ctxt.expands_path(&From::from(&place)));
                 }
             }
         }
@@ -352,7 +428,7 @@ impl<'tcx> Analysis<'tcx> for WriteAnalysis {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, _) = place_rvalue.deref();
             if self.ctxt.is_ptr_param(place) {
-                state.gen(From::from(place));
+                state.gen_all(self.ctxt.expands_path(&From::from(place)));
             }
         }
     }

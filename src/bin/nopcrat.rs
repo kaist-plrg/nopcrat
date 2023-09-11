@@ -14,11 +14,20 @@ fn main() {
     analysis::run_path(path);
     // analysis::run_code(
     //     "
-    //     struct A { x: u32, y: u32 };
-    //     unsafe fn f(x: *mut u32) {
-    //         if !x.is_null() {
-    //             *x = 1;
-    //         }
+    //     type A = _A;
+    //     type B = _B;
+    //     #[derive(Copy, Clone)]
+    //     struct _A { x: B, y: B };
+    //     #[derive(Copy, Clone)]
+    //     struct _B { x: u32, y: u32 };
+    //     unsafe fn f(x: *mut A) -> B {
+    //         (*x).x.x = 0;
+    //         let b = (*x).x;
+    //         *x = A {
+    //             x: B { x: 1, y: 2 },
+    //             y: B { x: 3, y: 4 },
+    //         };
+    //         return b;
     //     }
     // ",
     // );
