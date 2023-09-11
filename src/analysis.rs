@@ -141,6 +141,23 @@ impl PlacePath {
     fn local(&self) -> usize {
         self.0[0]
     }
+
+    fn from_place(place: &Place<'_>) -> (Self, bool) {
+        let mut projections = vec![place.local.index()];
+        let mut array_access = false;
+        for proj in place.projection.iter() {
+            match proj {
+                ProjectionElem::Deref => {}
+                ProjectionElem::Field(idx, _) => projections.push(idx.index()),
+                ProjectionElem::Index(_) => {
+                    array_access = true;
+                    break;
+                }
+                _ => panic!("{:?}", place),
+            }
+        }
+        (Self(projections), array_access)
+    }
 }
 
 impl std::fmt::Debug for PlacePath {
@@ -153,20 +170,6 @@ impl std::fmt::Debug for PlacePath {
             }
         }
         Ok(())
-    }
-}
-
-impl From<&Place<'_>> for PlacePath {
-    fn from(place: &Place<'_>) -> Self {
-        let mut projections = vec![place.local.index()];
-        for proj in place.projection.iter() {
-            match proj {
-                ProjectionElem::Deref => {}
-                ProjectionElem::Field(idx, _) => projections.push(idx.index()),
-                _ => panic!("{:?}", place),
-            }
-        }
-        Self(projections)
     }
 }
 
@@ -237,8 +240,11 @@ impl WriteVisitor {
 impl<'tcx> Visitor<'tcx> for WriteVisitor {
     fn visit_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
         if self.ctxt.is_ptr_param(place) {
-            for place in self.ctxt.expands_path(&From::from(place)) {
-                self.places.insert(place);
+            let (place, is_read) = PlacePath::from_place(place);
+            if !is_read {
+                for place in self.ctxt.expands_path(&place) {
+                    self.places.insert(place);
+                }
             }
         }
         self.super_assign(place, rvalue, location);
@@ -365,11 +371,17 @@ impl<'tcx> Analysis<'tcx> for ReadAnalysis {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, rvalue) = place_rvalue.deref();
             if self.ctxt.is_ptr_param(place) {
-                state.kill_all(self.ctxt.expands_path(&From::from(place)));
+                let (place, is_read) = PlacePath::from_place(place);
+                let places = self.ctxt.expands_path(&place);
+                if is_read {
+                    state.gen_all(places);
+                } else {
+                    state.kill_all(places);
+                }
             }
             for place in rvalue_to_places(rvalue) {
                 if self.ctxt.is_ptr_param(&place) {
-                    state.gen_all(self.ctxt.expands_path(&From::from(&place)));
+                    state.gen_all(self.ctxt.expands_path(&PlacePath::from_place(&place).0));
                 }
             }
         }
@@ -428,7 +440,10 @@ impl<'tcx> Analysis<'tcx> for WriteAnalysis {
         if let StatementKind::Assign(place_rvalue) = &statement.kind {
             let (place, _) = place_rvalue.deref();
             if self.ctxt.is_ptr_param(place) {
-                state.gen_all(self.ctxt.expands_path(&From::from(place)));
+                let (place, is_read) = PlacePath::from_place(place);
+                if !is_read {
+                    state.gen_all(self.ctxt.expands_path(&place));
+                }
             }
         }
     }
