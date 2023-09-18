@@ -10,8 +10,13 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let path = Path::new(&args.input);
-    analysis::run_path(path);
+    let mut path = Path::new(&args.input).to_path_buf();
+    if path.is_dir() {
+        path.push("c2rust-lib.rs");
+    }
+    assert!(path.is_file());
+    analysis::find_ptr_param_use(&path);
+    // analysis::run_path(path);
     // analysis::run_code(
     //     "
     //     type A = _A;

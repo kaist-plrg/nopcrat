@@ -8,9 +8,10 @@ use rustc_abi::VariantIdx;
 use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
-        visit::Visitor, BasicBlock, BasicBlockData, Body, CallReturnPlaces, Location, Place,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorEdges,
-        TerminatorKind,
+        visit::{PlaceContext, Visitor},
+        BasicBlock, BasicBlockData, Body, CallReturnPlaces, Constant, ConstantKind, Location,
+        Place, PlaceElem, PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorEdges, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -107,6 +108,167 @@ fn analyze(input: Input) {
             );
         }
     });
+}
+
+pub fn find_ptr_param_use(path: &Path) {
+    let input = compile_util::path_to_input(path);
+    let config = compile_util::make_config(input);
+    compile_util::run_compiler(config, |_, tcx| {
+        let hir = tcx.hir();
+        let mut visitor = KindVisitor::default();
+        let mut tys = BTreeSet::new();
+        for id in hir.items() {
+            let item = hir.item(id);
+            if !matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                continue;
+            };
+            let def_id = item.item_id().owner_id.def_id.to_def_id();
+            let body = tcx.optimized_mir(def_id);
+            visitor.visit_body(body);
+            for decl in &body.local_decls {
+                let kind = match decl.ty.kind() {
+                    TyKind::Bool => "bool",
+                    TyKind::Char => "char",
+                    TyKind::Int(_) => "int",
+                    TyKind::Uint(_) => "uint",
+                    TyKind::Float(_) => "float",
+                    TyKind::Adt(_, _) => "adt",
+                    TyKind::Foreign(_) => "foreign",
+                    TyKind::Str => "str",
+                    TyKind::Array(_, _) => "array",
+                    TyKind::Slice(_) => "slice",
+                    TyKind::RawPtr(_) => "raw_ptr",
+                    TyKind::Ref(_, _, _) => "ref",
+                    TyKind::FnDef(_, _) => "fn_def",
+                    TyKind::FnPtr(_) => "fn_ptr",
+                    TyKind::Dynamic(_, _, _) => "dynamic",
+                    TyKind::Closure(_, _) => "closure",
+                    TyKind::Generator(_, _, _) => "generator",
+                    TyKind::GeneratorWitness(_) => "generator_witness",
+                    TyKind::GeneratorWitnessMIR(_, _) => "generator_witness_mir",
+                    TyKind::Never => "never",
+                    TyKind::Tuple(_) => "tuple",
+                    TyKind::Alias(_, _) => "alias",
+                    TyKind::Param(_) => "param",
+                    TyKind::Bound(_, _) => "bound",
+                    TyKind::Placeholder(_) => "placeholder",
+                    TyKind::Infer(_) => "infer",
+                    TyKind::Error(_) => "error",
+                };
+                tys.insert(kind);
+            }
+        }
+        println!("{:?}", visitor.statements);
+        println!("{:?}", visitor.terminators);
+        println!("{:?}", visitor.rvalues);
+        println!("{:?}", visitor.elems);
+        println!("{:?}", visitor.constants);
+        println!("{:?}", tys);
+    });
+}
+
+#[derive(Default)]
+struct KindVisitor {
+    statements: BTreeSet<&'static str>,
+    terminators: BTreeSet<&'static str>,
+    rvalues: BTreeSet<&'static str>,
+    elems: BTreeSet<&'static str>,
+    constants: BTreeSet<&'static str>,
+}
+
+impl<'tcx> Visitor<'tcx> for KindVisitor {
+    fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
+        let kind = match statement.kind {
+            StatementKind::Assign(_) => "assign",
+            StatementKind::FakeRead(_) => "fake_read",
+            StatementKind::SetDiscriminant { .. } => "set_discriminant",
+            StatementKind::Deinit(_) => "deinit",
+            StatementKind::StorageLive(_) => "storage_live",
+            StatementKind::StorageDead(_) => "storage_dead",
+            StatementKind::Retag(_, _) => "retag",
+            StatementKind::PlaceMention(_) => "place_mention",
+            StatementKind::AscribeUserType(_, _) => "ascribe_user_type",
+            StatementKind::Coverage(_) => "coverage",
+            StatementKind::Intrinsic(_) => "intrinsic",
+            StatementKind::ConstEvalCounter => "const_eval_counter",
+            StatementKind::Nop => "nop",
+        };
+        self.statements.insert(kind);
+        self.super_statement(statement, location);
+    }
+
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
+        let kind = match terminator.kind {
+            TerminatorKind::Goto { .. } => "goto",
+            TerminatorKind::SwitchInt { .. } => "switch_int",
+            TerminatorKind::UnwindResume => "unwind_resume",
+            TerminatorKind::UnwindTerminate(_) => "unwind_terminate",
+            TerminatorKind::Return => "return",
+            TerminatorKind::Unreachable => "unreachable",
+            TerminatorKind::Drop { .. } => "drop",
+            TerminatorKind::Call { .. } => "call",
+            TerminatorKind::Assert { .. } => "assert",
+            TerminatorKind::Yield { .. } => "yield",
+            TerminatorKind::GeneratorDrop => "generator_drop",
+            TerminatorKind::FalseEdge { .. } => "false_edge",
+            TerminatorKind::FalseUnwind { .. } => "false_unwind",
+            TerminatorKind::InlineAsm { .. } => "inline_asm",
+        };
+        self.terminators.insert(kind);
+        self.super_terminator(terminator, location);
+    }
+
+    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
+        let kind = match rvalue {
+            Rvalue::Use(_) => "use",
+            Rvalue::Repeat(_, _) => "repeat",
+            Rvalue::Ref(_, _, _) => "ref",
+            Rvalue::ThreadLocalRef(_) => "thread_local_ref",
+            Rvalue::AddressOf(_, _) => "address_of",
+            Rvalue::Len(_) => "len",
+            Rvalue::Cast(_, _, _) => "cast",
+            Rvalue::BinaryOp(_, _) => "binary_op",
+            Rvalue::CheckedBinaryOp(_, _) => "checked_binary_op",
+            Rvalue::NullaryOp(_, _) => "nullary_op",
+            Rvalue::UnaryOp(_, _) => "unary_op",
+            Rvalue::Discriminant(_) => "discriminant",
+            Rvalue::Aggregate(_, _) => "aggregate",
+            Rvalue::ShallowInitBox(_, _) => "shallow_init_box",
+            Rvalue::CopyForDeref(_) => "copy_for_deref",
+        };
+        self.rvalues.insert(kind);
+        self.super_rvalue(rvalue, location);
+    }
+
+    fn visit_projection_elem(
+        &mut self,
+        place_ref: PlaceRef<'tcx>,
+        elem: PlaceElem<'tcx>,
+        context: PlaceContext,
+        location: Location,
+    ) {
+        let kind = match elem {
+            ProjectionElem::Deref => "deref",
+            ProjectionElem::Field(_, _) => "field",
+            ProjectionElem::Index(_) => "index",
+            ProjectionElem::ConstantIndex { .. } => "constant_index",
+            ProjectionElem::Subslice { .. } => "subslice",
+            ProjectionElem::Downcast(_, _) => "downcast",
+            ProjectionElem::OpaqueCast(_) => "opaque_cast",
+        };
+        self.elems.insert(kind);
+        self.super_projection_elem(place_ref, elem, context, location);
+    }
+
+    fn visit_constant(&mut self, constant: &Constant<'tcx>, location: Location) {
+        let kind = match &constant.literal {
+            ConstantKind::Ty(_) => "ty",
+            ConstantKind::Unevaluated(_, _) => "unevaluated",
+            ConstantKind::Val(_, _) => "val",
+        };
+        self.constants.insert(kind);
+        self.super_constant(constant, location);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

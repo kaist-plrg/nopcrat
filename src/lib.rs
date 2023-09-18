@@ -25,8 +25,10 @@
 #![feature(rustc_private)]
 #![feature(iter_intersperse)]
 #![feature(map_try_insert)]
+#![feature(box_patterns)]
 
 extern crate rustc_abi;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_driver_impl;
@@ -41,6 +43,7 @@ extern crate rustc_mir_dataflow;
 extern crate rustc_session;
 extern crate rustc_span;
 
+pub mod ai;
 pub mod analysis;
 pub mod compile_util;
 pub mod compiler;
