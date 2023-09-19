@@ -299,6 +299,137 @@ impl AbsValue {
         }
     }
 
+    pub fn to_i8(&self) -> Self {
+        Self {
+            intv: self
+                .intv
+                .to_i8()
+                .join(&self.uintv.to_i8())
+                .join(&self.floatv.to_i8()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_i16(&self) -> Self {
+        Self {
+            intv: self
+                .intv
+                .to_i16()
+                .join(&self.uintv.to_i16())
+                .join(&self.floatv.to_i16()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_i32(&self) -> Self {
+        Self {
+            intv: self
+                .intv
+                .to_i32()
+                .join(&self.uintv.to_i32())
+                .join(&self.floatv.to_i32()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_i64(&self) -> Self {
+        Self {
+            intv: self
+                .intv
+                .to_i64()
+                .join(&self.uintv.to_i64())
+                .join(&self.floatv.to_i64()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_i128(&self) -> Self {
+        Self {
+            intv: self
+                .intv
+                .join(&self.uintv.to_i128())
+                .join(&self.floatv.to_i128()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_u8(&self) -> Self {
+        Self {
+            uintv: self
+                .intv
+                .to_u8()
+                .join(&self.uintv.to_u8())
+                .join(&self.floatv.to_u8()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_u16(&self) -> Self {
+        Self {
+            uintv: self
+                .intv
+                .to_u16()
+                .join(&self.uintv.to_u16())
+                .join(&self.floatv.to_u16()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_u32(&self) -> Self {
+        Self {
+            uintv: self
+                .intv
+                .to_u32()
+                .join(&self.uintv.to_u32())
+                .join(&self.floatv.to_u32()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_u64(&self) -> Self {
+        Self {
+            uintv: self
+                .intv
+                .to_u64()
+                .join(&self.uintv.to_u64())
+                .join(&self.floatv.to_u64()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_u128(&self) -> Self {
+        Self {
+            uintv: self
+                .intv
+                .to_u128()
+                .join(&self.uintv)
+                .join(&self.floatv.to_u128()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_f32(&self) -> Self {
+        Self {
+            floatv: self
+                .intv
+                .to_f32()
+                .join(&self.uintv.to_f32())
+                .join(&self.floatv.to_f32()),
+            ..Self::bot()
+        }
+    }
+
+    pub fn to_f64(&self) -> Self {
+        Self {
+            floatv: self
+                .intv
+                .to_f64()
+                .join(&self.uintv.to_f64())
+                .join(&self.floatv),
+            ..Self::bot()
+        }
+    }
+
     pub fn add(&self, other: &Self) -> Self {
         Self {
             intv: self.intv.add(&other.intv),
@@ -557,6 +688,64 @@ impl AbsInt {
         self.unary(|n| -n)
     }
 
+    pub fn to_i8(&self) -> Self {
+        self.unary(|n| n as i8 as i128)
+    }
+
+    pub fn to_i16(&self) -> Self {
+        self.unary(|n| n as i16 as i128)
+    }
+
+    pub fn to_i32(&self) -> Self {
+        self.unary(|n| n as i32 as i128)
+    }
+
+    pub fn to_i64(&self) -> Self {
+        self.unary(|n| n as i64 as i128)
+    }
+
+    fn unaryu<F: Fn(i128) -> u128>(&self, f: F) -> AbsUint {
+        match self {
+            Self::Top => AbsUint::Top,
+            Self::Set(s) => AbsUint::alphas(s.iter().map(|n| f(*n)).collect()),
+        }
+    }
+
+    pub fn to_u8(&self) -> AbsUint {
+        self.unaryu(|n| n as u8 as u128)
+    }
+
+    pub fn to_u16(&self) -> AbsUint {
+        self.unaryu(|n| n as u16 as u128)
+    }
+
+    pub fn to_u32(&self) -> AbsUint {
+        self.unaryu(|n| n as u32 as u128)
+    }
+
+    pub fn to_u64(&self) -> AbsUint {
+        self.unaryu(|n| n as u64 as u128)
+    }
+
+    pub fn to_u128(&self) -> AbsUint {
+        self.unaryu(|n| n as u128)
+    }
+
+    fn unaryf<F: Fn(i128) -> f64>(&self, f: F) -> AbsFloat {
+        match self {
+            Self::Top => AbsFloat::Top,
+            Self::Set(s) => AbsFloat::alphas(s.iter().map(|n| f(*n)).collect()),
+        }
+    }
+
+    pub fn to_f32(&self) -> AbsFloat {
+        self.unaryf(|n| n as f32 as f64)
+    }
+
+    pub fn to_f64(&self) -> AbsFloat {
+        self.unaryf(|n| n as f64)
+    }
+
     fn binary<F: Fn(i128, i128) -> i128>(&self, other: &Self, f: F) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
@@ -756,6 +945,64 @@ impl AbsUint {
 
     pub fn not(&self) -> Self {
         self.unary(|n| !n)
+    }
+
+    pub fn to_u8(&self) -> Self {
+        self.unary(|n| n as u8 as u128)
+    }
+
+    pub fn to_u16(&self) -> Self {
+        self.unary(|n| n as u16 as u128)
+    }
+
+    pub fn to_u32(&self) -> Self {
+        self.unary(|n| n as u32 as u128)
+    }
+
+    pub fn to_u64(&self) -> Self {
+        self.unary(|n| n as u64 as u128)
+    }
+
+    fn unaryi<F: Fn(u128) -> i128>(&self, f: F) -> AbsInt {
+        match self {
+            Self::Top => AbsInt::Top,
+            Self::Set(s) => AbsInt::alphas(s.iter().map(|n| f(*n)).collect()),
+        }
+    }
+
+    pub fn to_i8(&self) -> AbsInt {
+        self.unaryi(|n| n as i8 as i128)
+    }
+
+    pub fn to_i16(&self) -> AbsInt {
+        self.unaryi(|n| n as i16 as i128)
+    }
+
+    pub fn to_i32(&self) -> AbsInt {
+        self.unaryi(|n| n as i32 as i128)
+    }
+
+    pub fn to_i64(&self) -> AbsInt {
+        self.unaryi(|n| n as i64 as i128)
+    }
+
+    pub fn to_i128(&self) -> AbsInt {
+        self.unaryi(|n| n as i128)
+    }
+
+    fn unaryf<F: Fn(u128) -> f64>(&self, f: F) -> AbsFloat {
+        match self {
+            Self::Top => AbsFloat::Top,
+            Self::Set(s) => AbsFloat::alphas(s.iter().map(|n| f(*n)).collect()),
+        }
+    }
+
+    pub fn to_f32(&self) -> AbsFloat {
+        self.unaryf(|n| n as f32 as f64)
+    }
+
+    pub fn to_f64(&self) -> AbsFloat {
+        self.unaryf(|n| n as f64)
     }
 
     fn binary<F: Fn(u128, u128) -> u128>(&self, other: &Self, f: F) -> Self {
@@ -961,6 +1208,64 @@ impl AbsFloat {
 
     pub fn neg(&self) -> Self {
         self.unary(|n| -n)
+    }
+
+    pub fn to_f32(&self) -> Self {
+        self.unary(|n| n as f32 as f64)
+    }
+
+    fn unaryi<F: Fn(f64) -> i128>(&self, f: F) -> AbsInt {
+        match self {
+            Self::Top => AbsInt::Top,
+            Self::Set(s) => AbsInt::alphas(s.iter().map(|n| f(f64::from_bits(*n))).collect()),
+        }
+    }
+
+    pub fn to_i8(&self) -> AbsInt {
+        self.unaryi(|n| n as i8 as i128)
+    }
+
+    pub fn to_i16(&self) -> AbsInt {
+        self.unaryi(|n| n as i16 as i128)
+    }
+
+    pub fn to_i32(&self) -> AbsInt {
+        self.unaryi(|n| n as i32 as i128)
+    }
+
+    pub fn to_i64(&self) -> AbsInt {
+        self.unaryi(|n| n as i64 as i128)
+    }
+
+    pub fn to_i128(&self) -> AbsInt {
+        self.unaryi(|n| n as i128)
+    }
+
+    fn unaryu<F: Fn(f64) -> u128>(&self, f: F) -> AbsUint {
+        match self {
+            Self::Top => AbsUint::Top,
+            Self::Set(s) => AbsUint::alphas(s.iter().map(|n| f(f64::from_bits(*n))).collect()),
+        }
+    }
+
+    pub fn to_u8(&self) -> AbsUint {
+        self.unaryu(|n| n as u8 as u128)
+    }
+
+    pub fn to_u16(&self) -> AbsUint {
+        self.unaryu(|n| n as u16 as u128)
+    }
+
+    pub fn to_u32(&self) -> AbsUint {
+        self.unaryu(|n| n as u32 as u128)
+    }
+
+    pub fn to_u64(&self) -> AbsUint {
+        self.unaryu(|n| n as u64 as u128)
+    }
+
+    pub fn to_u128(&self) -> AbsUint {
+        self.unaryu(|n| n as u128)
     }
 
     fn binary<F: Fn(f64, f64) -> f64>(&self, other: &Self, f: F) -> Self {

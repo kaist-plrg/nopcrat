@@ -18,20 +18,9 @@ fn main() {
     // analysis::find_ptr_param_use(&path);
     // analysis::run_path(path);
     ai::analysis::analyze_code(
-        "fn f() -> u128 {
-            let a = 3;
-            let a = a + 4;
-            let a = a - 1;
-            let a = a * 3;
-            let a = a / 2;
-            let a = a % 5;
-            let a = a << 3;
-            let a = a >> 1;
-            let a = a & 63;
-            let a = a | 0;
-            let a = a ^ 1;
-            let a = !a;
-            a
+        "fn f() -> u8 {
+            let x: u128 = u128::MAX;
+            x as _
         }
     ",
     );

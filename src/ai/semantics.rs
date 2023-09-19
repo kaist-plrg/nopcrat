@@ -1,10 +1,10 @@
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
-        BinOp, Constant, ConstantKind, Operand, Place, Rvalue, Statement, StatementKind,
+        BinOp, CastKind, Constant, ConstantKind, Operand, Place, Rvalue, Statement, StatementKind,
         Terminator, TerminatorKind, UnOp,
     },
-    ty::TyKind,
+    ty::{Ty, TyKind},
 };
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
@@ -53,7 +53,47 @@ pub fn transfer_rvalue(rvalue: &Rvalue<'_>, state: &AbsState) -> AbsValue {
         Rvalue::ThreadLocalRef(_) => unreachable!("{:?}", rvalue),
         Rvalue::AddressOf(_, _) => todo!("{:?}", rvalue),
         Rvalue::Len(_) => unreachable!("{:?}", rvalue),
-        Rvalue::Cast(_, _, _) => todo!("{:?}", rvalue),
+        Rvalue::Cast(kind, operand, ty) => {
+            let v = transfer_operand(operand, state);
+            match kind {
+                CastKind::PointerExposeAddress => todo!("{:?}", rvalue),
+                CastKind::PointerFromExposedAddress => todo!("{:?}", rvalue),
+                CastKind::PointerCoercion(_) => todo!("{:?}", rvalue),
+                CastKind::DynStar => todo!("{:?}", rvalue),
+                CastKind::IntToInt | CastKind::FloatToInt => match ty.kind() {
+                    TyKind::Int(int_ty) => match int_ty {
+                        IntTy::Isize => v.to_i64(),
+                        IntTy::I8 => v.to_i8(),
+                        IntTy::I16 => v.to_i16(),
+                        IntTy::I32 => v.to_i32(),
+                        IntTy::I64 => v.to_i64(),
+                        IntTy::I128 => v.to_i128(),
+                    },
+                    TyKind::Uint(uint_ty) => match uint_ty {
+                        UintTy::Usize => v.to_u64(),
+                        UintTy::U8 => v.to_u8(),
+                        UintTy::U16 => v.to_u16(),
+                        UintTy::U32 => v.to_u32(),
+                        UintTy::U64 => v.to_u64(),
+                        UintTy::U128 => v.to_u128(),
+                    },
+                    _ => unreachable!("{:?}", rvalue),
+                },
+                CastKind::FloatToFloat | CastKind::IntToFloat => {
+                    if let TyKind::Float(float_ty) = ty.kind() {
+                        match float_ty {
+                            FloatTy::F32 => v.to_f32(),
+                            FloatTy::F64 => v.to_f64(),
+                        }
+                    } else {
+                        unreachable!("{:?}", rvalue)
+                    }
+                }
+                CastKind::PtrToPtr => todo!("{:?}", rvalue),
+                CastKind::FnPtrToPtr => todo!("{:?}", rvalue),
+                CastKind::Transmute => todo!("{:?}", rvalue),
+            }
+        }
         Rvalue::BinaryOp(binop, box (l, r)) => {
             let l = transfer_operand(l, state);
             let r = transfer_operand(r, state);
@@ -113,7 +153,7 @@ pub fn transfer_place(place: &Place<'_>, state: &AbsState) -> AbsValue {
 pub fn transfer_constant(constant: &Constant<'_>, _state: &AbsState) -> AbsValue {
     match constant.literal {
         ConstantKind::Ty(_) => unreachable!("{:?}", constant),
-        ConstantKind::Unevaluated(_, _) => todo!("{:?}", constant),
+        ConstantKind::Unevaluated(_, ty) => top_value_of_ty(&ty),
         ConstantKind::Val(v, ty) => {
             if let ConstValue::Scalar(s) = v {
                 match s {
@@ -155,5 +195,41 @@ pub fn transfer_constant(constant: &Constant<'_>, _state: &AbsState) -> AbsValue
                 unreachable!("{:?}", constant)
             }
         }
+    }
+}
+
+pub fn top_value_of_ty(ty: &Ty<'_>) -> AbsValue {
+    match ty.kind() {
+        TyKind::Bool => AbsValue::bool_top(),
+        TyKind::Char => unreachable!("{:?}", ty),
+        TyKind::Int(_) => AbsValue::int_top(),
+        TyKind::Uint(_) => AbsValue::uint_top(),
+        TyKind::Float(_) => AbsValue::float_top(),
+        TyKind::Adt(_, _) => todo!("{:?}", ty),
+        TyKind::Foreign(_) => unreachable!("{:?}", ty),
+        TyKind::Str => unreachable!("{:?}", ty),
+        TyKind::Array(ty, len) => {
+            let v = top_value_of_ty(ty);
+            let len = len.try_to_scalar_int().unwrap().try_to_u128().unwrap();
+            AbsValue::list(vec![v; len as usize])
+        }
+        TyKind::Slice(_) => unreachable!("{:?}", ty),
+        TyKind::RawPtr(_) => todo!("{:?}", ty),
+        TyKind::Ref(_, _, _) => todo!("{:?}", ty),
+        TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
+        TyKind::FnPtr(_) => todo!("{:?}", ty),
+        TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
+        TyKind::Closure(_, _) => unreachable!("{:?}", ty),
+        TyKind::Generator(_, _, _) => unreachable!("{:?}", ty),
+        TyKind::GeneratorWitness(_) => unreachable!("{:?}", ty),
+        TyKind::GeneratorWitnessMIR(_, _) => unreachable!("{:?}", ty),
+        TyKind::Never => unreachable!("{:?}", ty),
+        TyKind::Tuple(tys) => AbsValue::list(tys.iter().map(|ty| top_value_of_ty(&ty)).collect()),
+        TyKind::Alias(_, _) => unreachable!("{:?}", ty),
+        TyKind::Param(_) => unreachable!("{:?}", ty),
+        TyKind::Bound(_, _) => unreachable!("{:?}", ty),
+        TyKind::Placeholder(_) => unreachable!("{:?}", ty),
+        TyKind::Infer(_) => unreachable!("{:?}", ty),
+        TyKind::Error(_) => unreachable!("{:?}", ty),
     }
 }
