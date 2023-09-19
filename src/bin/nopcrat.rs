@@ -15,25 +15,24 @@ fn main() {
         path.push("c2rust-lib.rs");
     }
     assert!(path.is_file());
-    analysis::find_ptr_param_use(&path);
+    // analysis::find_ptr_param_use(&path);
     // analysis::run_path(path);
-    // analysis::run_code(
-    //     "
-    //     type A = _A;
-    //     type B = _B;
-    //     #[derive(Copy, Clone)]
-    //     struct _A { x: B, y: B };
-    //     #[derive(Copy, Clone)]
-    //     struct _B { x: u32, y: u32 };
-    //     unsafe fn f(x: *mut A) -> B {
-    //         (*x).x.x = 0;
-    //         let b = (*x).x;
-    //         *x = A {
-    //             x: B { x: 1, y: 2 },
-    //             y: B { x: 3, y: 4 },
-    //         };
-    //         return b;
-    //     }
-    // ",
-    // );
+    ai::analysis::analyze_code(
+        "fn f() -> u128 {
+            let a = 3;
+            let a = a + 4;
+            let a = a - 1;
+            let a = a * 3;
+            let a = a / 2;
+            let a = a % 5;
+            let a = a << 3;
+            let a = a >> 1;
+            let a = a & 63;
+            let a = a | 0;
+            let a = a ^ 1;
+            let a = !a;
+            a
+        }
+    ",
+    );
 }
