@@ -1,6 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use rustc_abi::FieldIdx;
 use rustc_span::def_id::DefId;
 
 #[derive(Debug, Clone)]
@@ -83,6 +82,10 @@ impl AbsLocal {
         &self.0[i]
     }
 
+    pub fn get_mut(&mut self, i: usize) -> &mut AbsValue {
+        &mut self.0[i]
+    }
+
     pub fn set(&mut self, i: usize, v: AbsValue) {
         self.0[i] = v;
     }
@@ -96,7 +99,6 @@ pub struct AbsValue {
     pub boolv: AbsBool,
     pub listv: AbsList,
     pub ptrv: AbsPtr,
-    pub adtv: AbsAdt,
     pub optionv: AbsOption,
     pub fnv: AbsFn,
 }
@@ -143,13 +145,6 @@ impl std::fmt::Debug for AbsValue {
             write!(f, "{:?}", self.ptrv)?;
             not_bot = true;
         }
-        if !self.adtv.is_bot() {
-            if not_bot {
-                write!(f, " | ")?;
-            }
-            write!(f, "{:?}", self.adtv)?;
-            not_bot = true;
-        }
         if !self.optionv.is_bot() {
             if not_bot {
                 write!(f, " | ")?;
@@ -180,7 +175,6 @@ impl AbsValue {
             boolv: AbsBool::top(),
             listv: AbsList::top(),
             ptrv: AbsPtr::top(),
-            adtv: AbsAdt::top(),
             optionv: AbsOption::top(),
             fnv: AbsFn::top(),
         }
@@ -194,7 +188,6 @@ impl AbsValue {
             boolv: AbsBool::bot(),
             listv: AbsList::bot(),
             ptrv: AbsPtr::bot(),
-            adtv: AbsAdt::bot(),
             optionv: AbsOption::bot(),
             fnv: AbsFn::bot(),
         }
@@ -208,7 +201,6 @@ impl AbsValue {
             boolv: self.boolv.join(&other.boolv),
             listv: self.listv.join(&other.listv),
             ptrv: self.ptrv.join(&other.ptrv),
-            adtv: self.adtv.join(&other.adtv),
             optionv: self.optionv.join(&other.optionv),
             fnv: self.fnv.join(&other.fnv),
         }
@@ -221,7 +213,6 @@ impl AbsValue {
             && self.boolv.ord(&other.boolv)
             && self.listv.ord(&other.listv)
             && self.ptrv.ord(&other.ptrv)
-            && self.adtv.ord(&other.adtv)
             && self.optionv.ord(&other.optionv)
             && self.fnv.ord(&other.fnv)
     }
@@ -921,6 +912,14 @@ impl AbsUint {
         }
     }
 
+    pub fn gamma(&self) -> Option<&BTreeSet<u128>> {
+        if let Self::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
     pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
@@ -1508,6 +1507,23 @@ impl AbsList {
             _ => false,
         }
     }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> Option<usize> {
+        if let Self::List(l) = self {
+            Some(l.len())
+        } else {
+            None
+        }
+    }
+
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut AbsValue> {
+        if let Self::List(l) = self {
+            l.get_mut(i)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1557,53 +1573,6 @@ impl AbsPtr {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
             (Self::Set(s1), Self::Set(s2)) => s1.is_subset(s2),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum AbsAdt {
-    Top,
-    Map(BTreeMap<FieldIdx, AbsValue>),
-    Bot,
-}
-
-impl AbsAdt {
-    pub fn top() -> Self {
-        Self::Top
-    }
-
-    pub fn bot() -> Self {
-        Self::Bot
-    }
-
-    pub fn is_bot(&self) -> bool {
-        matches!(self, Self::Bot)
-    }
-
-    pub fn join(&self, other: &Self) -> Self {
-        match (self, other) {
-            (Self::Bot, v) | (v, Self::Bot) => v.clone(),
-            (Self::Map(l1), Self::Map(l2))
-                if l1.keys().all(|k| l2.contains_key(k))
-                    && l2.keys().all(|k| l1.contains_key(k)) =>
-            {
-                Self::Map(l1.keys().map(|k| (*k, l1[k].join(&l2[k]))).collect())
-            }
-            _ => Self::Top,
-        }
-    }
-
-    pub fn ord(&self, other: &Self) -> bool {
-        match (self, other) {
-            (_, Self::Top) | (Self::Bot, _) => true,
-            (Self::Map(l1), Self::Map(l2))
-                if l1.keys().all(|k| l2.contains_key(k))
-                    && l2.keys().all(|k| l1.contains_key(k)) =>
-            {
-                l1.keys().all(|k| l1[k].ord(&l2[k]))
-            }
-            _ => false,
         }
     }
 }

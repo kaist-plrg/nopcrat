@@ -31,6 +31,7 @@ pub fn analyze_code(code: &str) {
             };
             let def_id = item.item_id().owner_id.def_id.to_def_id();
             let body = tcx.optimized_mir(def_id);
+            println!("{:?}", def_id);
             analyze_body(body, inputs);
         }
     });

@@ -1,8 +1,8 @@
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
-        BinOp, CastKind, Constant, ConstantKind, Operand, Place, Rvalue, Statement, StatementKind,
-        Terminator, TerminatorKind, UnOp,
+        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Operand, Place, PlaceElem,
+        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
     },
     ty::{Ty, TyKind},
 };
@@ -12,11 +12,11 @@ use super::domains::*;
 
 pub fn transfer_statement(stmt: &Statement<'_>, state: &AbsState) -> AbsState {
     if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-        let v = transfer_rvalue(rvalue, state);
-        assert!(place.projection.is_empty());
-        let mut state = state.clone();
-        state.local.set(place.local.index(), v);
-        state
+        let new_v = transfer_rvalue(rvalue, state);
+        let mut new_state = state.clone();
+        let old_v = new_state.local.get_mut(place.local.index());
+        update_value(new_v, old_v, false, place.projection, state);
+        new_state
     } else {
         unreachable!("{:?}", stmt)
     }
@@ -132,7 +132,26 @@ pub fn transfer_rvalue(rvalue: &Rvalue<'_>, state: &AbsState) -> AbsValue {
             }
         }
         Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
-        Rvalue::Aggregate(_, _) => todo!("{:?}", rvalue),
+        Rvalue::Aggregate(box kind, fields) => match kind {
+            AggregateKind::Array(_) => AbsValue::list(
+                fields
+                    .iter()
+                    .map(|operand| transfer_operand(operand, state))
+                    .collect(),
+            ),
+            AggregateKind::Tuple => unreachable!("{:?}", rvalue),
+            AggregateKind::Adt(def_id, _, _, _, _) => {
+                assert!(def_id.is_local());
+                AbsValue::list(
+                    fields
+                        .iter()
+                        .map(|operand| transfer_operand(operand, state))
+                        .collect(),
+                )
+            }
+            AggregateKind::Closure(_, _) => unreachable!("{:?}", rvalue),
+            AggregateKind::Generator(_, _, _) => unreachable!("{:?}", rvalue),
+        },
         Rvalue::ShallowInitBox(_, _) => unreachable!("{:?}", rvalue),
         Rvalue::CopyForDeref(_) => todo!("{:?}", rvalue),
     }
@@ -146,8 +165,8 @@ pub fn transfer_operand(operand: &Operand<'_>, state: &AbsState) -> AbsValue {
 }
 
 pub fn transfer_place(place: &Place<'_>, state: &AbsState) -> AbsValue {
-    assert!(place.projection.is_empty());
-    state.local.get(place.local.index()).clone()
+    let v = state.local.get(place.local.index());
+    get_value(v, place.projection, state)
 }
 
 pub fn transfer_constant(constant: &Constant<'_>, _state: &AbsState) -> AbsValue {
@@ -231,5 +250,107 @@ pub fn top_value_of_ty(ty: &Ty<'_>) -> AbsValue {
         TyKind::Placeholder(_) => unreachable!("{:?}", ty),
         TyKind::Infer(_) => unreachable!("{:?}", ty),
         TyKind::Error(_) => unreachable!("{:?}", ty),
+    }
+}
+
+fn update_value(
+    new_v: AbsValue,
+    old_v: &mut AbsValue,
+    weak: bool,
+    projection: &[PlaceElem<'_>],
+    state: &AbsState,
+) {
+    if let Some(first) = projection.first() {
+        match first {
+            ProjectionElem::Deref => todo!("{:?}", projection),
+            ProjectionElem::Field(field, _) => {
+                if let Some(old_v) = old_v.listv.get_mut(field.index()) {
+                    update_value(new_v, old_v, weak, &projection[1..], state);
+                }
+            }
+            ProjectionElem::Index(idx) => {
+                let idx = state.local.get(idx.index());
+                if let Some(indices) = idx.uintv.gamma() {
+                    if indices.len() == 1 {
+                        let idx = indices.first().unwrap();
+                        if let Some(old_v) = old_v.listv.get_mut(*idx as _) {
+                            update_value(new_v, old_v, weak, &projection[1..], state);
+                        }
+                    } else {
+                        for idx in indices {
+                            if let Some(old_v) = old_v.listv.get_mut(*idx as _) {
+                                update_value(new_v.clone(), old_v, true, &projection[1..], state);
+                            }
+                        }
+                    }
+                } else if let Some(len) = old_v.listv.len() {
+                    for idx in 0..len {
+                        if let Some(old_v) = old_v.listv.get_mut(idx) {
+                            update_value(new_v.clone(), old_v, true, &projection[1..], state);
+                        }
+                    }
+                }
+            }
+            ProjectionElem::ConstantIndex { .. } => unreachable!("{:?}", projection),
+            ProjectionElem::Subslice { .. } => unreachable!("{:?}", projection),
+            ProjectionElem::Downcast(_, _) => unreachable!("{:?}", projection),
+            ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", projection),
+        }
+    } else if weak {
+        *old_v = new_v.join(old_v);
+    } else {
+        *old_v = new_v;
+    }
+}
+
+fn get_value(v: &AbsValue, projection: &[PlaceElem<'_>], state: &AbsState) -> AbsValue {
+    if let Some(first) = projection.first() {
+        match first {
+            ProjectionElem::Deref => todo!("{:?}", projection),
+            ProjectionElem::Field(field, ty) => match &v.listv {
+                AbsList::Top => top_value_of_ty(ty),
+                AbsList::List(l) => {
+                    let v = &l[field.index()];
+                    get_value(v, &projection[1..], state)
+                }
+                AbsList::Bot => AbsValue::bot(),
+            },
+            ProjectionElem::Index(idx) => {
+                let idx = state.local.get(idx.index());
+                if let Some(indices) = idx.uintv.gamma() {
+                    indices
+                        .iter()
+                        .map(|index| match &v.listv {
+                            AbsList::Top => AbsValue::top(),
+                            AbsList::List(l) => {
+                                if let Some(v) = l.get(*index as usize) {
+                                    get_value(v, &projection[1..], state)
+                                } else {
+                                    AbsValue::bot()
+                                }
+                            }
+                            AbsList::Bot => AbsValue::bot(),
+                        })
+                        .reduce(|v1, v2| v1.join(&v2))
+                        .unwrap_or(AbsValue::bot())
+                } else {
+                    match &v.listv {
+                        AbsList::Top => AbsValue::top(),
+                        AbsList::List(l) => l
+                            .iter()
+                            .map(|v| get_value(v, &projection[1..], state))
+                            .reduce(|v1, v2| v1.join(&v2))
+                            .unwrap_or(AbsValue::bot()),
+                        AbsList::Bot => AbsValue::bot(),
+                    }
+                }
+            }
+            ProjectionElem::ConstantIndex { .. } => unreachable!("{:?}", projection),
+            ProjectionElem::Subslice { .. } => unreachable!("{:?}", projection),
+            ProjectionElem::Downcast(_, _) => unreachable!("{:?}", projection),
+            ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", projection),
+        }
+    } else {
+        v.clone()
     }
 }
