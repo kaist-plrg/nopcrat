@@ -26,10 +26,24 @@ impl AbsState {
     pub fn ord(&self, other: &Self) -> bool {
         self.local.ord(&other.local) && self.heap.ord(&other.heap)
     }
+
+    pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
+        match base {
+            AbsBase::Local(i) => self.local.0.get(i),
+            AbsBase::Heap(i) => self.heap.0.get(i),
+        }
+    }
+
+    pub fn get_mut(&mut self, base: AbsBase) -> Option<&mut AbsValue> {
+        match base {
+            AbsBase::Local(i) => self.local.0.get_mut(i),
+            AbsBase::Heap(i) => self.heap.0.get_mut(i),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct AbsHeap(pub Vec<AbsValue>);
+pub struct AbsHeap(Vec<AbsValue>);
 
 impl AbsHeap {
     pub fn bot() -> Self {
@@ -51,6 +65,11 @@ impl AbsHeap {
 
     pub fn ord(&self, other: &Self) -> bool {
         self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
+    }
+
+    pub fn push(&mut self, v: AbsValue) -> usize {
+        self.0.push(v);
+        self.0.len() - 1
     }
 }
 
@@ -1360,10 +1379,10 @@ pub enum AbsBool {
 impl std::fmt::Debug for AbsBool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AbsBool::Top => write!(f, "Top_b"),
-            AbsBool::True => write!(f, "true"),
-            AbsBool::False => write!(f, "false"),
-            AbsBool::Bot => write!(f, "Bot_b"),
+            Self::Top => write!(f, "Top_b"),
+            Self::True => write!(f, "true"),
+            Self::False => write!(f, "false"),
+            Self::Bot => write!(f, "Bot_b"),
         }
     }
 }
@@ -1472,11 +1491,30 @@ impl AbsBool {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AbsList {
     Top,
     List(Vec<AbsValue>),
     Bot,
+}
+
+impl std::fmt::Debug for AbsList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Top => write!(f, "Top_l"),
+            Self::List(l) => {
+                write!(f, "[")?;
+                for (i, v) in l.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{:?}", v)?;
+                }
+                write!(f, "]")
+            }
+            Self::Bot => write!(f, "Bot_l"),
+        }
+    }
 }
 
 impl AbsList {
@@ -1533,22 +1571,78 @@ impl AbsList {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbsPlace {
-    pub local: usize,
+    pub base: AbsBase,
     pub projection: Vec<AbsProjElem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+impl std::fmt::Debug for AbsPlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.base)?;
+        for elem in &self.projection {
+            write!(f, "{:?}", elem)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AbsBase {
+    Local(usize),
+    Heap(usize),
+}
+
+impl std::fmt::Debug for AbsBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(i) => write!(f, "_{}", i),
+            Self::Heap(i) => write!(f, "A{}", i),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsProjElem {
     Field(usize),
     Index(AbsUint),
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for AbsProjElem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(i) => write!(f, ".{}", i),
+            Self::Index(i) => write!(f, "[{:?}]", i),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum AbsPtr {
     Top,
     Set(BTreeSet<AbsPlace>),
+}
+
+impl std::fmt::Debug for AbsPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Top => write!(f, "Top_p"),
+            Self::Set(s) => match s.len() {
+                0 => write!(f, "Bot_p"),
+                1 => write!(f, "{:?}", s.first().unwrap()),
+                _ => {
+                    write!(f, "{{")?;
+                    for (i, ptr) in s.iter().enumerate() {
+                        if i != 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", ptr)?;
+                    }
+                    write!(f, "}}")
+                }
+            },
+        }
+    }
 }
 
 impl AbsPtr {
