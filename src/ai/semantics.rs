@@ -1,6 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
+use rustc_abi::VariantIdx;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
@@ -17,7 +18,12 @@ use super::domains::*;
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'tcx> {
-    pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
+    pub fn transfer_statement(
+        &self,
+        stmt: &Statement<'tcx>,
+        state: &AbsState,
+        alloc_param_map: &BTreeMap<usize, usize>,
+    ) -> AbsState {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             let new_v = self.transfer_rvalue(rvalue, state);
             let mut new_state = state.clone();
@@ -31,6 +37,14 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         let mut ptr_projection = ptr.projection.clone();
                         ptr_projection.append(&mut projection.clone());
                         self.update_value(new_v.clone(), old_v, weak, &projection);
+                    }
+                    if ptrs.len() == 1 {
+                        let mut ptr = ptrs.first().unwrap().clone();
+                        ptr.projection.append(&mut projection.clone());
+                        if let Some((path, false)) = AbsPath::from_place(&ptr, alloc_param_map) {
+                            let paths = self.expands_path(&path);
+                            println!("{:?}", paths);
+                        }
                     }
                 } else {
                     todo!("{:?}", stmt);
@@ -80,8 +94,29 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         kind: MutBorrowKind::Default
                     }
                 ));
-                let place = self.abstract_place(place, state);
-                AbsValue::ptr(AbsPtr::alpha(place))
+                if place.is_indirect_first_projection() {
+                    let projection = self.abstract_projection(&place.projection[1..], state);
+                    let ptr = state.local.get(place.local.index());
+                    if let AbsPtr::Set(ptrs) = &ptr.ptrv {
+                        AbsValue::ptr(AbsPtr::Set(
+                            ptrs.iter()
+                                .map(|ptr| {
+                                    let mut ptr_projection = ptr.projection.clone();
+                                    ptr_projection.append(&mut projection.clone());
+                                    AbsPlace {
+                                        base: ptr.base,
+                                        projection: ptr_projection,
+                                    }
+                                })
+                                .collect(),
+                        ))
+                    } else {
+                        AbsValue::ptr(AbsPtr::Top)
+                    }
+                } else {
+                    let place = self.abstract_place(place, state);
+                    AbsValue::ptr(AbsPtr::alpha(place))
+                }
             }
             Rvalue::ThreadLocalRef(_) => unreachable!("{:?}", rvalue),
             Rvalue::AddressOf(_, place) => {
@@ -290,8 +325,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Float(_) => AbsValue::float_top(),
             TyKind::Adt(adt, arg) => {
                 assert!(adt.did().is_local());
-                assert_eq!(adt.variants().len(), 1);
-                let variant = adt.variants().iter().next().unwrap();
+                assert!(adt.is_struct());
+                let variant = adt.variant(VariantIdx::from_usize(0));
                 AbsValue::list(
                     variant
                         .fields

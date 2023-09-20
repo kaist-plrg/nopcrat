@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
+use etrace::some_or;
 use rustc_span::def_id::DefId;
 
 #[derive(Debug, Clone)]
@@ -1674,6 +1675,14 @@ impl AbsPtr {
         }
     }
 
+    pub fn gamma(&self) -> Option<&BTreeSet<AbsPlace>> {
+        if let Self::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
     pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
@@ -1777,5 +1786,88 @@ impl AbsFn {
             (Self::Top, _) => false,
             (Self::Set(s1), Self::Set(s2)) => s1.is_subset(s2),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsPath(pub Vec<usize>);
+
+impl AbsPath {
+    pub fn base(&self) -> usize {
+        self.0[0]
+    }
+
+    pub fn from_place(
+        place: &AbsPlace,
+        alloc_param_map: &BTreeMap<usize, usize>,
+    ) -> Option<(Self, bool)> {
+        let alloc = if let AbsBase::Heap(alloc) = place.base {
+            alloc
+        } else {
+            return None;
+        };
+        let param = some_or!(alloc_param_map.get(&alloc), return None);
+        let mut projections = vec![*param];
+        let mut array_access = false;
+        for proj in place.projection.iter() {
+            match proj {
+                AbsProjElem::Field(idx) => projections.push(*idx),
+                AbsProjElem::Index(_) => {
+                    array_access = true;
+                    break;
+                }
+            }
+        }
+        Some((Self(projections), array_access))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MustPathSet {
+    All,
+    Set(BTreeSet<AbsPath>),
+}
+
+impl MustPathSet {
+    pub fn top() -> Self {
+        Self::Set(BTreeSet::new())
+    }
+
+    pub fn bot() -> Self {
+        Self::All
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (s, Self::All) | (Self::All, s) => s.clone(),
+            (Self::Set(s1), Self::Set(s2)) => {
+                let mut s = s1.clone();
+                s.retain(|p| s2.contains(p));
+                Self::Set(s)
+            }
+        }
+    }
+
+    pub fn insert(&mut self, place: AbsPath) {
+        if let Self::Set(set) = self {
+            set.insert(place);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MayPlaceSet(BTreeSet<AbsPath>);
+
+impl MayPlaceSet {
+    pub fn bot() -> Self {
+        Self(BTreeSet::new())
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        Self(self.0.union(&other.0).cloned().collect())
+    }
+
+    pub fn insert(&mut self, place: AbsPath) {
+        self.0.insert(place);
     }
 }
