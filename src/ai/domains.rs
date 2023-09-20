@@ -273,6 +273,13 @@ impl AbsValue {
         }
     }
 
+    pub fn ptr(ptrv: AbsPtr) -> Self {
+        Self {
+            ptrv,
+            ..Self::bot()
+        }
+    }
+
     pub fn not(&self) -> Self {
         Self {
             intv: self.intv.not(),
@@ -855,7 +862,7 @@ impl AbsInt {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsUint {
     Top,
     Set(BTreeSet<u128>),
@@ -1526,10 +1533,22 @@ impl AbsList {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsPlace {
+    pub local: usize,
+    pub projection: Vec<AbsProjElem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AbsProjElem {
+    Field(usize),
+    Index(AbsUint),
+}
+
 #[derive(Debug, Clone)]
 pub enum AbsPtr {
     Top,
-    Set(BTreeSet<usize>),
+    Set(BTreeSet<AbsPlace>),
 }
 
 impl AbsPtr {
@@ -1549,11 +1568,11 @@ impl AbsPtr {
         }
     }
 
-    pub fn alpha(n: usize) -> Self {
+    pub fn alpha(n: AbsPlace) -> Self {
         Self::alphas([n].into_iter().collect())
     }
 
-    pub fn alphas(set: BTreeSet<usize>) -> Self {
+    pub fn alphas(set: BTreeSet<AbsPlace>) -> Self {
         if set.len() > MAX_SIZE {
             Self::Top
         } else {

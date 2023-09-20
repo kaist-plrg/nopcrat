@@ -1,8 +1,10 @@
+use etrace::some_or;
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Operand, Place, PlaceElem,
-        ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind, UnOp,
+        AggregateKind, BinOp, BorrowKind, CastKind, Constant, ConstantKind, MutBorrowKind, Operand,
+        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorKind, UnOp,
     },
     ty::{Ty, TyKind},
 };
@@ -14,8 +16,25 @@ pub fn transfer_statement(stmt: &Statement<'_>, state: &AbsState) -> AbsState {
     if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
         let new_v = transfer_rvalue(rvalue, state);
         let mut new_state = state.clone();
-        let old_v = new_state.local.get_mut(place.local.index());
-        update_value(new_v, old_v, false, place.projection, state);
+        if place.is_indirect_first_projection() {
+            let projection = abstract_projection(&place.projection[1..], state);
+            let ptr = state.local.get(place.local.index());
+            if let AbsPtr::Set(ptrs) = &ptr.ptrv {
+                let weak = ptrs.len() > 1;
+                for ptr in ptrs {
+                    let old_v = new_state.local.get_mut(ptr.local);
+                    let mut ptr_projection = ptr.projection.clone();
+                    ptr_projection.append(&mut projection.clone());
+                    update_value(new_v.clone(), old_v, weak, &projection);
+                }
+            } else {
+                todo!("{:?}", stmt);
+            }
+        } else {
+            let old_v = new_state.local.get_mut(place.local.index());
+            let projection = abstract_projection(place.projection, state);
+            update_value(new_v, old_v, false, &projection);
+        }
         new_state
     } else {
         unreachable!("{:?}", stmt)
@@ -49,9 +68,23 @@ pub fn transfer_rvalue(rvalue: &Rvalue<'_>, state: &AbsState) -> AbsValue {
             let len = len.try_to_scalar_int().unwrap().try_to_u128().unwrap();
             AbsValue::list(vec![v; len as usize])
         }
-        Rvalue::Ref(_, _, _) => todo!("{:?}", rvalue),
+        Rvalue::Ref(_, kind, place) => {
+            assert!(matches!(
+                kind,
+                BorrowKind::Mut {
+                    kind: MutBorrowKind::Default
+                }
+            ));
+            let place = abstract_place(place, state);
+            AbsValue::ptr(AbsPtr::alpha(place))
+        }
         Rvalue::ThreadLocalRef(_) => unreachable!("{:?}", rvalue),
-        Rvalue::AddressOf(_, _) => todo!("{:?}", rvalue),
+        Rvalue::AddressOf(_, place) => {
+            assert_eq!(place.projection.len(), 1);
+            assert!(place.is_indirect_first_projection());
+            let v = state.local.get(place.local.index());
+            AbsValue::ptr(v.ptrv.clone())
+        }
         Rvalue::Len(_) => unreachable!("{:?}", rvalue),
         Rvalue::Cast(kind, operand, ty) => {
             let v = transfer_operand(operand, state);
@@ -165,8 +198,27 @@ pub fn transfer_operand(operand: &Operand<'_>, state: &AbsState) -> AbsValue {
 }
 
 pub fn transfer_place(place: &Place<'_>, state: &AbsState) -> AbsValue {
-    let v = state.local.get(place.local.index());
-    get_value(v, place.projection, state)
+    if place.is_indirect_first_projection() {
+        let projection = abstract_projection(&place.projection[1..], state);
+        let ptr = state.local.get(place.local.index());
+        if let AbsPtr::Set(ptrs) = &ptr.ptrv {
+            ptrs.iter()
+                .map(|ptr| {
+                    let v = state.local.get(ptr.local);
+                    let mut ptr_projection = ptr.projection.clone();
+                    ptr_projection.append(&mut projection.clone());
+                    get_value(v, &projection)
+                })
+                .reduce(|v1, v2| v1.join(&v2))
+                .unwrap_or(AbsValue::bot())
+        } else {
+            AbsValue::top()
+        }
+    } else {
+        let v = state.local.get(place.local.index());
+        let projection = abstract_projection(place.projection, state);
+        get_value(v, &projection)
+    }
 }
 
 pub fn transfer_constant(constant: &Constant<'_>, _state: &AbsState) -> AbsValue {
@@ -253,48 +305,54 @@ pub fn top_value_of_ty(ty: &Ty<'_>) -> AbsValue {
     }
 }
 
-fn update_value(
-    new_v: AbsValue,
-    old_v: &mut AbsValue,
-    weak: bool,
-    projection: &[PlaceElem<'_>],
-    state: &AbsState,
-) {
+pub fn abstract_place(place: &Place<'_>, state: &AbsState) -> AbsPlace {
+    let local = place.local.index();
+    let projection = abstract_projection(place.projection, state);
+    AbsPlace { local, projection }
+}
+
+pub fn abstract_projection(projection: &[PlaceElem<'_>], state: &AbsState) -> Vec<AbsProjElem> {
+    projection.iter().map(|e| abstract_elem(e, state)).collect()
+}
+
+pub fn abstract_elem(elem: &PlaceElem<'_>, state: &AbsState) -> AbsProjElem {
+    match elem {
+        ProjectionElem::Deref => todo!("{:?}", elem),
+        ProjectionElem::Field(field, _) => AbsProjElem::Field(field.index()),
+        ProjectionElem::Index(idx) => {
+            AbsProjElem::Index(state.local.get(idx.index()).uintv.clone())
+        }
+        ProjectionElem::ConstantIndex { .. } => unreachable!("{:?}", elem),
+        ProjectionElem::Subslice { .. } => unreachable!("{:?}", elem),
+        ProjectionElem::Downcast(_, _) => unreachable!("{:?}", elem),
+        ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", elem),
+    }
+}
+
+fn update_value(new_v: AbsValue, old_v: &mut AbsValue, weak: bool, projection: &[AbsProjElem]) {
     if let Some(first) = projection.first() {
         match first {
-            ProjectionElem::Deref => todo!("{:?}", projection),
-            ProjectionElem::Field(field, _) => {
-                if let Some(old_v) = old_v.listv.get_mut(field.index()) {
-                    update_value(new_v, old_v, weak, &projection[1..], state);
+            AbsProjElem::Field(field) => {
+                if let Some(old_v) = old_v.listv.get_mut(*field) {
+                    update_value(new_v, old_v, weak, &projection[1..]);
                 }
             }
-            ProjectionElem::Index(idx) => {
-                let idx = state.local.get(idx.index());
-                if let Some(indices) = idx.uintv.gamma() {
-                    if indices.len() == 1 {
-                        let idx = indices.first().unwrap();
-                        if let Some(old_v) = old_v.listv.get_mut(*idx as _) {
-                            update_value(new_v, old_v, weak, &projection[1..], state);
-                        }
-                    } else {
-                        for idx in indices {
-                            if let Some(old_v) = old_v.listv.get_mut(*idx as _) {
-                                update_value(new_v.clone(), old_v, true, &projection[1..], state);
-                            }
-                        }
-                    }
-                } else if let Some(len) = old_v.listv.len() {
-                    for idx in 0..len {
-                        if let Some(old_v) = old_v.listv.get_mut(idx) {
-                            update_value(new_v.clone(), old_v, true, &projection[1..], state);
+            AbsProjElem::Index(idx) => {
+                if let AbsList::List(l) = &mut old_v.listv {
+                    let (indices, new_weak): (Box<dyn Iterator<Item = usize>>, _) =
+                        if let Some(indices) = idx.gamma() {
+                            (Box::new(indices.iter().map(|i| *i as _)), indices.len() > 1)
+                        } else {
+                            (Box::new(0..l.len()), l.len() > 1)
+                        };
+                    let weak = weak || new_weak;
+                    for idx in indices {
+                        if let Some(old_v) = l.get_mut(idx) {
+                            update_value(new_v.clone(), old_v, weak, &projection[1..]);
                         }
                     }
                 }
             }
-            ProjectionElem::ConstantIndex { .. } => unreachable!("{:?}", projection),
-            ProjectionElem::Subslice { .. } => unreachable!("{:?}", projection),
-            ProjectionElem::Downcast(_, _) => unreachable!("{:?}", projection),
-            ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", projection),
         }
     } else if weak {
         *old_v = new_v.join(old_v);
@@ -303,54 +361,34 @@ fn update_value(
     }
 }
 
-fn get_value(v: &AbsValue, projection: &[PlaceElem<'_>], state: &AbsState) -> AbsValue {
-    if let Some(first) = projection.first() {
-        match first {
-            ProjectionElem::Deref => todo!("{:?}", projection),
-            ProjectionElem::Field(field, ty) => match &v.listv {
-                AbsList::Top => top_value_of_ty(ty),
-                AbsList::List(l) => {
-                    let v = &l[field.index()];
-                    get_value(v, &projection[1..], state)
-                }
-                AbsList::Bot => AbsValue::bot(),
-            },
-            ProjectionElem::Index(idx) => {
-                let idx = state.local.get(idx.index());
-                if let Some(indices) = idx.uintv.gamma() {
-                    indices
-                        .iter()
-                        .map(|index| match &v.listv {
-                            AbsList::Top => AbsValue::top(),
-                            AbsList::List(l) => {
-                                if let Some(v) = l.get(*index as usize) {
-                                    get_value(v, &projection[1..], state)
-                                } else {
-                                    AbsValue::bot()
-                                }
-                            }
-                            AbsList::Bot => AbsValue::bot(),
-                        })
-                        .reduce(|v1, v2| v1.join(&v2))
-                        .unwrap_or(AbsValue::bot())
+fn get_value(v: &AbsValue, projection: &[AbsProjElem]) -> AbsValue {
+    let first = some_or!(projection.first(), return v.clone());
+    match first {
+        AbsProjElem::Field(field) => match &v.listv {
+            AbsList::Top => AbsValue::top(),
+            AbsList::List(l) => get_value(&l[*field], &projection[1..]),
+            AbsList::Bot => AbsValue::bot(),
+        },
+        AbsProjElem::Index(idx) => match &v.listv {
+            AbsList::Top => {
+                if idx.is_bot() {
+                    AbsValue::bot()
                 } else {
-                    match &v.listv {
-                        AbsList::Top => AbsValue::top(),
-                        AbsList::List(l) => l
-                            .iter()
-                            .map(|v| get_value(v, &projection[1..], state))
-                            .reduce(|v1, v2| v1.join(&v2))
-                            .unwrap_or(AbsValue::bot()),
-                        AbsList::Bot => AbsValue::bot(),
-                    }
+                    AbsValue::top()
                 }
             }
-            ProjectionElem::ConstantIndex { .. } => unreachable!("{:?}", projection),
-            ProjectionElem::Subslice { .. } => unreachable!("{:?}", projection),
-            ProjectionElem::Downcast(_, _) => unreachable!("{:?}", projection),
-            ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", projection),
-        }
-    } else {
-        v.clone()
+            AbsList::List(l) => {
+                let indices: Box<dyn Iterator<Item = usize>> = if let Some(indices) = idx.gamma() {
+                    Box::new(indices.iter().map(|i| *i as _))
+                } else {
+                    Box::new(0..l.len())
+                };
+                indices
+                    .filter_map(|index| l.get(index).map(|v| get_value(v, &projection[1..])))
+                    .reduce(|v1, v2| v1.join(&v2))
+                    .unwrap_or(AbsValue::bot())
+            }
+            AbsList::Bot => AbsValue::bot(),
+        },
     }
 }
