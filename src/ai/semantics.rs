@@ -186,7 +186,7 @@ pub fn transfer_rvalue(rvalue: &Rvalue<'_>, state: &AbsState) -> AbsValue {
             AggregateKind::Generator(_, _, _) => unreachable!("{:?}", rvalue),
         },
         Rvalue::ShallowInitBox(_, _) => unreachable!("{:?}", rvalue),
-        Rvalue::CopyForDeref(_) => todo!("{:?}", rvalue),
+        Rvalue::CopyForDeref(place) => transfer_place(place, state),
     }
 }
 

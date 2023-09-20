@@ -21,9 +21,10 @@ fn main() {
         "
         unsafe fn f() -> i32 {
             let mut x: i32 = 0;
-            let p: *mut i32 = &mut x;
-            *p = 1;
-            return *p;
+            let mut p: *mut i32 = &mut x;
+            let mut q: *mut *mut i32 = &mut p;
+            **q = 1;
+            return **q;
         }
     ",
     );
