@@ -23,7 +23,8 @@ fn main() {
         unsafe fn f(i: *mut S) -> i32 {
             let p: *mut i32 = &mut (*i).x;
             *p = 1;
-            0
+            (*i).y = (*i).x;
+            *p
         }
     ",
     );

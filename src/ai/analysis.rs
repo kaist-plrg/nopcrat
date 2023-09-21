@@ -49,7 +49,11 @@ pub fn analyze_code(code: &str) {
                 param_tys.push(ty);
             }
 
-            let analyzer = Analyzer { tcx, param_tys };
+            let mut analyzer = Analyzer {
+                tcx,
+                alloc_param_map: BTreeMap::new(),
+                param_tys,
+            };
             println!("{:?}", def_id);
             analyzer.analyze_body(body, inputs);
         }
@@ -59,16 +63,17 @@ pub fn analyze_code(code: &str) {
 #[derive(Clone)]
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    pub alloc_param_map: BTreeMap<usize, usize>,
     param_tys: Vec<TypeInfo>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    pub fn analyze_body(&self, body: &Body<'tcx>, inputs: usize) {
+    pub fn analyze_body(&mut self, body: &Body<'tcx>, inputs: usize) {
         let mut work_list = WorkList::default();
         let mut states: BTreeMap<Location, AbsState> = BTreeMap::new();
 
         let mut start_state = AbsState::bot(body.local_decls.len());
-        let mut alloc_param_map = BTreeMap::new();
+        start_state.writes = MustPathSet::top();
         for i in 1..=inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
@@ -81,7 +86,7 @@ impl<'tcx> Analyzer<'tcx> {
                 } else {
                     unreachable!()
                 };
-                alloc_param_map.insert(alloc, i);
+                self.alloc_param_map.insert(alloc, i);
             }
             start_state.local.set(i, v);
         }
@@ -100,7 +105,7 @@ impl<'tcx> Analyzer<'tcx> {
             let bbd = &body.basic_blocks[block];
             let (new_next_state, next_locations) = if statement_index < bbd.statements.len() {
                 let stmt = &bbd.statements[statement_index];
-                let new_next_state = self.transfer_statement(stmt, state, &alloc_param_map);
+                let new_next_state = self.transfer_statement(stmt, state);
                 let next_location = Location {
                     block,
                     statement_index: statement_index + 1,

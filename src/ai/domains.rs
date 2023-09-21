@@ -7,6 +7,8 @@ use rustc_span::def_id::DefId;
 pub struct AbsState {
     pub local: AbsLocal,
     pub heap: AbsHeap,
+    pub writes: MustPathSet,
+    pub reads: MayPathSet,
 }
 
 impl AbsState {
@@ -14,6 +16,8 @@ impl AbsState {
         Self {
             local: AbsLocal::bot(len),
             heap: AbsHeap::bot(),
+            writes: MustPathSet::bot(),
+            reads: MayPathSet::bot(),
         }
     }
 
@@ -21,11 +25,16 @@ impl AbsState {
         Self {
             local: self.local.join(&other.local),
             heap: self.heap.join(&other.heap),
+            writes: self.writes.join(&other.writes),
+            reads: self.reads.join(&other.reads),
         }
     }
 
     pub fn ord(&self, other: &Self) -> bool {
-        self.local.ord(&other.local) && self.heap.ord(&other.heap)
+        self.local.ord(&other.local)
+            && self.heap.ord(&other.heap)
+            && self.writes.ord(&other.writes)
+            && self.reads.ord(&other.reads)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -41,10 +50,32 @@ impl AbsState {
             AbsBase::Heap(i) => self.heap.0.get_mut(i),
         }
     }
+
+    pub fn add_reads<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            if !self.writes.contains(&path) {
+                self.reads.insert(path);
+            }
+        }
+    }
+
+    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            if !self.reads.contains(&path) {
+                self.writes.insert(path);
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AbsHeap(Vec<AbsValue>);
+
+impl std::fmt::Debug for AbsHeap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
 
 impl AbsHeap {
     pub fn bot() -> Self {
@@ -74,8 +105,14 @@ impl AbsHeap {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AbsLocal(Vec<AbsValue>);
+
+impl std::fmt::Debug for AbsLocal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
 
 impl AbsLocal {
     pub fn bot(len: usize) -> Self {
@@ -1789,8 +1826,23 @@ impl AbsFn {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbsPath(pub Vec<usize>);
+
+impl std::fmt::Debug for AbsPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for idx in self.0.iter() {
+            if first {
+                first = false;
+            } else {
+                write!(f, ".")?;
+            }
+            write!(f, "{}", idx)?;
+        }
+        Ok(())
+    }
+}
 
 impl AbsPath {
     pub fn base(&self) -> usize {
@@ -1822,10 +1874,19 @@ impl AbsPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum MustPathSet {
     All,
     Set(BTreeSet<AbsPath>),
+}
+
+impl std::fmt::Debug for MustPathSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MustPathSet::All => write!(f, "All"),
+            MustPathSet::Set(s) => write!(f, "{:?}", s),
+        }
+    }
 }
 
 impl MustPathSet {
@@ -1840,11 +1901,15 @@ impl MustPathSet {
     pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (s, Self::All) | (Self::All, s) => s.clone(),
-            (Self::Set(s1), Self::Set(s2)) => {
-                let mut s = s1.clone();
-                s.retain(|p| s2.contains(p));
-                Self::Set(s)
-            }
+            (Self::Set(s1), Self::Set(s2)) => Self::Set(s1.intersection(s2).cloned().collect()),
+        }
+    }
+
+    pub fn ord(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::All, _) => true,
+            (_, Self::All) => false,
+            (Self::Set(s1), Self::Set(s2)) => s2.is_subset(s1),
         }
     }
 
@@ -1853,12 +1918,25 @@ impl MustPathSet {
             set.insert(place);
         }
     }
+
+    pub fn contains(&self, place: &AbsPath) -> bool {
+        match self {
+            Self::All => true,
+            Self::Set(set) => set.contains(place),
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MayPlaceSet(BTreeSet<AbsPath>);
+#[derive(Clone)]
+pub struct MayPathSet(BTreeSet<AbsPath>);
 
-impl MayPlaceSet {
+impl std::fmt::Debug for MayPathSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl MayPathSet {
     pub fn bot() -> Self {
         Self(BTreeSet::new())
     }
@@ -1867,7 +1945,15 @@ impl MayPlaceSet {
         Self(self.0.union(&other.0).cloned().collect())
     }
 
+    pub fn ord(&self, other: &Self) -> bool {
+        self.0.is_subset(&other.0)
+    }
+
     pub fn insert(&mut self, place: AbsPath) {
         self.0.insert(place);
+    }
+
+    pub fn contains(&self, place: &AbsPath) -> bool {
+        self.0.contains(place)
     }
 }

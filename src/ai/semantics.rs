@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use etrace::some_or;
 use rustc_abi::VariantIdx;
@@ -18,14 +18,10 @@ use super::domains::*;
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'tcx> {
-    pub fn transfer_statement(
-        &self,
-        stmt: &Statement<'tcx>,
-        state: &AbsState,
-        alloc_param_map: &BTreeMap<usize, usize>,
-    ) -> AbsState {
+    pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-            let new_v = self.transfer_rvalue(rvalue, state);
+            let (new_v, reads) = self.transfer_rvalue(rvalue, state);
+            let mut writes = vec![];
             let mut new_state = state.clone();
             if place.is_indirect_first_projection() {
                 let projection = self.abstract_projection(&place.projection[1..], state);
@@ -36,14 +32,15 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         let old_v = new_state.get_mut(ptr.base).unwrap();
                         let mut ptr_projection = ptr.projection.clone();
                         ptr_projection.append(&mut projection.clone());
-                        self.update_value(new_v.clone(), old_v, weak, &projection);
+                        self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
                     }
                     if ptrs.len() == 1 {
                         let mut ptr = ptrs.first().unwrap().clone();
                         ptr.projection.append(&mut projection.clone());
-                        if let Some((path, false)) = AbsPath::from_place(&ptr, alloc_param_map) {
-                            let paths = self.expands_path(&path);
-                            println!("{:?}", paths);
+                        if let Some((path, false)) =
+                            AbsPath::from_place(&ptr, &self.alloc_param_map)
+                        {
+                            writes = self.expands_path(&path);
                         }
                     }
                 } else {
@@ -54,6 +51,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 let projection = self.abstract_projection(place.projection, state);
                 self.update_value(new_v, old_v, false, &projection);
             }
+            new_state.add_reads(reads.into_iter());
+            new_state.add_writes(writes.into_iter());
             new_state
         } else {
             unreachable!("{:?}", stmt)
@@ -63,14 +62,24 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
     pub fn transfer_terminator(&self, terminator: &Terminator<'tcx>, state: &AbsState) -> AbsState {
         match &terminator.kind {
             TerminatorKind::Goto { .. } => state.clone(),
-            TerminatorKind::SwitchInt { .. } => state.clone(),
+            TerminatorKind::SwitchInt { discr, .. } => {
+                let (_, reads) = self.transfer_operand(discr, state);
+                let mut new_state = state.clone();
+                new_state.add_reads(reads.into_iter());
+                new_state
+            }
             TerminatorKind::UnwindResume => state.clone(),
             TerminatorKind::UnwindTerminate(_) => state.clone(),
             TerminatorKind::Return => state.clone(),
             TerminatorKind::Unreachable => state.clone(),
             TerminatorKind::Drop { .. } => state.clone(),
             TerminatorKind::Call { .. } => todo!("{:?}", terminator.kind),
-            TerminatorKind::Assert { .. } => state.clone(),
+            TerminatorKind::Assert { cond, .. } => {
+                let (_, reads) = self.transfer_operand(cond, state);
+                let mut new_state = state.clone();
+                new_state.add_reads(reads.into_iter());
+                new_state
+            }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseEdge { .. } => unreachable!("{:?}", terminator.kind),
@@ -79,13 +88,13 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    fn transfer_rvalue(&self, rvalue: &Rvalue<'tcx>, state: &AbsState) -> AbsValue {
+    fn transfer_rvalue(&self, rvalue: &Rvalue<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
         match rvalue {
             Rvalue::Use(operand) => self.transfer_operand(operand, state),
             Rvalue::Repeat(operand, len) => {
-                let v = self.transfer_operand(operand, state);
+                let (v, reads) = self.transfer_operand(operand, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u128().unwrap();
-                AbsValue::list(vec![v; len as usize])
+                (AbsValue::list(vec![v; len as usize]), reads)
             }
             Rvalue::Ref(_, kind, place) => {
                 assert!(matches!(
@@ -94,7 +103,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         kind: MutBorrowKind::Default
                     }
                 ));
-                if place.is_indirect_first_projection() {
+                let v = if place.is_indirect_first_projection() {
                     let projection = self.abstract_projection(&place.projection[1..], state);
                     let ptr = state.local.get(place.local.index());
                     if let AbsPtr::Set(ptrs) = &ptr.ptrv {
@@ -116,19 +125,20 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 } else {
                     let place = self.abstract_place(place, state);
                     AbsValue::ptr(AbsPtr::alpha(place))
-                }
+                };
+                (v, vec![])
             }
             Rvalue::ThreadLocalRef(_) => unreachable!("{:?}", rvalue),
             Rvalue::AddressOf(_, place) => {
                 assert_eq!(place.projection.len(), 1);
                 assert!(place.is_indirect_first_projection());
                 let v = state.local.get(place.local.index());
-                AbsValue::ptr(v.ptrv.clone())
+                (AbsValue::ptr(v.ptrv.clone()), vec![])
             }
             Rvalue::Len(_) => unreachable!("{:?}", rvalue),
             Rvalue::Cast(kind, operand, ty) => {
-                let v = self.transfer_operand(operand, state);
-                match kind {
+                let (v, reads) = self.transfer_operand(operand, state);
+                let v = match kind {
                     CastKind::PointerExposeAddress => todo!("{:?}", rvalue),
                     CastKind::PointerFromExposedAddress => todo!("{:?}", rvalue),
                     CastKind::PointerCoercion(_) => todo!("{:?}", rvalue),
@@ -165,12 +175,13 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     CastKind::PtrToPtr => todo!("{:?}", rvalue),
                     CastKind::FnPtrToPtr => todo!("{:?}", rvalue),
                     CastKind::Transmute => todo!("{:?}", rvalue),
-                }
+                };
+                (v, reads)
             }
             Rvalue::BinaryOp(binop, box (l, r)) => {
-                let l = self.transfer_operand(l, state);
-                let r = self.transfer_operand(r, state);
-                match binop {
+                let (l, mut reads_l) = self.transfer_operand(l, state);
+                let (r, mut reads_r) = self.transfer_operand(r, state);
+                let v = match binop {
                     BinOp::Add => l.add(&r),
                     BinOp::AddUnchecked => unreachable!("{:?}", rvalue),
                     BinOp::Sub => l.sub(&r),
@@ -193,34 +204,41 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     BinOp::Ge => l.ge(&r),
                     BinOp::Gt => l.gt(&r),
                     BinOp::Offset => todo!("{:?}", rvalue),
-                }
+                };
+                reads_l.append(&mut reads_r);
+                (v, reads_l)
             }
             Rvalue::CheckedBinaryOp(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::NullaryOp(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::UnaryOp(unary, operand) => {
-                let v = self.transfer_operand(operand, state);
-                match unary {
+                let (v, reads) = self.transfer_operand(operand, state);
+                let v = match unary {
                     UnOp::Not => v.not(),
                     UnOp::Neg => v.neg(),
-                }
+                };
+                (v, reads)
             }
             Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
             Rvalue::Aggregate(box kind, fields) => match kind {
-                AggregateKind::Array(_) => AbsValue::list(
-                    fields
+                AggregateKind::Array(_) => {
+                    let (vs, readss): (Vec<_>, Vec<_>) = fields
                         .iter()
                         .map(|operand| self.transfer_operand(operand, state))
-                        .collect(),
-                ),
+                        .unzip();
+                    let v = AbsValue::list(vs.into_iter().collect());
+                    let reads = readss.into_iter().flatten().collect();
+                    (v, reads)
+                }
                 AggregateKind::Tuple => unreachable!("{:?}", rvalue),
                 AggregateKind::Adt(def_id, _, _, _, _) => {
                     assert!(def_id.is_local());
-                    AbsValue::list(
-                        fields
-                            .iter()
-                            .map(|operand| self.transfer_operand(operand, state))
-                            .collect(),
-                    )
+                    let (vs, readss): (Vec<_>, Vec<_>) = fields
+                        .iter()
+                        .map(|operand| self.transfer_operand(operand, state))
+                        .unzip();
+                    let v = AbsValue::list(vs.into_iter().collect());
+                    let reads = readss.into_iter().flatten().collect();
+                    (v, reads)
                 }
                 AggregateKind::Closure(_, _) => unreachable!("{:?}", rvalue),
                 AggregateKind::Generator(_, _, _) => unreachable!("{:?}", rvalue),
@@ -230,34 +248,49 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    fn transfer_operand(&self, operand: &Operand<'tcx>, state: &AbsState) -> AbsValue {
+    fn transfer_operand(
+        &self,
+        operand: &Operand<'tcx>,
+        state: &AbsState,
+    ) -> (AbsValue, Vec<AbsPath>) {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.transfer_place(place, state),
-            Operand::Constant(constant) => self.transfer_constant(constant),
+            Operand::Constant(constant) => (self.transfer_constant(constant), vec![]),
         }
     }
 
-    fn transfer_place(&self, place: &Place<'tcx>, state: &AbsState) -> AbsValue {
+    fn transfer_place(&self, place: &Place<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
         if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());
             if let AbsPtr::Set(ptrs) = &ptr.ptrv {
-                ptrs.iter()
+                let v = ptrs
+                    .iter()
                     .map(|ptr| {
                         let v = state.get(ptr.base).unwrap();
                         let mut ptr_projection = ptr.projection.clone();
                         ptr_projection.append(&mut projection.clone());
-                        self.get_value(v, &projection)
+                        self.get_value(v, &ptr_projection)
                     })
                     .reduce(|v1, v2| v1.join(&v2))
-                    .unwrap_or(AbsValue::bot())
+                    .unwrap_or(AbsValue::bot());
+                let reads: Vec<_> = ptrs
+                    .iter()
+                    .cloned()
+                    .filter_map(|mut ptr| {
+                        ptr.projection.append(&mut projection.clone());
+                        AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
+                    })
+                    .flat_map(|path| self.expands_path(&path))
+                    .collect();
+                (v, reads)
             } else {
-                AbsValue::top()
+                (AbsValue::top(), vec![])
             }
         } else {
             let v = state.local.get(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
-            self.get_value(v, &projection)
+            (self.get_value(v, &projection), vec![])
         }
     }
 
