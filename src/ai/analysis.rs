@@ -9,10 +9,10 @@ use rustc_middle::{
 use super::domains::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Label {
-    location: Location,
-    writes: MustPathSet,
-    reads: MayPathSet,
+pub struct Label {
+    pub location: Location,
+    pub writes: MustPathSet,
+    pub reads: MayPathSet,
 }
 
 #[derive(Default)]
@@ -42,46 +42,62 @@ pub fn analyze_code(code: &str) {
             };
             let def_id = item.item_id().owner_id.def_id.to_def_id();
             let body = tcx.optimized_mir(def_id);
-
-            let mut param_tys = vec![];
-            for (i, local) in body.local_decls.iter().enumerate() {
-                if i > inputs {
-                    break;
-                }
-                let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
-                    TypeInfo::from_ty(&tm.ty, tcx)
-                } else {
-                    TypeInfo::NonStruct
-                };
-                param_tys.push(ty);
-            }
-
             let mut analyzer = Analyzer {
                 tcx,
+                inputs,
                 alloc_param_map: BTreeMap::new(),
-                param_tys,
+                param_tys: vec![],
             };
-            println!("{:?}", def_id);
-            analyzer.analyze_body(body, inputs);
+            let result = analyzer.analyze_body(body);
+            show_analysis_result(body, &result);
         }
     });
+}
+
+pub fn return_location(body: &Body<'_>) -> Option<Location> {
+    for block in body.basic_blocks.indices() {
+        let bbd = &body.basic_blocks[block];
+        if let Some(terminator) = &bbd.terminator {
+            if terminator.kind == TerminatorKind::Return {
+                let location = Location {
+                    block,
+                    statement_index: bbd.statements.len(),
+                };
+                return Some(location);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
+    pub inputs: usize,
     pub alloc_param_map: BTreeMap<usize, usize>,
-    param_tys: Vec<TypeInfo>,
+    pub param_tys: Vec<TypeInfo>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    pub fn analyze_body(&mut self, body: &Body<'tcx>, inputs: usize) {
+    pub fn analyze_body(&mut self, body: &Body<'tcx>) -> BTreeMap<Label, AbsState> {
+        for (i, local) in body.local_decls.iter().enumerate() {
+            if i > self.inputs {
+                break;
+            }
+            let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
+                TypeInfo::from_ty(&tm.ty, self.tcx)
+            } else {
+                TypeInfo::NonStruct
+            };
+            self.param_tys.push(ty);
+        }
+
         let mut work_list = WorkList::default();
         let mut states: BTreeMap<Label, AbsState> = BTreeMap::new();
 
         let mut start_state = AbsState::bot(body.local_decls.len());
         start_state.writes = MustPathSet::top();
-        for i in 1..=inputs {
+        for i in 1..=self.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             if matches!(ty.kind(), TyKind::RawPtr(_)) {
@@ -143,36 +159,7 @@ impl<'tcx> Analyzer<'tcx> {
             }
         }
 
-        for block in body.basic_blocks.indices() {
-            let bbd = &body.basic_blocks[block];
-            println!("{:?}", block);
-            for (statement_index, stmt) in bbd.statements.iter().enumerate() {
-                let location = Location {
-                    block,
-                    statement_index,
-                };
-                for (label, state) in &states {
-                    if label.location != location {
-                        continue;
-                    }
-                    println!("{:?}", state);
-                }
-                println!("{:?}", stmt);
-            }
-            if let Some(terminator) = bbd.terminator.as_ref() {
-                let location = Location {
-                    block,
-                    statement_index: bbd.statements.len(),
-                };
-                for (label, state) in &states {
-                    if label.location != location {
-                        continue;
-                    }
-                    println!("{:?}", state);
-                }
-                println!("{:?}", terminator);
-            }
-        }
+        states
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
@@ -180,6 +167,40 @@ impl<'tcx> Analyzer<'tcx> {
             .into_iter()
             .map(AbsPath)
             .collect()
+    }
+}
+
+#[allow(unused)]
+fn show_analysis_result(body: &Body<'_>, states: &BTreeMap<Label, AbsState>) {
+    for block in body.basic_blocks.indices() {
+        let bbd = &body.basic_blocks[block];
+        println!("{:?}", block);
+        for (statement_index, stmt) in bbd.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            for (label, state) in states {
+                if label.location != location {
+                    continue;
+                }
+                println!("{:?}", state);
+            }
+            println!("{:?}", stmt);
+        }
+        if let Some(terminator) = bbd.terminator.as_ref() {
+            let location = Location {
+                block,
+                statement_index: bbd.statements.len(),
+            };
+            for (label, state) in states {
+                if label.location != location {
+                    continue;
+                }
+                println!("{:?}", state);
+            }
+            println!("{:?}", terminator);
+        }
     }
 }
 
@@ -228,7 +249,7 @@ fn next_locations_of_terminator(terminator: &Terminator<'_>) -> Vec<Location> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum TypeInfo {
+pub enum TypeInfo {
     Struct(Vec<TypeInfo>),
     NonStruct,
 }

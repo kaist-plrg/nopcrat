@@ -654,7 +654,7 @@ impl AbsValue {
     }
 }
 
-const MAX_SIZE: usize = 10;
+const MAX_SIZE: usize = 11;
 
 #[derive(Clone)]
 pub enum AbsInt {
@@ -693,6 +693,10 @@ impl AbsInt {
         Self::alphas(BTreeSet::new())
     }
 
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
+    }
+
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -710,6 +714,14 @@ impl AbsInt {
             Self::Top
         } else {
             Self::Set(set)
+        }
+    }
+
+    pub fn gamma(&self) -> Option<&BTreeSet<i128>> {
+        if let Self::Set(s) = self {
+            Some(s)
+        } else {
+            None
         }
     }
 
@@ -1247,6 +1259,14 @@ impl AbsFloat {
         Self::new(v.into_iter().map(|n| n.to_bits()).collect())
     }
 
+    pub fn gamma(&self) -> Option<Vec<f64>> {
+        if let Self::Set(s) = self {
+            Some(s.iter().map(|n| f64::from_bits(*n)).collect())
+        } else {
+            None
+        }
+    }
+
     pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
@@ -1443,6 +1463,15 @@ impl AbsBool {
             Self::True
         } else {
             Self::False
+        }
+    }
+
+    pub fn gamma(&self) -> Vec<bool> {
+        match self {
+            Self::Top => vec![true, false],
+            Self::True => vec![true],
+            Self::False => vec![false],
+            Self::Bot => vec![],
         }
     }
 
@@ -1925,6 +1954,34 @@ impl MustPathSet {
             Self::Set(set) => set.contains(place),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Set(set) => set.is_empty(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set.len(),
+        }
+    }
+
+    pub fn as_set(&self) -> &BTreeSet<AbsPath> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set,
+        }
+    }
+
+    pub fn as_vec(&self) -> Vec<&AbsPath> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set.iter().collect(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1955,5 +2012,21 @@ impl MayPathSet {
 
     pub fn contains(&self, place: &AbsPath) -> bool {
         self.0.contains(place)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn as_set(&self) -> &BTreeSet<AbsPath> {
+        &self.0
+    }
+
+    pub fn as_vec(&self) -> Vec<&AbsPath> {
+        self.0.iter().collect()
     }
 }

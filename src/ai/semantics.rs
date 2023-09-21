@@ -93,7 +93,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             Rvalue::Use(operand) => self.transfer_operand(operand, state),
             Rvalue::Repeat(operand, len) => {
                 let (v, reads) = self.transfer_operand(operand, state);
-                let len = len.try_to_scalar_int().unwrap().try_to_u128().unwrap();
+                let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 (AbsValue::list(vec![v; len as usize]), reads)
             }
             Rvalue::Ref(_, kind, place) => {
@@ -374,9 +374,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Foreign(_) => unreachable!("{:?}", ty),
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {
-                let v = self.top_value_of_ty(ty, heap, adts);
-                let len = len.try_to_scalar_int().unwrap().try_to_u128().unwrap();
-                AbsValue::list(vec![v; len as usize])
+                let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
+                AbsValue::list(
+                    (0..len)
+                        .map(|_| self.top_value_of_ty(ty, heap.as_deref_mut(), adts))
+                        .collect(),
+                )
             }
             TyKind::Slice(_) => unreachable!("{:?}", ty),
             TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) => {
