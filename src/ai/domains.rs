@@ -1874,7 +1874,7 @@ impl AbsPath {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MustPathSet {
     All,
     Set(BTreeSet<AbsPath>),
@@ -1927,7 +1927,7 @@ impl MustPathSet {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MayPathSet(BTreeSet<AbsPath>);
 
 impl std::fmt::Debug for MayPathSet {

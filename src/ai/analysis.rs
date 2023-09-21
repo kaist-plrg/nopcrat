@@ -8,16 +8,23 @@ use rustc_middle::{
 
 use super::domains::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Label {
+    location: Location,
+    writes: MustPathSet,
+    reads: MayPathSet,
+}
+
 #[derive(Default)]
-struct WorkList(VecDeque<Location>);
+struct WorkList(VecDeque<Label>);
 
 impl WorkList {
-    fn pop(&mut self) -> Option<Location> {
+    fn pop(&mut self) -> Option<Label> {
         self.0.pop_front()
     }
 
-    fn push(&mut self, loc: Location) {
-        self.0.push_back(loc)
+    fn push(&mut self, label: Label) {
+        self.0.push_back(label)
     }
 }
 
@@ -70,7 +77,7 @@ pub struct Analyzer<'tcx> {
 impl<'tcx> Analyzer<'tcx> {
     pub fn analyze_body(&mut self, body: &Body<'tcx>, inputs: usize) {
         let mut work_list = WorkList::default();
-        let mut states: BTreeMap<Location, AbsState> = BTreeMap::new();
+        let mut states: BTreeMap<Label, AbsState> = BTreeMap::new();
 
         let mut start_state = AbsState::bot(body.local_decls.len());
         start_state.writes = MustPathSet::top();
@@ -91,17 +98,21 @@ impl<'tcx> Analyzer<'tcx> {
             start_state.local.set(i, v);
         }
 
-        let start = Location::START;
-        states.insert(start, start_state);
-        work_list.push(start);
+        let start_label = Label {
+            location: Location::START,
+            writes: start_state.writes.clone(),
+            reads: start_state.reads.clone(),
+        };
+        states.insert(start_label.clone(), start_state);
+        work_list.push(start_label.clone());
 
         let bot = AbsState::bot(body.local_decls.len());
-        while let Some(location) = work_list.pop() {
-            let state = states.get(&location).unwrap_or(&bot);
+        while let Some(label) = work_list.pop() {
+            let state = states.get(&label).unwrap_or(&bot);
             let Location {
                 block,
                 statement_index,
-            } = location;
+            } = label.location;
             let bbd = &body.basic_blocks[block];
             let (new_next_state, next_locations) = if statement_index < bbd.statements.len() {
                 let stmt = &bbd.statements[statement_index];
@@ -117,12 +128,17 @@ impl<'tcx> Analyzer<'tcx> {
                 let next_locations = next_locations_of_terminator(terminator);
                 (new_next_state, next_locations)
             };
-            for next_location in next_locations {
-                let next_state = states.get(&next_location).unwrap_or(&bot);
+            for location in next_locations {
+                let next_label = Label {
+                    location,
+                    writes: new_next_state.writes.clone(),
+                    reads: new_next_state.reads.clone(),
+                };
+                let next_state = states.get(&next_label).unwrap_or(&bot);
                 let joined = next_state.join(&new_next_state);
                 if !joined.ord(next_state) {
-                    states.insert(next_location, joined);
-                    work_list.push(next_location);
+                    states.insert(next_label.clone(), joined);
+                    work_list.push(next_label);
                 }
             }
         }
@@ -135,8 +151,12 @@ impl<'tcx> Analyzer<'tcx> {
                     block,
                     statement_index,
                 };
-                let state = states.get(&location).unwrap_or(&bot);
-                println!("{:?}", state);
+                for (label, state) in &states {
+                    if label.location != location {
+                        continue;
+                    }
+                    println!("{:?}", state);
+                }
                 println!("{:?}", stmt);
             }
             if let Some(terminator) = bbd.terminator.as_ref() {
@@ -144,8 +164,12 @@ impl<'tcx> Analyzer<'tcx> {
                     block,
                     statement_index: bbd.statements.len(),
                 };
-                let state = states.get(&location).unwrap_or(&bot);
-                println!("{:?}", state);
+                for (label, state) in &states {
+                    if label.location != location {
+                        continue;
+                    }
+                    println!("{:?}", state);
+                }
                 println!("{:?}", terminator);
             }
         }
