@@ -249,3 +249,16 @@ fn test_neg() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![-1, 0]);
 }
+
+#[test]
+fn test_const() {
+    let code = "
+        const X: i32 = 0;
+        fn f() -> i32 {
+            X
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+}

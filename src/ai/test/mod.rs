@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
+use rustc_hir::def_id::DefId;
+
 use super::{analysis::*, domains::*};
 
 mod arrays;
 mod cast;
 mod float;
+mod fnptr;
 mod int;
 mod labels;
 mod ptr;
@@ -89,4 +92,41 @@ fn as_bool(v: &AbsValue) -> Vec<bool> {
     assert!(v.optionv.is_bot());
     assert!(v.fnv.is_bot());
     v.boolv.gamma()
+}
+
+fn as_fn(v: &AbsValue) -> Vec<DefId> {
+    assert!(v.intv.is_bot());
+    assert!(v.uintv.is_bot());
+    assert!(v.floatv.is_bot());
+    assert!(v.boolv.is_bot());
+    assert!(v.listv.is_bot());
+    assert!(v.ptrv.is_bot());
+    assert!(v.optionv.is_bot());
+    v.fnv.gamma().unwrap().iter().cloned().collect()
+}
+
+fn is_none(v: &AbsValue) {
+    assert!(v.intv.is_bot());
+    assert!(v.uintv.is_bot());
+    assert!(v.floatv.is_bot());
+    assert!(v.boolv.is_bot());
+    assert!(v.listv.is_bot());
+    assert!(v.ptrv.is_bot());
+    assert!(v.optionv.is_none());
+    assert!(v.fnv.is_bot());
+}
+
+fn as_some(v: &AbsValue) -> &AbsValue {
+    assert!(v.intv.is_bot());
+    assert!(v.uintv.is_bot());
+    assert!(v.floatv.is_bot());
+    assert!(v.boolv.is_bot());
+    assert!(v.listv.is_bot());
+    assert!(v.ptrv.is_bot());
+    assert!(v.fnv.is_bot());
+    if let AbsOption::Some(box v) = &v.optionv {
+        &v
+    } else {
+        panic!("not some")
+    }
 }

@@ -9,9 +9,9 @@ use rustc_hir::ItemKind;
 use rustc_middle::{
     mir::{
         visit::{PlaceContext, Visitor},
-        BasicBlock, BasicBlockData, Body, CallReturnPlaces, Constant, ConstantKind, Location,
-        Place, PlaceElem, PlaceRef, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
-        TerminatorEdges, TerminatorKind,
+        BasicBlock, BasicBlockData, Body, CallReturnPlaces, ClearCrossCrate, Constant,
+        ConstantKind, LocalInfo, Location, Place, PlaceElem, PlaceRef, ProjectionElem, Rvalue,
+        Statement, StatementKind, Terminator, TerminatorEdges, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -20,6 +20,7 @@ use rustc_mir_dataflow::{
     GenKill, Results, ResultsVisitor,
 };
 use rustc_session::config::Input;
+use rustc_span::def_id::DefId;
 
 use crate::compile_util;
 
@@ -108,6 +109,69 @@ fn analyze(input: Input) {
             );
         }
     });
+}
+
+pub fn find_mutable_globals(path: &Path) {
+    let input = compile_util::path_to_input(path);
+    let config = compile_util::make_config(input);
+    compile_util::run_compiler(config, |_, tcx| {
+        let hir = tcx.hir();
+        let mut read_onlys = BTreeSet::new();
+        let mut writes = BTreeSet::new();
+        for id in hir.items() {
+            let item = hir.item(id);
+            let def_id = item.item_id().owner_id.def_id.to_def_id();
+            match &item.kind {
+                ItemKind::Static(_, _, _) => {
+                    read_onlys.insert(def_id);
+                }
+                ItemKind::Fn(_, _, _) => {
+                    let body = tcx.mir_built(def_id.as_local().unwrap()).borrow();
+                    let mut visitor = GlobalWriteVisitor::new(&body);
+                    visitor.visit_body(&body);
+                    writes.append(&mut visitor.globals);
+                }
+                _ => {}
+            }
+        }
+        for write in &writes {
+            read_onlys.remove(write);
+        }
+        println!("read_onlys:");
+        for read_only in read_onlys {
+            println!("{}", tcx.def_path_str(read_only));
+        }
+        println!("writes:");
+        for write in writes {
+            println!("{}", tcx.def_path_str(write));
+        }
+    });
+}
+
+struct GlobalWriteVisitor<'tcx, 'a> {
+    body: &'a Body<'tcx>,
+    globals: BTreeSet<DefId>,
+}
+
+impl<'tcx, 'a> GlobalWriteVisitor<'tcx, 'a> {
+    fn new(body: &'a Body<'tcx>) -> Self {
+        Self {
+            body,
+            globals: BTreeSet::new(),
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for GlobalWriteVisitor<'tcx, '_> {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        if context.is_mutating_use() {
+            let l = &self.body.local_decls[place.local];
+            if let ClearCrossCrate::Set(box LocalInfo::StaticRef { def_id, .. }) = &l.local_info {
+                self.globals.insert(*def_id);
+            }
+        }
+        self.super_place(place, context, location);
+    }
 }
 
 pub fn find_ptr_param_use(path: &Path) {

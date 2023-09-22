@@ -337,6 +337,17 @@ impl AbsValue {
         }
     }
 
+    pub fn option(optionv: AbsOption) -> Self {
+        Self {
+            optionv,
+            ..Self::bot()
+        }
+    }
+
+    pub fn func(fnv: AbsFn) -> Self {
+        Self { fnv, ..Self::bot() }
+    }
+
     pub fn not(&self) -> Self {
         Self {
             intv: self.intv.not(),
@@ -1802,6 +1813,14 @@ impl AbsOption {
             _ => false,
         }
     }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub fn some(v: AbsValue) -> Self {
+        Self::Some(Box::new(v))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1836,6 +1855,14 @@ impl AbsFn {
             Self::Top
         } else {
             Self::Set(set)
+        }
+    }
+
+    pub fn gamma(&self) -> Option<&BTreeSet<DefId>> {
+        if let Self::Set(s) = self {
+            Some(s)
+        } else {
+            None
         }
     }
 

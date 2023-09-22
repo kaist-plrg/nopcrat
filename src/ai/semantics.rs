@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use etrace::some_or;
-use rustc_abi::VariantIdx;
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
@@ -9,7 +9,7 @@ use rustc_middle::{
         Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
-    ty::{Ty, TyKind, TypeAndMut},
+    ty::{AdtKind, Ty, TyKind, TypeAndMut},
 };
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
@@ -141,8 +141,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 let v = match kind {
                     CastKind::PointerExposeAddress => todo!("{:?}", rvalue),
                     CastKind::PointerFromExposedAddress => todo!("{:?}", rvalue),
-                    CastKind::PointerCoercion(_) => todo!("{:?}", rvalue),
-                    CastKind::DynStar => todo!("{:?}", rvalue),
+                    CastKind::PointerCoercion(_) => v,
+                    CastKind::DynStar => unreachable!("{:?}", rvalue),
                     CastKind::IntToInt | CastKind::FloatToInt => match ty.kind() {
                         TyKind::Int(int_ty) => match int_ty {
                             IntTy::Isize => v.to_i64(),
@@ -172,9 +172,9 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             unreachable!("{:?}", rvalue)
                         }
                     }
-                    CastKind::PtrToPtr => todo!("{:?}", rvalue),
-                    CastKind::FnPtrToPtr => todo!("{:?}", rvalue),
-                    CastKind::Transmute => todo!("{:?}", rvalue),
+                    CastKind::PtrToPtr => v,
+                    CastKind::FnPtrToPtr => v,
+                    CastKind::Transmute => unreachable!("{:?}", rvalue),
                 };
                 (v, reads)
             }
@@ -231,14 +231,33 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 }
                 AggregateKind::Tuple => unreachable!("{:?}", rvalue),
                 AggregateKind::Adt(def_id, _, _, _, _) => {
-                    assert!(def_id.is_local());
-                    let (vs, readss): (Vec<_>, Vec<_>) = fields
-                        .iter()
-                        .map(|operand| self.transfer_operand(operand, state))
-                        .unzip();
-                    let v = AbsValue::list(vs.into_iter().collect());
-                    let reads = readss.into_iter().flatten().collect();
-                    (v, reads)
+                    let adt_def = self.tcx.adt_def(def_id);
+                    match adt_def.adt_kind() {
+                        AdtKind::Struct => {
+                            let (vs, readss): (Vec<_>, Vec<_>) = fields
+                                .iter()
+                                .map(|operand| self.transfer_operand(operand, state))
+                                .unzip();
+                            let v = AbsValue::list(vs.into_iter().collect());
+                            let reads = readss.into_iter().flatten().collect();
+                            (v, reads)
+                        }
+                        AdtKind::Union => todo!("{:?}", rvalue),
+                        AdtKind::Enum => {
+                            assert_eq!(
+                                format!("{:?}", adt_def),
+                                "std::option::Option",
+                                "{:?}",
+                                rvalue
+                            );
+                            if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
+                                let (v, reads) = self.transfer_operand(field, state);
+                                (AbsValue::option(AbsOption::some(v)), reads)
+                            } else {
+                                (AbsValue::option(AbsOption::None), vec![])
+                            }
+                        }
+                    }
                 }
                 AggregateKind::Closure(_, _) => unreachable!("{:?}", rvalue),
                 AggregateKind::Generator(_, _, _) => unreachable!("{:?}", rvalue),
@@ -297,50 +316,63 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
     fn transfer_constant(&self, constant: &Constant<'tcx>) -> AbsValue {
         match constant.literal {
             ConstantKind::Ty(_) => unreachable!("{:?}", constant),
-            ConstantKind::Unevaluated(_, ty) => {
-                self.top_value_of_ty(&ty, None, &mut BTreeSet::new())
-            }
-            ConstantKind::Val(v, ty) => {
-                if let ConstValue::Scalar(s) = v {
-                    match s {
-                        Scalar::Int(i) => match ty.kind() {
-                            TyKind::Int(int_ty) => {
-                                let v = match int_ty {
-                                    IntTy::Isize => i.try_to_i64().unwrap() as _,
-                                    IntTy::I8 => i.try_to_i8().unwrap() as _,
-                                    IntTy::I16 => i.try_to_i16().unwrap() as _,
-                                    IntTy::I32 => i.try_to_i32().unwrap() as _,
-                                    IntTy::I64 => i.try_to_i64().unwrap() as _,
-                                    IntTy::I128 => i.try_to_i128().unwrap(),
-                                };
-                                AbsValue::int(v)
-                            }
-                            TyKind::Uint(uint_ty) => {
-                                let v = match uint_ty {
-                                    UintTy::Usize => i.try_to_u64().unwrap() as _,
-                                    UintTy::U8 => i.try_to_u8().unwrap() as _,
-                                    UintTy::U16 => i.try_to_u16().unwrap() as _,
-                                    UintTy::U32 => i.try_to_u32().unwrap() as _,
-                                    UintTy::U64 => i.try_to_u64().unwrap() as _,
-                                    UintTy::U128 => i.try_to_u128().unwrap(),
-                                };
-                                AbsValue::uint(v)
-                            }
-                            TyKind::Float(float_ty) => {
-                                let v = match float_ty {
-                                    FloatTy::F32 => f32::from_bits(i.try_to_u32().unwrap()) as _,
-                                    FloatTy::F64 => f64::from_bits(i.try_to_u64().unwrap()),
-                                };
-                                AbsValue::float(v)
-                            }
-                            _ => unreachable!("{:?}", ty),
-                        },
-                        Scalar::Ptr(_, _) => todo!("{:?}", constant),
-                    }
+            ConstantKind::Unevaluated(constant, ty) => {
+                if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
+                    self.transfer_const_value(&v, &ty)
                 } else {
-                    unreachable!("{:?}", constant)
+                    self.top_value_of_ty(&ty, None, &mut BTreeSet::new())
                 }
             }
+            ConstantKind::Val(v, ty) => self.transfer_const_value(&v, &ty),
+        }
+    }
+
+    pub fn transfer_const_value(&self, v: &ConstValue<'tcx>, ty: &Ty<'tcx>) -> AbsValue {
+        match v {
+            ConstValue::Scalar(s) => match s {
+                Scalar::Int(i) => match ty.kind() {
+                    TyKind::Int(int_ty) => {
+                        let v = match int_ty {
+                            IntTy::Isize => i.try_to_i64().unwrap() as _,
+                            IntTy::I8 => i.try_to_i8().unwrap() as _,
+                            IntTy::I16 => i.try_to_i16().unwrap() as _,
+                            IntTy::I32 => i.try_to_i32().unwrap() as _,
+                            IntTy::I64 => i.try_to_i64().unwrap() as _,
+                            IntTy::I128 => i.try_to_i128().unwrap(),
+                        };
+                        AbsValue::int(v)
+                    }
+                    TyKind::Uint(uint_ty) => {
+                        let v = match uint_ty {
+                            UintTy::Usize => i.try_to_u64().unwrap() as _,
+                            UintTy::U8 => i.try_to_u8().unwrap() as _,
+                            UintTy::U16 => i.try_to_u16().unwrap() as _,
+                            UintTy::U32 => i.try_to_u32().unwrap() as _,
+                            UintTy::U64 => i.try_to_u64().unwrap() as _,
+                            UintTy::U128 => i.try_to_u128().unwrap(),
+                        };
+                        AbsValue::uint(v)
+                    }
+                    TyKind::Float(float_ty) => {
+                        let v = match float_ty {
+                            FloatTy::F32 => f32::from_bits(i.try_to_u32().unwrap()) as _,
+                            FloatTy::F64 => f64::from_bits(i.try_to_u64().unwrap()),
+                        };
+                        AbsValue::float(v)
+                    }
+                    _ => unreachable!("{:?}", ty),
+                },
+                Scalar::Ptr(ptr, _) => todo!("{:?}", self.tcx.global_alloc(ptr.provenance)),
+            },
+            ConstValue::ZeroSized => {
+                if let TyKind::FnDef(def_id, _) = ty.kind() {
+                    AbsValue::func(AbsFn::alpha(*def_id))
+                } else {
+                    unreachable!("{:?}", v)
+                }
+            }
+            ConstValue::Slice { .. } => unreachable!("{:?}", v),
+            ConstValue::ByRef { .. } => unreachable!("{:?}", v),
         }
     }
 
@@ -356,21 +388,26 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Int(_) => AbsValue::int_top(),
             TyKind::Uint(_) => AbsValue::uint_top(),
             TyKind::Float(_) => AbsValue::float_top(),
-            TyKind::Adt(adt, arg) => {
-                assert!(adt.did().is_local());
-                assert!(adt.is_struct());
-                let variant = adt.variant(VariantIdx::from_usize(0));
-                AbsValue::list(
-                    variant
-                        .fields
-                        .iter()
-                        .map(|field| {
-                            let ty = field.ty(self.tcx, arg);
-                            self.top_value_of_ty(&ty, heap.as_deref_mut(), adts)
-                        })
-                        .collect(),
-                )
-            }
+            TyKind::Adt(adt, arg) => match adt.adt_kind() {
+                AdtKind::Struct => {
+                    let variant = adt.variant(VariantIdx::from_usize(0));
+                    AbsValue::list(
+                        variant
+                            .fields
+                            .iter()
+                            .map(|field| {
+                                let ty = field.ty(self.tcx, arg);
+                                self.top_value_of_ty(&ty, heap.as_deref_mut(), adts)
+                            })
+                            .collect(),
+                    )
+                }
+                AdtKind::Union => todo!("{:?}", ty),
+                AdtKind::Enum => {
+                    assert_eq!(format!("{:?}", adt), "std::option::Option", "{:?}", ty);
+                    AbsValue::option(AbsOption::Top)
+                }
+            },
             TyKind::Foreign(_) => unreachable!("{:?}", ty),
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {

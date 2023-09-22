@@ -166,3 +166,16 @@ fn test_neg() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_float(ret(&result[0])), vec![-0.0, -1.0]);
 }
+
+#[test]
+fn test_const() {
+    let code = "
+        const X: f32 = 0.0;
+        fn f() -> f32 {
+            X
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_float(ret(&result[0])), vec![0.0]);
+}

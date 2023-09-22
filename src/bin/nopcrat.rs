@@ -16,15 +16,13 @@ fn main() {
     }
     assert!(path.is_file());
     // analysis::find_ptr_param_use(&path);
+    // analysis::find_mutable_globals(&path);
     // analysis::run_path(path);
     ai::analysis::analyze_code(
         "
-        unsafe fn f(b: bool, p: *mut [*mut i32; 2]) -> i32 {
-            let q = (*p)[0];
-            let r = (*p)[1];
-            *q = if b { 0 } else { 1 };
-            *r = if b { 0 } else { 2 };
-            *(*p)[0] + *(*p)[1]
+        const X: i32 = 0;
+        unsafe fn f() -> i32 {
+            i32::MAX
         }
     ",
     );

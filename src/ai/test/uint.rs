@@ -236,3 +236,16 @@ fn test_not() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_uint(ret(&result[0])), vec![u128::MAX - 1, u128::MAX]);
 }
+
+#[test]
+fn test_const() {
+    let code = "
+        const X: u32 = 0;
+        fn f() -> u32 {
+            X
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_uint(ret(&result[0])), vec![0]);
+}
