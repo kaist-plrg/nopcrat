@@ -141,6 +141,25 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                     };
                                     AbsValue::ptr(ptr)
                                 }
+                                "::ptr::mut_ptr::{impl#0}::offset" => {
+                                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                                        AbsPtr::alphas(
+                                            ptrs.iter()
+                                                .cloned()
+                                                .map(|mut ptr| {
+                                                    let last = ptr.projection.last_mut();
+                                                    if let Some(AbsProjElem::Index(i)) = last {
+                                                        *i = i.to_i64().add(&args[1].intv).to_u64();
+                                                    }
+                                                    ptr
+                                                })
+                                                .collect(),
+                                        )
+                                    } else {
+                                        AbsPtr::Top
+                                    };
+                                    AbsValue::ptr(ptr)
+                                }
                                 _ => todo!("{}", name),
                             }
                         };

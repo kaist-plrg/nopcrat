@@ -20,9 +20,9 @@ fn main() {
     // analysis::run_path(path);
     ai::analysis::analyze_code(
         "
-unsafe fn f() -> i32 {
-    let mut arr: [i32; 3] = [1, 2, 3];
-    let p: *mut i32 = arr.as_mut_ptr();
+unsafe fn f(b: bool) -> i32 {
+    let mut x = 0;
+    let p: *mut i32 = if b { &mut x } else { 0 as *mut i32 };
     *p
 }
     ",

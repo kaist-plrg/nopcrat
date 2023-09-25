@@ -236,3 +236,19 @@ fn test_as_mut_ptr() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![1]);
 }
+
+#[test]
+fn test_offset() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut arr: [i32; 3] = [1, 2, 3];
+            let mut p: *mut i32 = arr.as_mut_ptr();
+            let x = if b { 1 } else { 2 };
+            p = p.offset(x);
+            *p
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![2, 3]);
+}
