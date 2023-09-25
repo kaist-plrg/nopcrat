@@ -683,6 +683,17 @@ impl AbsValue {
             ..Self::bot()
         }
     }
+
+    pub fn heap_addr(&self) -> usize {
+        let places = self.ptrv.gamma().unwrap();
+        assert_eq!(places.len(), 1);
+        let place = places.first().unwrap();
+        if let AbsBase::Heap(alloc) = place.base {
+            alloc
+        } else {
+            panic!()
+        }
+    }
 }
 
 const MAX_SIZE: usize = 11;
@@ -1689,6 +1700,13 @@ impl AbsPlace {
     pub fn null() -> Self {
         Self {
             base: AbsBase::Null,
+            projection: Vec::new(),
+        }
+    }
+
+    pub fn alloc(i: usize) -> Self {
+        Self {
+            base: AbsBase::Heap(i),
             projection: Vec::new(),
         }
     }

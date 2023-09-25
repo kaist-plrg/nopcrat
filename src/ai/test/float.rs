@@ -179,3 +179,19 @@ fn test_const() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_float(ret(&result[0])), vec![0.0]);
 }
+
+#[test]
+fn test_static() {
+    let code = "
+        static mut X: f32 = 0.0;
+        static mut Y: f32 = 0.0;
+        fn f() -> f32 {
+            X = 1.0;
+            Y = 2.0;
+            X + Y
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_float(ret(&result[0])), vec![3.0]);
+}

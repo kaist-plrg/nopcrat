@@ -1,8 +1,7 @@
-use std::collections::BTreeMap;
-
 use rustc_hir::def_id::DefId;
 
 use super::{analysis::*, domains::*};
+use crate::*;
 
 mod arrays;
 mod bools;
@@ -16,9 +15,9 @@ mod structs;
 mod uint;
 
 fn analyze(code: &str) -> Vec<(Label, AbsState)> {
-    let input = crate::compile_util::str_to_input(code);
-    let config = crate::compile_util::make_config(input);
-    crate::compile_util::run_compiler(config, |_, tcx| {
+    let input = compile_util::str_to_input(code);
+    let config = compile_util::make_config(input);
+    compile_util::run_compiler(config, |_, tcx| {
         let hir = tcx.hir();
         for id in hir.items() {
             let item = hir.item(id);
@@ -28,13 +27,9 @@ fn analyze(code: &str) -> Vec<(Label, AbsState)> {
                 continue;
             };
             let def_id = item.item_id().owner_id.def_id.to_def_id();
+            let static_tys = get_static_tys(def_id, tcx);
             let body = tcx.optimized_mir(def_id);
-            let mut analyzer = Analyzer {
-                tcx,
-                inputs,
-                alloc_param_map: BTreeMap::new(),
-                param_tys: vec![],
-            };
+            let mut analyzer = Analyzer::new(tcx, inputs, static_tys);
             let result = analyzer.analyze_body(body);
             let location = return_location(body).unwrap();
             return result

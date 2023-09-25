@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_const_eval::interpret::{ConstValue, Scalar};
+use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Operand,
@@ -117,11 +117,21 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 let new_state_opt = fns
                     .iter()
                     .map(|def_id| {
+                        let mut state = state.clone();
                         let mut reads = reads.clone();
+                        let name = self.def_id_to_string(*def_id);
                         let v = if def_id.is_local() {
-                            todo!("{:?}", def_id)
+                            if name.ends_with("::{extern#0}::sysconf") {
+                                AbsValue::top()
+                            } else if name.ends_with("::{extern#0}::malloc")
+                                || name.ends_with("::{extern#0}::realloc")
+                            {
+                                let i = state.heap.push(AbsValue::top());
+                                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
+                            } else {
+                                todo!("{:?}", def_id)
+                            }
                         } else {
-                            let name = self.def_id_to_string(*def_id);
                             match name.as_str() {
                                 "::slice::{impl#0}::as_mut_ptr" | "::slice::{impl#0}::as_ptr" => {
                                     let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
@@ -170,7 +180,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                     AbsValue::bools(b)
                                 }
                                 "::option::{impl#0}::is_some" => {
-                                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
+                                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
                                     reads.extend(reads2);
                                     let b = match v.optionv {
                                         AbsOption::Top => AbsBool::Top,
@@ -188,7 +198,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 _ => todo!("{}", name),
                             }
                         };
-                        let (mut new_state, writes) = self.assign(destination, v, state);
+                        let (mut new_state, writes) = self.assign(destination, v, &state);
                         new_state.add_reads(reads.into_iter());
                         new_state.add_writes(writes.into_iter());
                         new_state
@@ -506,7 +516,18 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     }
                     _ => unreachable!("{:?}", ty),
                 },
-                Scalar::Ptr(ptr, _) => todo!("{:?}", self.tcx.global_alloc(ptr.provenance)),
+                Scalar::Ptr(ptr, _) => {
+                    let alloc = self.tcx.global_alloc(ptr.provenance);
+                    match alloc {
+                        GlobalAlloc::Function(_) => unreachable!("{:?}", alloc),
+                        GlobalAlloc::VTable(_, _) => unreachable!("{:?}", alloc),
+                        GlobalAlloc::Static(def_id) => {
+                            let i = self.static_allocs.get(&def_id).unwrap();
+                            AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(*i)))
+                        }
+                        GlobalAlloc::Memory(_) => unreachable!("{:?}", alloc),
+                    }
+                }
             },
             ConstValue::ZeroSized => {
                 if let TyKind::FnDef(def_id, _) = ty.kind() {
@@ -548,11 +569,15 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 }
                 AdtKind::Union => todo!("{:?}", ty),
                 AdtKind::Enum => {
-                    assert_eq!(format!("{:?}", adt), "std::option::Option", "{:?}", ty);
-                    AbsValue::option(AbsOption::Top)
+                    let ty = format!("{:?}", adt);
+                    match ty.as_str() {
+                        "std::option::Option" => AbsValue::option(AbsOption::Top),
+                        "libc::c_void" => AbsValue::top(),
+                        _ => unreachable!("{:?}", ty),
+                    }
                 }
             },
-            TyKind::Foreign(_) => unreachable!("{:?}", ty),
+            TyKind::Foreign(_) => AbsValue::top(),
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
@@ -580,11 +605,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 }
                 let heap = heap.unwrap();
                 let i = heap.push(v);
-                let ptr = AbsPlace {
-                    base: AbsBase::Heap(i),
-                    projection: vec![],
-                };
-                AbsValue::ptr(AbsPtr::alpha(ptr))
+                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
             }
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
             TyKind::FnPtr(_) => todo!("{:?}", ty),

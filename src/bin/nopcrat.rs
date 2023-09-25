@@ -15,16 +15,20 @@ fn main() {
         path.push("c2rust-lib.rs");
     }
     assert!(path.is_file());
+    ai::analysis::analyze_path(&path);
     // analysis::find_ptr_param_use(&path);
     // analysis::find_mutable_globals(&path);
-    // analysis::run_path(path);
-    ai::analysis::analyze_code(
-        "
-        fn f(mut x: Option::<fn() -> i32>) -> i32 {
-            x = Some(g);
-            if x.is_some() { 0 } else { 1 }
-        }
-        fn g() -> i32 { 0 }
-    ",
-    );
+    // ai::analysis::analyze_code(
+    //     "
+    //     extern crate libc;
+    //     extern \"C\" {
+    //         fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+    //     }
+    //     unsafe fn f() -> i32 {
+    //         let p = malloc(4) as *mut i32;
+    //         *p = 1;
+    //         *p
+    //     }
+    // ",
+    // );
 }
