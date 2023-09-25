@@ -1553,8 +1553,8 @@ impl AbsBool {
     pub fn bit_and(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, Self::False) => Self::False,
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
             _ => Self::Top,
         }
     }
@@ -1562,8 +1562,8 @@ impl AbsBool {
     pub fn bit_or(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, Self::True) => Self::True,
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
             _ => Self::Top,
         }
     }

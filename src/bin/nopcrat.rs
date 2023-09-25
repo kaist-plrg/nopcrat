@@ -20,9 +20,10 @@ fn main() {
     // analysis::run_path(path);
     ai::analysis::analyze_code(
         "
-        const X: i32 = 0;
-        unsafe fn f() -> i32 {
-            i32::MAX
+        unsafe fn f(b: bool) -> i32 {
+            let x = if b { 0 } else { 1 };
+            let b1 = x > 3;
+            if b1 { 0 } else { 1 }
         }
     ",
     );

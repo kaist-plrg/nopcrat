@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rustc_abi::VariantIdx;
 use rustc_middle::{
-    mir::{Body, Local, Location, Terminator, TerminatorKind},
+    mir::{Body, Local, Location, TerminatorKind},
     ty::{Ty, TyCtxt, TyKind},
 };
 
@@ -140,8 +140,7 @@ impl<'tcx> Analyzer<'tcx> {
                 (new_next_state, vec![next_location])
             } else {
                 let terminator = bbd.terminator.as_ref().unwrap();
-                let new_next_state = self.transfer_terminator(terminator, state);
-                let next_locations = next_locations_of_terminator(terminator);
+                let (new_next_state, next_locations) = self.transfer_terminator(terminator, state);
                 (new_next_state, next_locations)
             };
             for location in next_locations {
@@ -201,50 +200,6 @@ fn show_analysis_result(body: &Body<'_>, states: &BTreeMap<Label, AbsState>) {
             }
             println!("{:?}", terminator);
         }
-    }
-}
-
-fn next_locations_of_terminator(terminator: &Terminator<'_>) -> Vec<Location> {
-    match &terminator.kind {
-        TerminatorKind::Goto { target } => vec![Location {
-            block: *target,
-            statement_index: 0,
-        }],
-        TerminatorKind::SwitchInt { targets, .. } => targets
-            .all_targets()
-            .iter()
-            .map(|&target| Location {
-                block: target,
-                statement_index: 0,
-            })
-            .collect(),
-        TerminatorKind::UnwindResume => vec![],
-        TerminatorKind::UnwindTerminate(_) => vec![],
-        TerminatorKind::Return => vec![],
-        TerminatorKind::Unreachable => vec![],
-        TerminatorKind::Drop { target, .. } => vec![Location {
-            block: *target,
-            statement_index: 0,
-        }],
-        TerminatorKind::Call { target, .. } => {
-            if let Some(target) = target {
-                vec![Location {
-                    block: *target,
-                    statement_index: 0,
-                }]
-            } else {
-                vec![]
-            }
-        }
-        TerminatorKind::Assert { target, .. } => vec![Location {
-            block: *target,
-            statement_index: 0,
-        }],
-        TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
-        TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
-        TerminatorKind::FalseEdge { .. } => unreachable!("{:?}", terminator.kind),
-        TerminatorKind::FalseUnwind { .. } => unreachable!("{:?}", terminator.kind),
-        TerminatorKind::InlineAsm { .. } => unreachable!("{:?}", terminator.kind),
     }
 }
 

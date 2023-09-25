@@ -5,6 +5,7 @@ use rustc_hir::def_id::DefId;
 use super::{analysis::*, domains::*};
 
 mod arrays;
+mod bools;
 mod cast;
 mod float;
 mod fnptr;

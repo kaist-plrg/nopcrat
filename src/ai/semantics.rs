@@ -5,9 +5,9 @@ use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, BorrowKind, CastKind, Constant, ConstantKind, MutBorrowKind, Operand,
-        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
-        TerminatorKind, UnOp,
+        AggregateKind, BasicBlock, BinOp, BorrowKind, CastKind, Constant, ConstantKind, Location,
+        MutBorrowKind, Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind,
+        Terminator, TerminatorKind, UnOp,
     },
     ty::{AdtKind, Ty, TyKind, TypeAndMut},
 };
@@ -59,26 +59,49 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    pub fn transfer_terminator(&self, terminator: &Terminator<'tcx>, state: &AbsState) -> AbsState {
+    pub fn transfer_terminator(
+        &self,
+        terminator: &Terminator<'tcx>,
+        state: &AbsState,
+    ) -> (AbsState, Vec<Location>) {
         match &terminator.kind {
-            TerminatorKind::Goto { .. } => state.clone(),
-            TerminatorKind::SwitchInt { discr, .. } => {
-                let (_, reads) = self.transfer_operand(discr, state);
+            TerminatorKind::Goto { target } => (state.clone(), vec![block_entry(*target)]),
+            TerminatorKind::SwitchInt { discr, targets } => {
+                let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
-                new_state
+                let locations = if v.intv.is_bot() && v.uintv.is_bot() {
+                    assert_eq!(targets.iter().next().unwrap().0, 0);
+                    let targets = targets.all_targets();
+                    assert_eq!(targets.len(), 2);
+                    let l1 = block_entry(targets[0]);
+                    let l2 = block_entry(targets[1]);
+                    match v.boolv {
+                        AbsBool::Top => vec![l1, l2],
+                        AbsBool::True => vec![l2],
+                        AbsBool::False => vec![l1],
+                        AbsBool::Bot => vec![],
+                    }
+                } else {
+                    targets
+                        .all_targets()
+                        .iter()
+                        .map(|target| block_entry(*target))
+                        .collect()
+                };
+                (new_state, locations)
             }
-            TerminatorKind::UnwindResume => state.clone(),
-            TerminatorKind::UnwindTerminate(_) => state.clone(),
-            TerminatorKind::Return => state.clone(),
-            TerminatorKind::Unreachable => state.clone(),
-            TerminatorKind::Drop { .. } => state.clone(),
+            TerminatorKind::UnwindResume => (state.clone(), vec![]),
+            TerminatorKind::UnwindTerminate(_) => (state.clone(), vec![]),
+            TerminatorKind::Return => (state.clone(), vec![]),
+            TerminatorKind::Unreachable => (state.clone(), vec![]),
+            TerminatorKind::Drop { target, .. } => (state.clone(), vec![block_entry(*target)]),
             TerminatorKind::Call { .. } => todo!("{:?}", terminator.kind),
-            TerminatorKind::Assert { cond, .. } => {
+            TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
-                new_state
+                (new_state, vec![block_entry(*target)])
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
@@ -566,5 +589,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 AbsList::Bot => AbsValue::bot(),
             },
         }
+    }
+}
+
+fn block_entry(block: BasicBlock) -> Location {
+    Location {
+        block,
+        statement_index: 0,
     }
 }
