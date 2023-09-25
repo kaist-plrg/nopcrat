@@ -41,6 +41,7 @@ impl AbsState {
         match base {
             AbsBase::Local(i) => self.local.0.get(i),
             AbsBase::Heap(i) => self.heap.0.get(i),
+            AbsBase::Null => None,
         }
     }
 
@@ -48,6 +49,7 @@ impl AbsState {
         match base {
             AbsBase::Local(i) => self.local.0.get_mut(i),
             AbsBase::Heap(i) => self.heap.0.get_mut(i),
+            AbsBase::Null => None,
         }
     }
 
@@ -319,6 +321,13 @@ impl AbsValue {
     pub fn float(f: f64) -> Self {
         Self {
             floatv: AbsFloat::alpha(f),
+            ..Self::bot()
+        }
+    }
+
+    pub fn bools(boolv: AbsBool) -> Self {
+        Self {
+            boolv,
             ..Self::bot()
         }
     }
@@ -1665,10 +1674,24 @@ impl std::fmt::Debug for AbsPlace {
     }
 }
 
+impl AbsPlace {
+    pub fn null() -> Self {
+        Self {
+            base: AbsBase::Null,
+            projection: Vec::new(),
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.base == AbsBase::Null
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsBase {
     Local(usize),
     Heap(usize),
+    Null,
 }
 
 impl std::fmt::Debug for AbsBase {
@@ -1676,6 +1699,7 @@ impl std::fmt::Debug for AbsBase {
         match self {
             Self::Local(i) => write!(f, "_{}", i),
             Self::Heap(i) => write!(f, "A{}", i),
+            Self::Null => write!(f, "null"),
         }
     }
 }
@@ -1773,6 +1797,10 @@ impl AbsPtr {
             (Self::Top, _) => false,
             (Self::Set(s1), Self::Set(s2)) => s1.is_subset(s2),
         }
+    }
+
+    pub fn null() -> Self {
+        Self::alpha(AbsPlace::null())
     }
 }
 

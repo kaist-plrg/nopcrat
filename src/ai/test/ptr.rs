@@ -538,3 +538,50 @@ fn test_param_struct_recursive2() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![0, 1, 2, 3]);
 }
+
+#[test]
+fn test_null() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x = 0;
+            let p: *mut i32 = if b { &mut x } else { 0 as *mut i32 };
+            *p
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+}
+
+#[test]
+fn test_is_null_null() {
+    let code = "
+        unsafe fn f(mut p: *mut i32) -> i32 {
+            p = 0 as *mut i32;
+            let mut x = 0;
+            if !p.is_null() {
+                x = 1;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+}
+
+#[test]
+fn test_is_null_param() {
+    let code = "
+        unsafe fn f(p: *mut i32) -> i32 {
+            let mut x = 0;
+            if !p.is_null() {
+                x = 1;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}

@@ -20,10 +20,12 @@ fn main() {
     // analysis::run_path(path);
     ai::analysis::analyze_code(
         "
-unsafe fn f(b: bool) -> i32 {
+unsafe fn f(p: *mut i32) -> i32 {
     let mut x = 0;
-    let p: *mut i32 = if b { &mut x } else { 0 as *mut i32 };
-    *p
+    if p.is_null() {
+        x = 1;
+    }
+    x
 }
     ",
     );

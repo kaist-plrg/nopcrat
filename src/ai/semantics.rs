@@ -160,6 +160,16 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                     };
                                     AbsValue::ptr(ptr)
                                 }
+                                "::ptr::mut_ptr::{impl#0}::is_null" => {
+                                    let b = if let Some(ptrs) = args[0].ptrv.gamma() {
+                                        AbsBool::alphas(
+                                            ptrs.iter().map(|ptr| ptr.is_null()).collect(),
+                                        )
+                                    } else {
+                                        AbsBool::Top
+                                    };
+                                    AbsValue::bools(b)
+                                }
                                 _ => todo!("{}", name),
                             }
                         };
@@ -239,7 +249,11 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match kind {
                     CastKind::PointerExposeAddress => todo!("{:?}", rvalue),
-                    CastKind::PointerFromExposedAddress => todo!("{:?}", rvalue),
+                    CastKind::PointerFromExposedAddress => {
+                        let zero: BTreeSet<u128> = [0].into_iter().collect();
+                        assert_eq!(v.uintv.gamma().unwrap(), &zero);
+                        AbsValue::ptr(AbsPtr::null())
+                    }
                     CastKind::PointerCoercion(_) => v,
                     CastKind::DynStar => unreachable!("{:?}", rvalue),
                     CastKind::IntToInt | CastKind::FloatToInt => match ty.kind() {
@@ -384,11 +398,11 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             if let AbsPtr::Set(ptrs) = &ptr.ptrv {
                 let v = ptrs
                     .iter()
-                    .map(|ptr| {
-                        let v = state.get(ptr.base).unwrap();
+                    .filter_map(|ptr| {
+                        let v = state.get(ptr.base)?;
                         let mut ptr_projection = ptr.projection.clone();
                         ptr_projection.append(&mut projection.clone());
-                        self.get_value(v, &ptr_projection)
+                        Some(self.get_value(v, &ptr_projection))
                     })
                     .reduce(|v1, v2| v1.join(&v2))
                     .unwrap_or(AbsValue::bot());
