@@ -5,8 +5,8 @@ use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{ConstValue, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BinOp, BorrowKind, CastKind, Constant, ConstantKind, Location,
-        Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Operand,
+        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{AdtKind, Ty, TyKind, TypeAndMut},
@@ -105,26 +105,25 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 target,
                 ..
             } => {
-                let (func, reads) = self.transfer_operand(func, state);
+                let (func, mut reads) = self.transfer_operand(func, state);
                 let (args, readss): (Vec<_>, Vec<_>) = args
                     .iter()
                     .map(|arg| self.transfer_operand(arg, state))
                     .unzip();
-                let mut new_state = state.clone();
-                new_state.add_reads(reads.into_iter());
-                for reads in readss {
-                    new_state.add_reads(reads.into_iter());
+                for reads2 in readss {
+                    reads.extend(reads2);
                 }
                 let fns = some_or!(func.fnv.gamma(), todo!("{:?}", terminator.kind));
                 let new_state_opt = fns
                     .iter()
                     .map(|def_id| {
+                        let mut reads = reads.clone();
                         let v = if def_id.is_local() {
                             todo!("{:?}", def_id)
                         } else {
                             let name = self.def_id_to_string(*def_id);
                             match name.as_str() {
-                                "::slice::{impl#0}::as_mut_ptr" => {
+                                "::slice::{impl#0}::as_mut_ptr" | "::slice::{impl#0}::as_ptr" => {
                                     let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                                         AbsPtr::alphas(
                                             ptrs.iter()
@@ -170,10 +169,27 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                     };
                                     AbsValue::bools(b)
                                 }
+                                "::option::{impl#0}::is_some" => {
+                                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
+                                    reads.extend(reads2);
+                                    let b = match v.optionv {
+                                        AbsOption::Top => AbsBool::Top,
+                                        AbsOption::Some(_) => AbsBool::True,
+                                        AbsOption::None => AbsBool::False,
+                                        AbsOption::Bot => AbsBool::Bot,
+                                    };
+                                    AbsValue::bools(b)
+                                }
+                                "::option::{impl#0}::unwrap" => match &args[0].optionv {
+                                    AbsOption::Top => AbsValue::top(),
+                                    AbsOption::Some(box v) => v.clone(),
+                                    _ => AbsValue::bot(),
+                                },
                                 _ => todo!("{}", name),
                             }
                         };
-                        let (mut new_state, writes) = self.assign(destination, v, &new_state);
+                        let (mut new_state, writes) = self.assign(destination, v, state);
+                        new_state.add_reads(reads.into_iter());
                         new_state.add_writes(writes.into_iter());
                         new_state
                     })
@@ -185,6 +201,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         .unwrap_or(vec![]);
                     (new_state, locations)
                 } else {
+                    let mut new_state = state.clone();
+                    new_state.add_reads(reads.into_iter());
                     (new_state, vec![])
                 }
             }
@@ -210,8 +228,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 (AbsValue::list(vec![v; len as usize]), reads)
             }
-            Rvalue::Ref(_, kind, place) => {
-                assert!(matches!(kind, BorrowKind::Mut { .. }), "{:?}", kind);
+            Rvalue::Ref(_, _, place) => {
                 let v = if place.is_indirect_first_projection() {
                     let projection = self.abstract_projection(&place.projection[1..], state);
                     let ptr = state.local.get(place.local.index());
@@ -365,7 +382,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             );
                             if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
                                 let (v, reads) = self.transfer_operand(field, state);
-                                (AbsValue::option(AbsOption::some(v)), reads)
+                                let opt_v = if v.is_bot() {
+                                    AbsOption::bot()
+                                } else {
+                                    AbsOption::some(v)
+                                };
+                                (AbsValue::option(opt_v), reads)
                             } else {
                                 (AbsValue::option(AbsOption::None), vec![])
                             }
@@ -395,34 +417,43 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());
-            if let AbsPtr::Set(ptrs) = &ptr.ptrv {
-                let v = ptrs
-                    .iter()
-                    .filter_map(|ptr| {
-                        let v = state.get(ptr.base)?;
-                        let mut ptr_projection = ptr.projection.clone();
-                        ptr_projection.append(&mut projection.clone());
-                        Some(self.get_value(v, &ptr_projection))
-                    })
-                    .reduce(|v1, v2| v1.join(&v2))
-                    .unwrap_or(AbsValue::bot());
-                let reads: Vec<_> = ptrs
-                    .iter()
-                    .cloned()
-                    .filter_map(|mut ptr| {
-                        ptr.projection.append(&mut projection.clone());
-                        AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
-                    })
-                    .flat_map(|path| self.expands_path(&path))
-                    .collect();
-                (v, reads)
-            } else {
-                (AbsValue::top(), vec![])
-            }
+            self.read_ptr(&ptr.ptrv, &projection, state)
         } else {
             let v = state.local.get(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
             (self.get_value(v, &projection), vec![])
+        }
+    }
+
+    fn read_ptr(
+        &self,
+        ptr: &AbsPtr,
+        projection: &[AbsProjElem],
+        state: &AbsState,
+    ) -> (AbsValue, Vec<AbsPath>) {
+        if let AbsPtr::Set(ptrs) = ptr {
+            let v = ptrs
+                .iter()
+                .filter_map(|ptr| {
+                    let v = state.get(ptr.base)?;
+                    let mut ptr_projection = ptr.projection.clone();
+                    ptr_projection.append(&mut projection.to_owned());
+                    Some(self.get_value(v, &ptr_projection))
+                })
+                .reduce(|v1, v2| v1.join(&v2))
+                .unwrap_or(AbsValue::bot());
+            let reads: Vec<_> = ptrs
+                .iter()
+                .cloned()
+                .filter_map(|mut ptr| {
+                    ptr.projection.append(&mut projection.to_owned());
+                    AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
+                })
+                .flat_map(|path| self.expands_path(&path))
+                .collect();
+            (v, reads)
+        } else {
+            (AbsValue::top(), vec![])
         }
     }
 

@@ -276,6 +276,17 @@ impl AbsValue {
             && self.fnv.ord(&other.fnv)
     }
 
+    pub fn is_bot(&self) -> bool {
+        self.intv.is_bot()
+            && self.uintv.is_bot()
+            && self.floatv.is_bot()
+            && self.boolv.is_bot()
+            && self.listv.is_bot()
+            && self.ptrv.is_bot()
+            && self.optionv.is_bot()
+            && self.fnv.is_bot()
+    }
+
     pub fn int_top() -> Self {
         Self {
             intv: AbsInt::top(),

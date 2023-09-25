@@ -224,6 +224,20 @@ fn test_weak_update_ind_oob() {
 }
 
 #[test]
+fn test_as_ptr() {
+    let code = "
+        unsafe fn f() -> i32 {
+            let mut arr: [i32; 3] = [1, 2, 3];
+            let p: *const i32 = arr.as_ptr();
+            *p
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
 fn test_as_mut_ptr() {
     let code = "
         unsafe fn f() -> i32 {
