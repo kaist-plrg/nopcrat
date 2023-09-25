@@ -5,6 +5,7 @@ use rustc_middle::{
     mir::{Body, Local, Location, TerminatorKind},
     ty::{Ty, TyCtxt, TyKind},
 };
+use rustc_span::def_id::DefId;
 
 use super::domains::*;
 
@@ -166,6 +167,10 @@ impl<'tcx> Analyzer<'tcx> {
             .into_iter()
             .map(AbsPath)
             .collect()
+    }
+
+    pub fn def_id_to_string(&self, def_id: DefId) -> String {
+        self.tcx.def_path(def_id).to_string_no_crate_verbose()
     }
 }
 
