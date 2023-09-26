@@ -344,6 +344,13 @@ impl AbsValue {
         }
     }
 
+    pub fn boolean(b: bool) -> Self {
+        Self {
+            boolv: AbsBool::alpha(b),
+            ..Self::bot()
+        }
+    }
+
     pub fn bools(boolv: AbsBool) -> Self {
         Self {
             boolv,

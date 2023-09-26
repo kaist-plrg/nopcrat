@@ -19,6 +19,7 @@ use super::domains::*;
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'tcx> {
     pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
+        println!("{:?}", stmt);
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             let (new_v, reads) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
@@ -83,6 +84,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         terminator: &Terminator<'tcx>,
         state: &AbsState,
     ) -> (Vec<AbsState>, Vec<Location>) {
+        println!("{:?}", terminator);
         match &terminator.kind {
             TerminatorKind::Goto { target } => (vec![state.clone()], vec![block_entry(*target)]),
             TerminatorKind::SwitchInt { discr, targets } => {
@@ -209,7 +211,6 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             .chain(std::iter::once(ret_v))
                             .flat_map(|v| v.allocs())
                             .collect();
-                        println!("{:?}", allocs);
                         for alloc in allocs {
                             ptr_maps.entry(alloc).or_insert_with(|| {
                                 let alloc_v = return_state.heap.get(alloc);
@@ -270,8 +271,18 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         state
                     })
                     .collect();
-            } else if name.ends_with("::{extern#0}::sysconf") {
-                AbsValue::top()
+            } else if name.ends_with("::{extern#0}::free") {
+                AbsValue::bot()
+            } else if name.ends_with("::{extern#0}::sysconf")
+                || name.ends_with("::{extern#0}::getgroups")
+            {
+                AbsValue::int_top()
+            } else if name.ends_with("::{extern#0}::getuid")
+                || name.ends_with("::{extern#0}::geteuid")
+                || name.ends_with("::{extern#0}::getgid")
+                || name.ends_with("::{extern#0}::getegid")
+            {
+                AbsValue::uint_top()
             } else if name.ends_with("::{extern#0}::malloc")
                 || name.ends_with("::{extern#0}::realloc")
             {
@@ -342,6 +353,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     AbsOption::Some(box v) => v.clone(),
                     _ => AbsValue::bot(),
                 },
+                "::mem::size_of" => AbsValue::uint_top(),
+                _ if name.ends_with("::wrapping_add") => args[0].add(&args[1]),
+                _ if name.ends_with("::wrapping_sub") => args[0].sub(&args[1]),
+                _ if name.ends_with("::wrapping_mul") => args[0].mul(&args[1]),
                 _ => todo!("{}", name),
             }
         };
@@ -635,6 +650,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         };
                         AbsValue::float(v)
                     }
+                    TyKind::Bool => AbsValue::boolean(i.try_to_bool().unwrap()),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
