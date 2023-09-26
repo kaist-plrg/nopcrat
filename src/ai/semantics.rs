@@ -176,21 +176,35 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                let mut params = summary.init_state.local.iter();
-                params.next();
-                let ptr_maps: Vec<_> = params
-                    .zip(args.iter())
-                    .flat_map(|(p, a)| p.compare_pointers(a))
-                    .collect();
+                let mut ptr_maps = BTreeMap::new();
+                let mut allocs = BTreeSet::new();
+                for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
+                    for (param_ptr, arg_ptr) in param.compare_pointers(arg) {
+                        let alloc = param_ptr.heap_addr();
+                        let _ = ptr_maps.try_insert(alloc, arg_ptr.clone());
+                        allocs.insert(alloc);
+                    }
+                }
+                while let Some(alloc) = allocs.pop_first() {
+                    let arg_ptr = ptr_maps.get(&alloc).unwrap();
+                    let (arg, _) = self.read_ptr(arg_ptr, &[], &state);
+                    let param = summary.init_state.heap.get(alloc);
+                    for (param_ptr, arg_ptr) in param.compare_pointers(&arg) {
+                        let alloc = param_ptr.heap_addr();
+                        if ptr_maps.try_insert(alloc, arg_ptr.clone()).is_ok() {
+                            allocs.insert(alloc);
+                        }
+                    }
+                }
+                println!("{:?}", ptr_maps);
                 return summary
                     .return_states
                     .iter()
                     .map(|return_state| {
                         let mut state = state.clone();
-                        for (p, a) in ptr_maps.iter().cloned() {
-                            let alloc = p.heap_addr();
-                            let v = return_state.heap.get(alloc);
-                            self.indirect_assign(a, v, &[], &mut state, &mut vec![]);
+                        for (p, a) in &ptr_maps {
+                            let v = return_state.heap.get(*p).subst(&ptr_maps);
+                            self.indirect_assign(a, &v, &[], &mut state, &mut vec![]);
                         }
                         let ret_v = return_state.local.get(0);
                         let (mut state, writes) = self.assign(dst, ret_v.clone(), &state);

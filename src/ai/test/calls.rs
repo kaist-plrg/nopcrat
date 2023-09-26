@@ -412,7 +412,7 @@ fn test_read_weak() {
 #[test]
 fn test_write_struct() {
     let code = "
-        struct S { x: i32 }
+        struct S { x: i32, y: i32 }
         unsafe fn f(b: bool, p: *mut S) -> i32 {
             g(b, &mut (*p).x);
             (*p).x
@@ -435,4 +435,156 @@ fn test_write_struct() {
     assert_eq!(result[1].writes.len(), 1);
     assert_eq!(result[1].writes.as_vec()[0].0, vec![2, 0]);
     assert_eq!(result[1].reads.len(), 0);
+}
+
+#[test]
+fn test_write_array() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut [i32; 2]) -> i32 {
+            g(b, &mut (*p)[0]);
+            (*p)[0]
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                *p = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 1);
+    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+}
+
+#[test]
+fn test_double() {
+    let code = "
+        unsafe fn f() -> i32 {
+            let mut x = 0;
+            let mut p: *mut i32 = &mut x;
+            g(&mut p);
+            x
+        }
+        unsafe fn g(p: *mut *mut i32) {
+            **p = 1;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_double_ptr() {
+    let code = "
+        unsafe fn f() -> i32 {
+            let mut x = 0;
+            let mut p: *mut i32 = &mut x;
+            g(&mut p);
+            *p
+        }
+        unsafe fn g(p: *mut *mut i32) {
+            **p = 1;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_double_swap() {
+    let code = "
+        unsafe fn f() -> i32 {
+            let mut x1 = 0;
+            let mut p1: *mut i32 = &mut x1;
+            let q1: *mut *mut i32 = &mut p1;
+            let mut x2 = 0;
+            let mut p2: *mut i32 = &mut x2;
+            let q2: *mut *mut i32 = &mut p2;
+            g(q1, q2);
+            x1 = 2;
+            x2 = 1;
+            *p2 - *p1
+        }
+        unsafe fn g(p: *mut *mut i32, q: *mut *mut i32) {
+            let a = *p;
+            let b = *q;
+            *p = b;
+            *q = a;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_double_struct() {
+    let code = "
+        struct S { x: i32, y: i32 }
+        unsafe fn f() -> i32 {
+            let mut x = S { x: 0, y: 0 };
+            let mut y = 0;
+            let mut p: *mut i32 = &mut y;
+            g(&mut x, &mut p);
+            x.x = 1;
+            *p
+        }
+        unsafe fn g(p: *mut S, q: *mut *mut i32) {
+            *q = &mut (*p).x;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_double_weak() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x1 = 0;
+            let mut p1: *mut i32 = &mut x1;
+            let mut q1: *mut *mut i32 = &mut p1;
+            let mut x2 = 0;
+            let mut p2: *mut i32 = &mut x2;
+            let mut q2: *mut *mut i32 = &mut p2;
+            g(b, q1, q2);
+            x1 = 1;
+            x2 = 2;
+            *p1
+        }
+        unsafe fn g(b: bool, p: *mut *mut i32, q: *mut *mut i32) {
+            let r = *p;
+            let s = *q;
+            *p = if b { r } else { s };
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1, 2]);
+}
+
+#[test]
+fn test_double_dangling() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x1 = 0;
+            let mut p1: *mut i32 = &mut x1;
+            let mut q1: *mut *mut i32 = &mut p1;
+            g(q1);
+            *p1
+        }
+        unsafe fn g(p: *mut *mut i32) {
+            let mut x = 0;
+            *p = &mut x;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert!(ret(&result[0]).is_bot());
 }

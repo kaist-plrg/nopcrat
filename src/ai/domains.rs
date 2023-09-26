@@ -708,6 +708,14 @@ impl AbsValue {
         }
         res
     }
+
+    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+        Self {
+            ptrv: self.ptrv.subst(map),
+            listv: self.listv.subst(map),
+            ..self.clone()
+        }
+    }
 }
 
 const MAX_SIZE: usize = 11;
@@ -1692,6 +1700,14 @@ impl AbsList {
             None
         }
     }
+
+    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+        match self {
+            Self::Top => Self::Top,
+            Self::List(l) => Self::List(l.iter().map(|v| v.subst(map)).collect()),
+            Self::Bot => Self::Bot,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1855,6 +1871,38 @@ impl AbsPtr {
         } else {
             panic!()
         }
+    }
+
+    pub fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
+        let ptrs = if let Self::Set(ptrs) = self {
+            ptrs
+        } else {
+            return AbsPtr::Top;
+        };
+        ptrs.iter()
+            .map(|place| {
+                let alloc = match &place.base {
+                    AbsBase::Local(_) => return Self::bot(),
+                    AbsBase::Heap(alloc) => alloc,
+                    AbsBase::Null => return self.clone(),
+                };
+                let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
+                    ptrs
+                } else {
+                    return AbsPtr::Top;
+                };
+                Self::Set(
+                    ptrs.iter()
+                        .cloned()
+                        .map(|mut new_place| {
+                            new_place.projection.extend(place.projection.clone());
+                            new_place
+                        })
+                        .collect(),
+                )
+            })
+            .reduce(|ptr1, ptr2| ptr1.join(&ptr2))
+            .unwrap_or(AbsPtr::bot())
     }
 }
 

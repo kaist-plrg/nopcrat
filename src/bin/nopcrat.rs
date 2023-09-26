@@ -20,14 +20,16 @@ fn main() {
     // analysis::find_mutable_globals(&path);
     ai::analysis::analyze_code(
         "
-        unsafe fn g(b: bool, p: *mut i32) {
-            if b {
-                *p = 1;
-            }
+        unsafe fn f(b: bool) -> i32 {
+            let mut x1 = 0;
+            let mut p1: *mut i32 = &mut x1;
+            let mut q1: *mut *mut i32 = &mut p1;
+            g(q1);
+            *p1
         }
-        unsafe fn f(b: bool, p: *mut i32) -> i32 {
-            g(b, p);
-            *p
+        unsafe fn g(p: *mut *mut i32) {
+            let mut x = 0;
+            *p = &mut x;
         }
     ",
     );
