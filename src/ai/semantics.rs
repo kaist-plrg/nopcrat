@@ -176,10 +176,9 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                let ptr_maps: Vec<_> = summary
-                    .init_state
-                    .local
-                    .iter()
+                let mut params = summary.init_state.local.iter();
+                params.next();
+                let ptr_maps: Vec<_> = params
                     .zip(args.iter())
                     .flat_map(|(p, a)| p.compare_pointers(a))
                     .collect();
