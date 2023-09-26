@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, VariantIdx};
@@ -41,24 +41,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());
-            if let AbsPtr::Set(ptrs) = &ptr.ptrv {
-                let weak = ptrs.len() > 1;
-                for ptr in ptrs {
-                    let old_v = new_state.get_mut(ptr.base).unwrap();
-                    let mut ptr_projection = ptr.projection.clone();
-                    ptr_projection.append(&mut projection.clone());
-                    self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
-                }
-                if ptrs.len() == 1 {
-                    let mut ptr = ptrs.first().unwrap().clone();
-                    ptr.projection.append(&mut projection.clone());
-                    if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
-                        writes = self.expands_path(&path);
-                    }
-                }
-            } else {
-                todo!("{:?}", place);
-            }
+            self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state, &mut writes);
         } else {
             let old_v = new_state.local.get_mut(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
@@ -67,13 +50,41 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         (new_state, writes)
     }
 
+    fn indirect_assign(
+        &self,
+        ptr: &AbsPtr,
+        new_v: &AbsValue,
+        projection: &[AbsProjElem],
+        state: &mut AbsState,
+        writes: &mut Vec<AbsPath>,
+    ) {
+        if let AbsPtr::Set(ptrs) = ptr {
+            let weak = ptrs.len() > 1;
+            for ptr in ptrs {
+                let old_v = state.get_mut(ptr.base).unwrap();
+                let mut ptr_projection = ptr.projection.clone();
+                ptr_projection.extend(projection.to_owned());
+                self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
+            }
+            if ptrs.len() == 1 {
+                let mut ptr = ptrs.first().unwrap().clone();
+                ptr.projection.extend(projection.to_owned());
+                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
+                    writes.extend(self.expands_path(&path));
+                }
+            }
+        } else {
+            todo!()
+        }
+    }
+
     pub fn transfer_terminator(
         &self,
         terminator: &Terminator<'tcx>,
         state: &AbsState,
-    ) -> (AbsState, Vec<Location>) {
+    ) -> (Vec<AbsState>, Vec<Location>) {
         match &terminator.kind {
-            TerminatorKind::Goto { target } => (state.clone(), vec![block_entry(*target)]),
+            TerminatorKind::Goto { target } => (vec![state.clone()], vec![block_entry(*target)]),
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
@@ -91,13 +102,15 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         .map(|target| block_entry(*target))
                         .collect()
                 };
-                (new_state, locations)
+                (vec![new_state], locations)
             }
-            TerminatorKind::UnwindResume => (state.clone(), vec![]),
-            TerminatorKind::UnwindTerminate(_) => (state.clone(), vec![]),
-            TerminatorKind::Return => (state.clone(), vec![]),
-            TerminatorKind::Unreachable => (state.clone(), vec![]),
-            TerminatorKind::Drop { target, .. } => (state.clone(), vec![block_entry(*target)]),
+            TerminatorKind::UnwindResume => (vec![], vec![]),
+            TerminatorKind::UnwindTerminate(_) => (vec![], vec![]),
+            TerminatorKind::Return => (vec![], vec![]),
+            TerminatorKind::Unreachable => (vec![], vec![]),
+            TerminatorKind::Drop { target, .. } => {
+                (vec![state.clone()], vec![block_entry(*target)])
+            }
             TerminatorKind::Call {
                 func,
                 args,
@@ -114,113 +127,35 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     reads.extend(reads2);
                 }
                 let fns = some_or!(func.fnv.gamma(), todo!("{:?}", terminator.kind));
-                let new_state_opt = fns
-                    .iter()
-                    .map(|def_id| {
-                        let mut state = state.clone();
-                        let mut reads = reads.clone();
-                        let name = self.def_id_to_string(*def_id);
-                        let v = if def_id.is_local() {
-                            if name.ends_with("::{extern#0}::sysconf") {
-                                AbsValue::top()
-                            } else if name.ends_with("::{extern#0}::malloc")
-                                || name.ends_with("::{extern#0}::realloc")
-                            {
-                                let i = state.heap.push(AbsValue::top());
-                                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
-                            } else {
-                                todo!("{:?}", def_id)
-                            }
-                        } else {
-                            match name.as_str() {
-                                "::slice::{impl#0}::as_mut_ptr" | "::slice::{impl#0}::as_ptr" => {
-                                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                                        AbsPtr::alphas(
-                                            ptrs.iter()
-                                                .cloned()
-                                                .map(|mut ptr| {
-                                                    let zero = AbsUint::alpha(0);
-                                                    ptr.projection.push(AbsProjElem::Index(zero));
-                                                    ptr
-                                                })
-                                                .collect(),
-                                        )
-                                    } else {
-                                        AbsPtr::Top
-                                    };
-                                    AbsValue::ptr(ptr)
-                                }
-                                "::ptr::mut_ptr::{impl#0}::offset" => {
-                                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                                        AbsPtr::alphas(
-                                            ptrs.iter()
-                                                .cloned()
-                                                .map(|mut ptr| {
-                                                    let last = ptr.projection.last_mut();
-                                                    if let Some(AbsProjElem::Index(i)) = last {
-                                                        *i = i.to_i64().add(&args[1].intv).to_u64();
-                                                    }
-                                                    ptr
-                                                })
-                                                .collect(),
-                                        )
-                                    } else {
-                                        AbsPtr::Top
-                                    };
-                                    AbsValue::ptr(ptr)
-                                }
-                                "::ptr::mut_ptr::{impl#0}::is_null" => {
-                                    let b = if let Some(ptrs) = args[0].ptrv.gamma() {
-                                        AbsBool::alphas(
-                                            ptrs.iter().map(|ptr| ptr.is_null()).collect(),
-                                        )
-                                    } else {
-                                        AbsBool::Top
-                                    };
-                                    AbsValue::bools(b)
-                                }
-                                "::option::{impl#0}::is_some" => {
-                                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
-                                    reads.extend(reads2);
-                                    let b = match v.optionv {
-                                        AbsOption::Top => AbsBool::Top,
-                                        AbsOption::Some(_) => AbsBool::True,
-                                        AbsOption::None => AbsBool::False,
-                                        AbsOption::Bot => AbsBool::Bot,
-                                    };
-                                    AbsValue::bools(b)
-                                }
-                                "::option::{impl#0}::unwrap" => match &args[0].optionv {
-                                    AbsOption::Top => AbsValue::top(),
-                                    AbsOption::Some(box v) => v.clone(),
-                                    _ => AbsValue::bot(),
-                                },
-                                _ => todo!("{}", name),
-                            }
-                        };
-                        let (mut new_state, writes) = self.assign(destination, v, &state);
-                        new_state.add_reads(reads.into_iter());
-                        new_state.add_writes(writes.into_iter());
-                        new_state
-                    })
-                    .reduce(|a, b| a.join(&b));
-                if let Some(new_state) = new_state_opt {
-                    let locations = target
-                        .as_ref()
-                        .map(|target| vec![block_entry(*target)])
-                        .unwrap_or(vec![]);
-                    (new_state, locations)
-                } else {
-                    let mut new_state = state.clone();
-                    new_state.add_reads(reads.into_iter());
-                    (new_state, vec![])
+                let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                for def_id in fns {
+                    let states = self.transfer_call(
+                        *def_id,
+                        &args,
+                        destination,
+                        state.clone(),
+                        reads.clone(),
+                    );
+                    for state in states {
+                        let rw = (state.reads.clone(), state.writes.clone());
+                        new_states_map.entry(rw).or_default().push(state);
+                    }
                 }
+                let new_states = new_states_map
+                    .into_values()
+                    .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
+                    .collect();
+                let locations = target
+                    .as_ref()
+                    .map(|target| vec![block_entry(*target)])
+                    .unwrap_or(vec![]);
+                (new_states, locations)
             }
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
-                (new_state, vec![block_entry(*target)])
+                (vec![new_state], vec![block_entry(*target)])
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
@@ -228,6 +163,124 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TerminatorKind::FalseUnwind { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::InlineAsm { .. } => unreachable!("{:?}", terminator.kind),
         }
+    }
+
+    fn transfer_call(
+        &self,
+        callee: DefId,
+        args: &[AbsValue],
+        dst: &Place<'tcx>,
+        mut state: AbsState,
+        mut reads: Vec<AbsPath>,
+    ) -> Vec<AbsState> {
+        let name = self.def_id_to_string(callee);
+        let v = if callee.is_local() {
+            if let Some(summary) = self.summaries.get(&callee) {
+                let ptr_maps: Vec<_> = summary
+                    .init_state
+                    .local
+                    .iter()
+                    .zip(args.iter())
+                    .flat_map(|(p, a)| p.compare_pointers(a))
+                    .collect();
+                return summary
+                    .return_states
+                    .iter()
+                    .map(|return_state| {
+                        let mut state = state.clone();
+                        let mut writes = vec![];
+                        for (p, a) in ptr_maps.iter().cloned() {
+                            let alloc = p.heap_addr();
+                            let v = return_state.heap.get(alloc);
+                            self.indirect_assign(a, v, &[], &mut state, &mut writes);
+                        }
+                        let ret_v = return_state.local.get(0);
+                        let (mut state, writes2) = self.assign(dst, ret_v.clone(), &state);
+                        state.add_reads(reads.clone().into_iter());
+                        state.add_writes(writes.into_iter());
+                        state.add_writes(writes2.into_iter());
+                        state
+                    })
+                    .collect();
+            } else if name.ends_with("::{extern#0}::sysconf") {
+                AbsValue::top()
+            } else if name.ends_with("::{extern#0}::malloc")
+                || name.ends_with("::{extern#0}::realloc")
+            {
+                let i = state.heap.push(AbsValue::top());
+                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
+            } else {
+                todo!("{:?}", callee)
+            }
+        } else {
+            match name.as_str() {
+                "::slice::{impl#0}::as_mut_ptr" | "::slice::{impl#0}::as_ptr" => {
+                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                        AbsPtr::alphas(
+                            ptrs.iter()
+                                .cloned()
+                                .map(|mut ptr| {
+                                    let zero = AbsUint::alpha(0);
+                                    ptr.projection.push(AbsProjElem::Index(zero));
+                                    ptr
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        AbsPtr::Top
+                    };
+                    AbsValue::ptr(ptr)
+                }
+                "::ptr::mut_ptr::{impl#0}::offset" => {
+                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                        AbsPtr::alphas(
+                            ptrs.iter()
+                                .cloned()
+                                .map(|mut ptr| {
+                                    let last = ptr.projection.last_mut();
+                                    if let Some(AbsProjElem::Index(i)) = last {
+                                        *i = i.to_i64().add(&args[1].intv).to_u64();
+                                    }
+                                    ptr
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        AbsPtr::Top
+                    };
+                    AbsValue::ptr(ptr)
+                }
+                "::ptr::mut_ptr::{impl#0}::is_null" => {
+                    let b = if let Some(ptrs) = args[0].ptrv.gamma() {
+                        AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
+                    } else {
+                        AbsBool::Top
+                    };
+                    AbsValue::bools(b)
+                }
+                "::option::{impl#0}::is_some" => {
+                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
+                    reads.extend(reads2);
+                    let b = match v.optionv {
+                        AbsOption::Top => AbsBool::Top,
+                        AbsOption::Some(_) => AbsBool::True,
+                        AbsOption::None => AbsBool::False,
+                        AbsOption::Bot => AbsBool::Bot,
+                    };
+                    AbsValue::bools(b)
+                }
+                "::option::{impl#0}::unwrap" => match &args[0].optionv {
+                    AbsOption::Top => AbsValue::top(),
+                    AbsOption::Some(box v) => v.clone(),
+                    _ => AbsValue::bot(),
+                },
+                _ => todo!("{}", name),
+            }
+        };
+        let (mut new_state, writes) = self.assign(dst, v, &state);
+        new_state.add_reads(reads.into_iter());
+        new_state.add_writes(writes.into_iter());
+        vec![new_state]
     }
 
     fn transfer_rvalue(&self, rvalue: &Rvalue<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
@@ -247,7 +300,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             ptrs.iter()
                                 .map(|ptr| {
                                     let mut ptr_projection = ptr.projection.clone();
-                                    ptr_projection.append(&mut projection.clone());
+                                    ptr_projection.extend(projection.clone());
                                     AbsPlace {
                                         base: ptr.base,
                                         projection: ptr_projection,
@@ -320,7 +373,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             }
             Rvalue::BinaryOp(binop, box (l, r)) => {
                 let (l, mut reads_l) = self.transfer_operand(l, state);
-                let (r, mut reads_r) = self.transfer_operand(r, state);
+                let (r, reads_r) = self.transfer_operand(r, state);
                 let v = match binop {
                     BinOp::Add => l.add(&r),
                     BinOp::AddUnchecked => unreachable!("{:?}", rvalue),
@@ -345,7 +398,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     BinOp::Gt => l.gt(&r),
                     BinOp::Offset => todo!("{:?}", rvalue),
                 };
-                reads_l.append(&mut reads_r);
+                reads_l.extend(reads_r);
                 (v, reads_l)
             }
             Rvalue::CheckedBinaryOp(_, _) => unreachable!("{:?}", rvalue),
@@ -447,7 +500,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 .filter_map(|ptr| {
                     let v = state.get(ptr.base)?;
                     let mut ptr_projection = ptr.projection.clone();
-                    ptr_projection.append(&mut projection.to_owned());
+                    ptr_projection.extend(projection.to_owned());
                     Some(self.get_value(v, &ptr_projection))
                 })
                 .reduce(|v1, v2| v1.join(&v2))
@@ -456,7 +509,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 .iter()
                 .cloned()
                 .filter_map(|mut ptr| {
-                    ptr.projection.append(&mut projection.to_owned());
+                    ptr.projection.extend(projection.to_owned());
                     AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
                 })
                 .flat_map(|path| self.expands_path(&path))

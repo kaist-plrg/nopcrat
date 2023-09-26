@@ -105,6 +105,10 @@ impl AbsHeap {
         self.0.push(v);
         self.0.len() - 1
     }
+
+    pub fn get(&self, i: usize) -> &AbsValue {
+        &self.0[i]
+    }
 }
 
 #[derive(Clone)]
@@ -147,6 +151,10 @@ impl AbsLocal {
 
     pub fn set(&mut self, i: usize, v: AbsValue) {
         self.0[i] = v;
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AbsValue> {
+        self.0.iter()
     }
 }
 
@@ -685,14 +693,20 @@ impl AbsValue {
     }
 
     pub fn heap_addr(&self) -> usize {
-        let places = self.ptrv.gamma().unwrap();
-        assert_eq!(places.len(), 1);
-        let place = places.first().unwrap();
-        if let AbsBase::Heap(alloc) = place.base {
-            alloc
-        } else {
-            panic!()
+        self.ptrv.heap_addr()
+    }
+
+    pub fn compare_pointers<'a, 'b>(&'a self, other: &'b Self) -> Vec<(&'a AbsPtr, &'b AbsPtr)> {
+        let mut res = vec![];
+        if !self.ptrv.is_bot() && !other.ptrv.is_bot() {
+            res.push((&self.ptrv, &other.ptrv));
         }
+        if let (AbsList::List(l1), AbsList::List(l2)) = (&self.listv, &other.listv) {
+            for (v1, v2) in l1.iter().zip(l2.iter()) {
+                res.extend(v1.compare_pointers(v2));
+            }
+        }
+        res
     }
 }
 
@@ -1830,6 +1844,17 @@ impl AbsPtr {
 
     pub fn null() -> Self {
         Self::alpha(AbsPlace::null())
+    }
+
+    pub fn heap_addr(&self) -> usize {
+        let places = self.gamma().unwrap();
+        assert_eq!(places.len(), 1);
+        let place = places.first().unwrap();
+        if let AbsBase::Heap(alloc) = place.base {
+            alloc
+        } else {
+            panic!()
+        }
     }
 }
 

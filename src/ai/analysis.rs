@@ -16,68 +16,89 @@ use super::domains::*;
 use crate::*;
 
 pub fn analyze_path(path: &Path) {
-    analyze(compile_util::path_to_input(path));
+    analyze_input(compile_util::path_to_input(path));
 }
 
 pub fn analyze_code(code: &str) {
-    analyze(compile_util::str_to_input(code));
+    analyze_input(compile_util::str_to_input(code));
 }
 
-pub fn analyze(input: Input) {
+pub fn analyze_input(input: Input) -> BTreeMap<DefId, FunctionSummary> {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| {
-        let hir = tcx.hir();
-
-        let mut call_graph = BTreeMap::new();
-        let mut inputs_map = BTreeMap::new();
-        for id in hir.items() {
-            let item = hir.item(id);
-            let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
-                sig.decl.inputs.len()
-            } else {
-                continue;
-            };
-            let def_id = item.item_id().owner_id.def_id.to_def_id();
-            inputs_map.insert(def_id, inputs);
-            let mut visitor = CallVisitor::new(tcx);
-            use rustc_hir::intravisit::Visitor;
-            visitor.visit_item(item);
-            call_graph.insert(def_id, visitor.callees);
-        }
-
-        let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
-        for callees in call_graph.values_mut() {
-            callees.retain(|callee| funcs.contains(callee));
-        }
-        let (graph, elems) = graph::compute_sccs(&call_graph);
-        let inv_graph = graph::inverse(&graph);
-        let po: Vec<_> = graph::post_order(&graph, &inv_graph)
-            .into_iter()
-            .flatten()
-            .collect();
-
-        for id in &po {
-            let def_ids = elems.get(id).unwrap();
-            assert_eq!(def_ids.len(), 1);
-
-            let def_id = *def_ids.iter().next().unwrap();
-            println!("{:?}", def_id);
-
-            let static_tys = get_static_tys(def_id, tcx);
-            let inputs = *inputs_map.get(&def_id).unwrap();
-            let body = tcx.optimized_mir(def_id);
-            let mut analyzer = Analyzer::new(tcx, inputs, static_tys);
-            let result = analyzer.analyze_body(body);
-            show_analysis_result(body, &result);
-        }
-    });
+    compile_util::run_compiler(config, |_, tcx| analyze(tcx)).unwrap()
 }
 
-#[derive(Clone)]
+pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
+    let hir = tcx.hir();
+
+    let mut call_graph = BTreeMap::new();
+    let mut inputs_map = BTreeMap::new();
+    for id in hir.items() {
+        let item = hir.item(id);
+        let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
+            sig.decl.inputs.len()
+        } else {
+            continue;
+        };
+        let def_id = item.item_id().owner_id.def_id.to_def_id();
+        inputs_map.insert(def_id, inputs);
+        let mut visitor = CallVisitor::new(tcx);
+        use rustc_hir::intravisit::Visitor;
+        visitor.visit_item(item);
+        call_graph.insert(def_id, visitor.callees);
+    }
+
+    let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
+    for callees in call_graph.values_mut() {
+        callees.retain(|callee| funcs.contains(callee));
+    }
+    let (graph, elems) = graph::compute_sccs(&call_graph);
+    let inv_graph = graph::inverse(&graph);
+    let po: Vec<_> = graph::post_order(&graph, &inv_graph)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut summaries = BTreeMap::new();
+    for id in &po {
+        let def_ids = elems.get(id).unwrap();
+        assert_eq!(def_ids.len(), 1);
+
+        let def_id = *def_ids.iter().next().unwrap();
+        println!("{:?}", def_id);
+
+        let static_tys = get_static_tys(def_id, tcx);
+        let inputs = *inputs_map.get(&def_id).unwrap();
+        let body = tcx.optimized_mir(def_id);
+        let mut analyzer = Analyzer::new(tcx, inputs, static_tys, summaries);
+        let (result, init_state) = analyzer.analyze_body(body);
+        summaries = analyzer.summaries;
+        show_analysis_result(body, &result);
+        let return_states = return_location(body)
+            .map(|ret| {
+                result
+                    .into_iter()
+                    .filter_map(|(label, state)| {
+                        if label.location == ret {
+                            Some(state)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let summary = FunctionSummary::new(init_state, return_states);
+        summaries.insert(def_id, summary);
+    }
+    summaries
+}
+
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub inputs: usize,
     pub static_tys: BTreeMap<DefId, Ty<'tcx>>,
+    pub summaries: BTreeMap<DefId, FunctionSummary>,
 
     pub alloc_param_map: BTreeMap<usize, usize>,
     pub param_tys: Vec<TypeInfo>,
@@ -85,11 +106,17 @@ pub struct Analyzer<'tcx> {
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, inputs: usize, static_tys: BTreeMap<DefId, Ty<'tcx>>) -> Self {
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        inputs: usize,
+        static_tys: BTreeMap<DefId, Ty<'tcx>>,
+        summaries: BTreeMap<DefId, FunctionSummary>,
+    ) -> Self {
         Self {
             tcx,
             inputs,
             static_tys,
+            summaries,
             alloc_param_map: BTreeMap::new(),
             param_tys: vec![],
             static_allocs: BTreeMap::new(),
@@ -98,7 +125,7 @@ impl<'tcx> Analyzer<'tcx> {
 }
 
 impl<'tcx> Analyzer<'tcx> {
-    pub fn analyze_body(&mut self, body: &Body<'tcx>) -> BTreeMap<Label, AbsState> {
+    pub fn analyze_body(&mut self, body: &Body<'tcx>) -> (BTreeMap<Label, AbsState>, AbsState) {
         for (i, local) in body.local_decls.iter().enumerate() {
             if i > self.inputs {
                 break;
@@ -126,6 +153,8 @@ impl<'tcx> Analyzer<'tcx> {
             start_state.local.set(i, v);
         }
 
+        let init_state = start_state.clone();
+
         for (def_id, ty) in &self.static_tys {
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             self.static_allocs.insert(*def_id, v.heap_addr());
@@ -147,35 +176,37 @@ impl<'tcx> Analyzer<'tcx> {
                 statement_index,
             } = label.location;
             let bbd = &body.basic_blocks[block];
-            let (new_next_state, next_locations) = if statement_index < bbd.statements.len() {
+            let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
                 let stmt = &bbd.statements[statement_index];
                 let new_next_state = self.transfer_statement(stmt, state);
                 let next_location = Location {
                     block,
                     statement_index: statement_index + 1,
                 };
-                (new_next_state, vec![next_location])
+                (vec![new_next_state], vec![next_location])
             } else {
                 let terminator = bbd.terminator.as_ref().unwrap();
-                let (new_next_state, next_locations) = self.transfer_terminator(terminator, state);
-                (new_next_state, next_locations)
+                let (new_next_states, next_locations) = self.transfer_terminator(terminator, state);
+                (new_next_states, next_locations)
             };
-            for location in next_locations {
-                let next_label = Label {
-                    location,
-                    writes: new_next_state.writes.clone(),
-                    reads: new_next_state.reads.clone(),
-                };
-                let next_state = states.get(&next_label).unwrap_or(&bot);
-                let joined = next_state.join(&new_next_state);
-                if !joined.ord(next_state) {
-                    states.insert(next_label.clone(), joined);
-                    work_list.push(next_label);
+            for new_next_state in new_next_states {
+                for location in &next_locations {
+                    let next_label = Label {
+                        location: *location,
+                        writes: new_next_state.writes.clone(),
+                        reads: new_next_state.reads.clone(),
+                    };
+                    let next_state = states.get(&next_label).unwrap_or(&bot);
+                    let joined = next_state.join(&new_next_state);
+                    if !joined.ord(next_state) {
+                        states.insert(next_label.clone(), joined);
+                        work_list.push(next_label);
+                    }
                 }
             }
         }
 
-        states
+        (states, init_state)
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
@@ -187,6 +218,21 @@ impl<'tcx> Analyzer<'tcx> {
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionSummary {
+    pub init_state: AbsState,
+    pub return_states: Vec<AbsState>,
+}
+
+impl FunctionSummary {
+    fn new(init_state: AbsState, return_states: Vec<AbsState>) -> Self {
+        Self {
+            init_state,
+            return_states,
+        }
     }
 }
 

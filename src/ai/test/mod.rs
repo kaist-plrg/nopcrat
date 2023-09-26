@@ -1,10 +1,11 @@
 use rustc_hir::def_id::DefId;
 
-use super::{analysis::*, domains::*};
+use super::{analysis, domains::*};
 use crate::*;
 
 mod arrays;
 mod bools;
+mod calls;
 mod cast;
 mod float;
 mod fnptr;
@@ -14,36 +15,26 @@ mod ptr;
 mod structs;
 mod uint;
 
-fn analyze(code: &str) -> Vec<(Label, AbsState)> {
+fn analyze(code: &str) -> Vec<AbsState> {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |_, tcx| {
-        let hir = tcx.hir();
-        for id in hir.items() {
-            let item = hir.item(id);
-            let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
-                sig.decl.inputs.len()
-            } else {
-                continue;
-            };
-            let def_id = item.item_id().owner_id.def_id.to_def_id();
-            let static_tys = get_static_tys(def_id, tcx);
-            let body = tcx.optimized_mir(def_id);
-            let mut analyzer = Analyzer::new(tcx, inputs, static_tys);
-            let result = analyzer.analyze_body(body);
-            let location = return_location(body).unwrap();
-            return result
-                .into_iter()
-                .filter(|(label, _)| label.location == location)
-                .collect();
-        }
-        vec![]
+        analysis::analyze(tcx)
+            .into_iter()
+            .find(|(def_id, _)| {
+                tcx.def_path(*def_id)
+                    .to_string_no_crate_verbose()
+                    .ends_with("::f")
+            })
+            .unwrap()
+            .1
+            .return_states
     })
     .unwrap()
 }
 
-fn ret(ls: &(Label, AbsState)) -> &AbsValue {
-    ls.1.local.get(0)
+fn ret(st: &AbsState) -> &AbsValue {
+    st.local.get(0)
 }
 
 fn as_int(v: &AbsValue) -> Vec<i128> {
