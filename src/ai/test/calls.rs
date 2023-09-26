@@ -197,3 +197,242 @@ fn test_array_ptr2() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![10]);
 }
+
+#[test]
+fn test_write_local() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x = 0;
+            g(b, &mut x);
+            x
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                *p = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 0);
+}
+
+#[test]
+fn test_write() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32) -> i32 {
+            g(b, p);
+            *p
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                *p = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 1);
+    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+
+    assert_eq!(as_int(ret(&result[1])), vec![0]);
+    assert_eq!(result[1].writes.len(), 1);
+    assert_eq!(result[1].writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[1].reads.len(), 0);
+}
+
+#[test]
+fn test_write2() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32, b: bool) -> i32 {
+            g(p, q, b);
+            *p
+        }
+        unsafe fn g(p: *mut i32, q: *mut i32, b: bool) {
+            if b {
+                *p = 0;
+            } else {
+                *q = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+    assert_eq!(result[0].writes.len(), 1);
+    assert_eq!(result[0].writes.as_vec()[0].0, vec![1]);
+    assert_eq!(result[0].reads.len(), 0);
+
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].writes.len(), 1);
+    assert_eq!(result[1].writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[1].reads.len(), 1);
+    assert_eq!(result[1].reads.as_vec()[0].0, vec![1]);
+}
+
+#[test]
+fn test_write_weak() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32, q: *mut i32) -> i32 {
+            let r = if b { p } else { q };
+            g(b, r);
+            *p
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                *p = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 1);
+    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+}
+
+#[test]
+fn test_read_local() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x = 0;
+            g(b, &mut x)
+        }
+        unsafe fn g(b: bool, p: *mut i32) -> i32 {
+            let mut x = 0;
+            if b {
+                x = *p;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 0);
+}
+
+#[test]
+fn test_read() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32) -> i32 {
+            g(b, p)
+        }
+        unsafe fn g(b: bool, p: *mut i32) -> i32 {
+            let mut x = 0;
+            if b {
+                x = *p;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 0);
+
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].writes.len(), 0);
+    assert_eq!(result[1].reads.len(), 1);
+    assert_eq!(result[1].reads.as_vec()[0].0, vec![2]);
+}
+
+#[test]
+fn test_read2() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32, b: bool) -> i32 {
+            g(p, q, b)
+        }
+        unsafe fn g(p: *mut i32, q: *mut i32, b: bool) -> i32 {
+            let mut x = 0;
+            if b {
+                x = *p;
+            } else {
+                x = *q;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 1);
+    assert_eq!(result[0].reads.as_vec()[0].0, vec![1]);
+
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].writes.len(), 0);
+    assert_eq!(result[1].reads.len(), 1);
+    assert_eq!(result[1].reads.as_vec()[0].0, vec![2]);
+}
+
+#[test]
+fn test_read_weak() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32, q: *mut i32) -> i32 {
+            let r = if b { p } else { q };
+            g(b, r)
+        }
+        unsafe fn g(b: bool, p: *mut i32) -> i32 {
+            let mut x = 0;
+            if b {
+                x = *p;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 0);
+
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].writes.len(), 0);
+    assert_eq!(result[1].reads.len(), 2);
+    assert_eq!(result[1].reads.as_vec()[0].0, vec![2]);
+    assert_eq!(result[1].reads.as_vec()[1].0, vec![3]);
+}
+
+#[test]
+fn test_write_struct() {
+    let code = "
+        struct S { x: i32 }
+        unsafe fn f(b: bool, p: *mut S) -> i32 {
+            g(b, &mut (*p).x);
+            (*p).x
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                *p = 0;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+
+    assert!(ret(&result[0]).intv.is_top());
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].reads.len(), 1);
+    assert_eq!(result[0].reads.as_vec()[0].0, vec![2, 0]);
+
+    assert_eq!(as_int(ret(&result[1])), vec![0]);
+    assert_eq!(result[1].writes.len(), 1);
+    assert_eq!(result[1].writes.as_vec()[0].0, vec![2, 0]);
+    assert_eq!(result[1].reads.len(), 0);
+}

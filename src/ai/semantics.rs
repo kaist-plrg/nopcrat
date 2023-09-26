@@ -187,17 +187,57 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     .iter()
                     .map(|return_state| {
                         let mut state = state.clone();
-                        let mut writes = vec![];
                         for (p, a) in ptr_maps.iter().cloned() {
                             let alloc = p.heap_addr();
                             let v = return_state.heap.get(alloc);
-                            self.indirect_assign(a, v, &[], &mut state, &mut writes);
+                            self.indirect_assign(a, v, &[], &mut state, &mut vec![]);
                         }
                         let ret_v = return_state.local.get(0);
-                        let (mut state, writes2) = self.assign(dst, ret_v.clone(), &state);
+                        let (mut state, writes) = self.assign(dst, ret_v.clone(), &state);
+                        let callee_reads: Vec<_> = return_state
+                            .reads
+                            .iter()
+                            .filter_map(|read| {
+                                let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
+                                    ptrs
+                                } else {
+                                    return None;
+                                };
+                                Some(ptrs.iter().filter_map(|ptr| {
+                                    let (mut path, _) =
+                                        AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                                    path.0.extend(read.0[1..].to_owned());
+                                    Some(path)
+                                }))
+                            })
+                            .flatten()
+                            .collect();
+                        let callee_writes: Vec<_> = return_state
+                            .writes
+                            .iter()
+                            .filter_map(|write| {
+                                let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
+                                    if ptrs.len() == 1 {
+                                        ptrs.first().unwrap()
+                                    } else {
+                                        return None;
+                                    }
+                                } else {
+                                    return None;
+                                };
+                                let (mut path, array_access) =
+                                    AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                                if array_access {
+                                    return None;
+                                }
+                                path.0.extend(write.0[1..].to_owned());
+                                Some(path)
+                            })
+                            .collect();
                         state.add_reads(reads.clone().into_iter());
+                        state.add_reads(callee_reads.into_iter());
+                        state.add_writes(callee_writes.into_iter());
                         state.add_writes(writes.into_iter());
-                        state.add_writes(writes2.into_iter());
                         state
                     })
                     .collect();

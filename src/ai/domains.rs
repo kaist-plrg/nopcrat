@@ -2078,6 +2078,13 @@ impl MustPathSet {
         }
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &AbsPath> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set.iter(),
+        }
+    }
+
     pub fn as_set(&self) -> &BTreeSet<AbsPath> {
         match self {
             Self::All => panic!(),
@@ -2129,6 +2136,10 @@ impl MayPathSet {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AbsPath> {
+        self.0.iter()
     }
 
     pub fn as_set(&self) -> &BTreeSet<AbsPath> {
