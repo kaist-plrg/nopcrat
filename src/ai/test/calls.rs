@@ -572,7 +572,7 @@ fn test_double_weak() {
 #[test]
 fn test_double_dangling() {
     let code = "
-        unsafe fn f(b: bool) -> i32 {
+        unsafe fn f() -> i32 {
             let mut x1 = 0;
             let mut p1: *mut i32 = &mut x1;
             let mut q1: *mut *mut i32 = &mut p1;
@@ -587,4 +587,67 @@ fn test_double_dangling() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
     assert!(ret(&result[0]).is_bot());
+}
+
+#[test]
+fn test_ptr_return() {
+    let code = "
+        unsafe fn f() -> i32 {
+            let mut x = 0;
+            let p: *mut i32 = &mut x;
+            let q = g(p);
+            x = 1;
+            *q
+        }
+        unsafe fn g(p: *mut i32) -> *mut i32 {
+            p
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_malloc() {
+    let code = "
+        extern crate libc;
+        extern \"C\" {
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }
+        unsafe fn f() -> i32 {
+            let mut x = 0;
+            let mut p: *mut i32 = &mut x;
+            g(&mut p);
+            *p = 1;
+            *p
+        }
+        unsafe fn g(p: *mut *mut i32) {
+            *p = malloc(4) as *mut i32;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_malloc_return() {
+    let code = "
+        extern crate libc;
+        extern \"C\" {
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }
+        unsafe fn f() -> i32 {
+            let q = g();
+            *q = 1;
+            *q
+        }
+        unsafe fn g() -> *mut i32 {
+            malloc(4) as *mut i32
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
 }

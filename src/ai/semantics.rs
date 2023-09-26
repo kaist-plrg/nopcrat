@@ -196,18 +196,33 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         }
                     }
                 }
-                println!("{:?}", ptr_maps);
                 return summary
                     .return_states
                     .iter()
                     .map(|return_state| {
                         let mut state = state.clone();
+                        let mut ptr_maps = ptr_maps.clone();
+                        let ret_v = return_state.local.get(0);
+                        let allocs: BTreeSet<_> = ptr_maps
+                            .keys()
+                            .map(|p| return_state.heap.get(*p))
+                            .chain(std::iter::once(ret_v))
+                            .flat_map(|v| v.allocs())
+                            .collect();
+                        println!("{:?}", allocs);
+                        for alloc in allocs {
+                            ptr_maps.entry(alloc).or_insert_with(|| {
+                                let alloc_v = return_state.heap.get(alloc);
+                                let i = state.heap.push(alloc_v.clone());
+                                AbsPtr::alpha(AbsPlace::alloc(i))
+                            });
+                        }
                         for (p, a) in &ptr_maps {
                             let v = return_state.heap.get(*p).subst(&ptr_maps);
                             self.indirect_assign(a, &v, &[], &mut state, &mut vec![]);
                         }
-                        let ret_v = return_state.local.get(0);
-                        let (mut state, writes) = self.assign(dst, ret_v.clone(), &state);
+                        let ret_v = ret_v.subst(&ptr_maps);
+                        let (mut state, writes) = self.assign(dst, ret_v, &state);
                         let callee_reads: Vec<_> = return_state
                             .reads
                             .iter()

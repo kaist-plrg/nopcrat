@@ -1,3 +1,4 @@
 ```bash
-cargo run --release
+cargo test --release
+cargo run --release --bin nopcrat -- [input]
 ```

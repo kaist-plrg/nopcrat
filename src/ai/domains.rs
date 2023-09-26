@@ -716,6 +716,14 @@ impl AbsValue {
             ..self.clone()
         }
     }
+
+    pub fn allocs(&self) -> BTreeSet<usize> {
+        self.ptrv
+            .allocs()
+            .union(&self.listv.allocs())
+            .cloned()
+            .collect()
+    }
 }
 
 const MAX_SIZE: usize = 11;
@@ -1708,6 +1716,14 @@ impl AbsList {
             Self::Bot => Self::Bot,
         }
     }
+
+    pub fn allocs(&self) -> BTreeSet<usize> {
+        if let Self::List(l) = self {
+            l.iter().flat_map(|v| v.allocs()).collect()
+        } else {
+            BTreeSet::new()
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1874,35 +1890,48 @@ impl AbsPtr {
     }
 
     pub fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
-        let ptrs = if let Self::Set(ptrs) = self {
-            ptrs
+        if let Self::Set(ptrs) = self {
+            ptrs.iter()
+                .map(|place| {
+                    let alloc = match &place.base {
+                        AbsBase::Local(_) => return Self::bot(),
+                        AbsBase::Heap(alloc) => alloc,
+                        AbsBase::Null => return self.clone(),
+                    };
+                    let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
+                        ptrs
+                    } else {
+                        return AbsPtr::Top;
+                    };
+                    Self::Set(
+                        ptrs.iter()
+                            .cloned()
+                            .map(|mut new_place| {
+                                new_place.projection.extend(place.projection.clone());
+                                new_place
+                            })
+                            .collect(),
+                    )
+                })
+                .reduce(|ptr1, ptr2| ptr1.join(&ptr2))
+                .unwrap_or(AbsPtr::bot())
         } else {
-            return AbsPtr::Top;
-        };
-        ptrs.iter()
-            .map(|place| {
-                let alloc = match &place.base {
-                    AbsBase::Local(_) => return Self::bot(),
-                    AbsBase::Heap(alloc) => alloc,
-                    AbsBase::Null => return self.clone(),
-                };
-                let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
-                    ptrs
-                } else {
-                    return AbsPtr::Top;
-                };
-                Self::Set(
-                    ptrs.iter()
-                        .cloned()
-                        .map(|mut new_place| {
-                            new_place.projection.extend(place.projection.clone());
-                            new_place
-                        })
-                        .collect(),
-                )
-            })
-            .reduce(|ptr1, ptr2| ptr1.join(&ptr2))
-            .unwrap_or(AbsPtr::bot())
+            AbsPtr::Top
+        }
+    }
+
+    pub fn allocs(&self) -> BTreeSet<usize> {
+        if let Self::Set(ptrs) = self {
+            ptrs.iter()
+                .filter_map(|place| match &place.base {
+                    AbsBase::Local(_) => None,
+                    AbsBase::Heap(alloc) => Some(*alloc),
+                    AbsBase::Null => None,
+                })
+                .collect()
+        } else {
+            BTreeSet::new()
+        }
     }
 }
 
