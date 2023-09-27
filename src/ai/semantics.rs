@@ -19,7 +19,7 @@ use super::domains::*;
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'tcx> {
     pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
-        println!("{:?}", stmt);
+        tracing::info!("\n{:?}", stmt);
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             let (new_v, reads) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
@@ -37,17 +37,18 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         new_v: AbsValue,
         state: &AbsState,
     ) -> (AbsState, Vec<AbsPath>) {
-        let mut writes = vec![];
         let mut new_state = state.clone();
-        if place.is_indirect_first_projection() {
+        let writes = if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());
-            self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state, &mut writes);
+            self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
+            self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {
             let old_v = new_state.local.get_mut(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
             self.update_value(new_v, old_v, false, &projection);
-        }
+            vec![]
+        };
         (new_state, writes)
     }
 
@@ -57,7 +58,6 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         new_v: &AbsValue,
         projection: &[AbsProjElem],
         state: &mut AbsState,
-        writes: &mut Vec<AbsPath>,
     ) {
         if let AbsPtr::Set(ptrs) = ptr {
             let weak = ptrs.len() > 1;
@@ -67,16 +67,22 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 ptr_projection.extend(projection.to_owned());
                 self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
             }
+        } else {
+            todo!()
+        }
+    }
+
+    fn get_write_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
+        if let AbsPtr::Set(ptrs) = ptr {
             if ptrs.len() == 1 {
                 let mut ptr = ptrs.first().unwrap().clone();
                 ptr.projection.extend(projection.to_owned());
                 if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
-                    writes.extend(self.expands_path(&path));
+                    return self.expands_path(&path);
                 }
             }
-        } else {
-            todo!()
         }
+        vec![]
     }
 
     pub fn transfer_terminator(
@@ -84,7 +90,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         terminator: &Terminator<'tcx>,
         state: &AbsState,
     ) -> (Vec<AbsState>, Vec<Location>) {
-        println!("{:?}", terminator);
+        tracing::info!("\n{:?}", terminator);
         match &terminator.kind {
             TerminatorKind::Goto { target } => (vec![state.clone()], vec![block_entry(*target)]),
             TerminatorKind::SwitchInt { discr, targets } => {
@@ -175,6 +181,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
     ) -> Vec<AbsState> {
+        let mut writes = vec![];
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
@@ -220,7 +227,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         }
                         for (p, a) in &ptr_maps {
                             let v = return_state.heap.get(*p).subst(&ptr_maps);
-                            self.indirect_assign(a, &v, &[], &mut state, &mut vec![]);
+                            self.indirect_assign(a, &v, &[], &mut state);
                         }
                         let ret_v = ret_v.subst(&ptr_maps);
                         let (mut state, writes) = self.assign(dst, ret_v, &state);
@@ -271,18 +278,34 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         state
                     })
                     .collect();
+            }
+
+            let sig = self.tcx.fn_sig(callee).skip_binder();
+            let inputs = sig.inputs().skip_binder();
+            let output = sig.output().skip_binder();
+
+            let (read_args, write_args) = if name.ends_with("::{extern#0}::realloc") {
+                (vec![0], vec![])
             } else if name.ends_with("::{extern#0}::free") {
-                AbsValue::bot()
-            } else if name.ends_with("::{extern#0}::sysconf")
-                || name.ends_with("::{extern#0}::getgroups")
-            {
-                AbsValue::int_top()
-            } else if name.ends_with("::{extern#0}::getuid")
-                || name.ends_with("::{extern#0}::geteuid")
-                || name.ends_with("::{extern#0}::getgid")
-                || name.ends_with("::{extern#0}::getegid")
-            {
-                AbsValue::uint_top()
+                (vec![], vec![])
+            } else if name.ends_with("::{extern#0}::getgroups") {
+                (vec![], vec![1])
+            } else if inputs.iter().any(|ty| !ty.is_primitive()) {
+                todo!("{:?}", callee)
+            } else {
+                (vec![], vec![])
+            };
+            for arg in read_args {
+                let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
+                reads.extend(reads2);
+            }
+            for arg in write_args {
+                let writes2 = self.get_write_paths_of_ptr(&args[arg].ptrv, &[]);
+                writes.extend(writes2);
+            }
+
+            if output.is_primitive() || output.is_unit() {
+                self.top_value_of_ty(&output, None, &mut BTreeSet::new())
             } else if name.ends_with("::{extern#0}::malloc")
                 || name.ends_with("::{extern#0}::realloc")
             {
@@ -360,9 +383,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 _ => todo!("{}", name),
             }
         };
-        let (mut new_state, writes) = self.assign(dst, v, &state);
+        let (mut new_state, writes_ret) = self.assign(dst, v, &state);
         new_state.add_reads(reads.into_iter());
         new_state.add_writes(writes.into_iter());
+        new_state.add_writes(writes_ret.into_iter());
         vec![new_state]
     }
 
@@ -577,9 +601,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         projection: &[AbsProjElem],
         state: &AbsState,
     ) -> (AbsValue, Vec<AbsPath>) {
-        if let AbsPtr::Set(ptrs) = ptr {
-            let v = ptrs
-                .iter()
+        let v = if let AbsPtr::Set(ptrs) = ptr {
+            ptrs.iter()
                 .filter_map(|ptr| {
                     let v = state.get(ptr.base)?;
                     let mut ptr_projection = ptr.projection.clone();
@@ -587,19 +610,25 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     Some(self.get_value(v, &ptr_projection))
                 })
                 .reduce(|v1, v2| v1.join(&v2))
-                .unwrap_or(AbsValue::bot());
-            let reads: Vec<_> = ptrs
-                .iter()
+                .unwrap_or(AbsValue::bot())
+        } else {
+            AbsValue::top()
+        };
+        (v, self.get_read_paths_of_ptr(ptr, projection))
+    }
+
+    fn get_read_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
+        if let AbsPtr::Set(ptrs) = ptr {
+            ptrs.iter()
                 .cloned()
                 .filter_map(|mut ptr| {
                     ptr.projection.extend(projection.to_owned());
                     AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
                 })
                 .flat_map(|path| self.expands_path(&path))
-                .collect();
-            (v, reads)
+                .collect()
         } else {
-            (AbsValue::top(), vec![])
+            vec![]
         }
     }
 

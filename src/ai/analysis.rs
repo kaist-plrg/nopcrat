@@ -73,7 +73,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
         let mut analyzer = Analyzer::new(tcx, inputs, static_tys, summaries);
         let (result, init_state) = analyzer.analyze_body(body);
         summaries = analyzer.summaries;
-        show_analysis_result(body, &result);
+        tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
         let return_states = return_location(body)
             .map(|ret| {
                 result
@@ -314,11 +314,15 @@ impl TypeInfo {
     }
 }
 
-#[allow(unused)]
-fn show_analysis_result(body: &Body<'_>, states: &BTreeMap<Label, AbsState>) {
+fn analysis_result_to_string(
+    body: &Body<'_>,
+    states: &BTreeMap<Label, AbsState>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+    let mut res = String::new();
     for block in body.basic_blocks.indices() {
         let bbd = &body.basic_blocks[block];
-        println!("{:?}", block);
+        writeln!(&mut res, "block {:?}", block)?;
         for (statement_index, stmt) in bbd.statements.iter().enumerate() {
             let location = Location {
                 block,
@@ -328,9 +332,9 @@ fn show_analysis_result(body: &Body<'_>, states: &BTreeMap<Label, AbsState>) {
                 if label.location != location {
                     continue;
                 }
-                println!("{:?}", state);
+                writeln!(&mut res, "{:?}", state)?;
             }
-            println!("{:?}", stmt);
+            writeln!(&mut res, "{:?}", stmt)?;
         }
         if let Some(terminator) = bbd.terminator.as_ref() {
             let location = Location {
@@ -341,11 +345,12 @@ fn show_analysis_result(body: &Body<'_>, states: &BTreeMap<Label, AbsState>) {
                 if label.location != location {
                     continue;
                 }
-                println!("{:?}", state);
+                writeln!(&mut res, "{:?}", state)?;
             }
-            println!("{:?}", terminator);
+            writeln!(&mut res, "{:?}", terminator)?;
         }
     }
+    Ok(res)
 }
 
 pub fn get_static_tys(def_id: DefId, tcx: TyCtxt<'_>) -> BTreeMap<DefId, Ty<'_>> {
