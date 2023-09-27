@@ -14,7 +14,7 @@ use rustc_middle::{
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
-use super::domains::*;
+use super::{analysis::Label, domains::*};
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'tcx> {
@@ -86,9 +86,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
     }
 
     pub fn transfer_terminator(
-        &self,
+        &mut self,
         terminator: &Terminator<'tcx>,
         state: &AbsState,
+        label: &Label,
     ) -> (Vec<AbsState>, Vec<Location>) {
         tracing::info!("\n{:?}", terminator);
         match &terminator.kind {
@@ -143,6 +144,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             destination,
                             state.clone(),
                             reads.clone(),
+                            label,
                         );
                         for state in states {
                             let rw = (state.reads.clone(), state.writes.clone());
@@ -181,12 +183,13 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
     }
 
     fn transfer_call(
-        &self,
+        &mut self,
         callee: DefId,
         args: &[AbsValue],
         dst: &Place<'tcx>,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
+        label: &Label,
     ) -> Vec<AbsState> {
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
@@ -212,79 +215,97 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         }
                     }
                 }
-                return summary
-                    .return_states
-                    .iter()
-                    .map(|return_state| {
-                        let mut state = state.clone();
-                        let mut ptr_maps = ptr_maps.clone();
-                        let ret_v = return_state.local.get(0);
-                        let allocs: BTreeSet<_> = ptr_maps
-                            .keys()
-                            .map(|p| return_state.heap.get(*p))
-                            .chain(std::iter::once(ret_v))
-                            .flat_map(|v| v.allocs())
-                            .collect();
-                        for alloc in allocs {
-                            ptr_maps.entry(alloc).or_insert_with(|| {
-                                let alloc_v = return_state.heap.get(alloc);
-                                let i = state.heap.push(alloc_v.clone());
-                                AbsPtr::alpha(AbsPlace::alloc(i))
-                            });
-                        }
-                        for (p, a) in &ptr_maps {
-                            let v = return_state.heap.get(*p).subst(&ptr_maps);
-                            self.indirect_assign(a, &v, &[], &mut state);
-                        }
-                        let ret_v = ret_v.subst(&ptr_maps);
-                        let (mut state, writes) = self.assign(dst, ret_v, &state);
-                        let callee_reads: Vec<_> = return_state
-                            .reads
-                            .iter()
-                            .filter_map(|read| {
-                                let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
-                                    ptrs
+
+                let mut states = vec![];
+                for return_state in &summary.return_states {
+                    let mut state = state.clone();
+                    let mut ptr_maps = ptr_maps.clone();
+                    let ret_v = return_state.local.get(0);
+                    let allocs: BTreeSet<_> = ptr_maps
+                        .keys()
+                        .map(|p| return_state.heap.get(*p))
+                        .chain(std::iter::once(ret_v))
+                        .flat_map(|v| v.allocs())
+                        .collect();
+                    let label_alloc_map = self
+                        .label_user_fn_alloc_map
+                        .entry((
+                            label.clone(),
+                            return_state.reads.clone(),
+                            return_state.writes.clone(),
+                        ))
+                        .or_default();
+                    for alloc in allocs {
+                        ptr_maps.entry(alloc).or_insert_with(|| {
+                            let alloc_v = return_state.heap.get(alloc);
+                            let i = if let Some(i) = label_alloc_map.get(&alloc) {
+                                if *i < state.heap.len() {
+                                    let old_v = state.heap.get_mut(*i);
+                                    *old_v = old_v.join(alloc_v);
+                                    *i
                                 } else {
-                                    return None;
-                                };
-                                Some(ptrs.iter().filter_map(|ptr| {
-                                    let (mut path, _) =
-                                        AbsPath::from_place(ptr, &self.alloc_param_map)?;
-                                    path.0.extend(read.0[1..].to_owned());
-                                    Some(path)
-                                }))
-                            })
-                            .flatten()
-                            .collect();
-                        let callee_writes: Vec<_> = return_state
-                            .writes
-                            .iter()
-                            .filter_map(|write| {
-                                let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
-                                    if ptrs.len() == 1 {
-                                        ptrs.first().unwrap()
-                                    } else {
-                                        return None;
-                                    }
-                                } else {
-                                    return None;
-                                };
-                                let (mut path, array_access) =
+                                    state.heap.push(alloc_v.clone())
+                                }
+                            } else {
+                                state.heap.push(alloc_v.clone())
+                            };
+                            label_alloc_map.insert(alloc, i);
+                            AbsPtr::alpha(AbsPlace::alloc(i))
+                        });
+                    }
+                    for (p, a) in &ptr_maps {
+                        let v = return_state.heap.get(*p).subst(&ptr_maps);
+                        self.indirect_assign(a, &v, &[], &mut state);
+                    }
+                    let ret_v = ret_v.subst(&ptr_maps);
+                    let (mut state, writes) = self.assign(dst, ret_v, &state);
+                    let callee_reads: Vec<_> = return_state
+                        .reads
+                        .iter()
+                        .filter_map(|read| {
+                            let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
+                                ptrs
+                            } else {
+                                return None;
+                            };
+                            Some(ptrs.iter().filter_map(|ptr| {
+                                let (mut path, _) =
                                     AbsPath::from_place(ptr, &self.alloc_param_map)?;
-                                if array_access {
+                                path.0.extend(read.0[1..].to_owned());
+                                Some(path)
+                            }))
+                        })
+                        .flatten()
+                        .collect();
+                    let callee_writes: Vec<_> = return_state
+                        .writes
+                        .iter()
+                        .filter_map(|write| {
+                            let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
+                                if ptrs.len() == 1 {
+                                    ptrs.first().unwrap()
+                                } else {
                                     return None;
                                 }
-                                path.0.extend(write.0[1..].to_owned());
-                                Some(path)
-                            })
-                            .collect();
-                        state.add_reads(reads.clone().into_iter());
-                        state.add_reads(callee_reads.into_iter());
-                        state.add_writes(callee_writes.into_iter());
-                        state.add_writes(writes.into_iter());
-                        state
-                    })
-                    .collect();
+                            } else {
+                                return None;
+                            };
+                            let (mut path, array_access) =
+                                AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                            if array_access {
+                                return None;
+                            }
+                            path.0.extend(write.0[1..].to_owned());
+                            Some(path)
+                        })
+                        .collect();
+                    state.add_reads(reads.clone().into_iter());
+                    state.add_reads(callee_reads.into_iter());
+                    state.add_writes(callee_writes.into_iter());
+                    state.add_writes(writes.into_iter());
+                    states.push(state)
+                }
+                return states;
             }
 
             let sig = self.tcx.fn_sig(callee).skip_binder();
@@ -320,6 +341,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 (vec![1], vec![0])
             } else if name.ends_with("::{extern#0}::__xstat") {
                 (vec![1], vec![2])
+            } else if name.ends_with("::{extern#0}::getopt_long") {
+                (vec![1, 2, 3], vec![4])
             } else if inputs.iter().any(|ty| !ty.is_primitive()) {
                 todo!("{:?}", callee)
             } else {
@@ -341,7 +364,17 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 || name.ends_with("::{extern#0}::getenv")
                 || name.ends_with("::{extern#0}::getpwnam")
             {
-                let i = state.heap.push(AbsValue::top());
+                let i = if let Some(i) = self.label_alloc_map.get(label) {
+                    if *i < state.heap.len() {
+                        *state.heap.get_mut(*i) = AbsValue::top();
+                        *i
+                    } else {
+                        state.heap.push(AbsValue::top())
+                    }
+                } else {
+                    state.heap.push(AbsValue::top())
+                };
+                self.label_alloc_map.insert(label.clone(), i);
                 AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
             } else if name.ends_with("::{extern#0}::getcwd")
                 || name.ends_with("::{extern#0}::strchr")

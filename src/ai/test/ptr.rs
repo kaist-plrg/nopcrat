@@ -616,3 +616,24 @@ fn test_literal() {
     assert_eq!(result.len(), 1);
     assert!(ret(&result[0]).uintv.is_top());
 }
+
+#[test]
+fn test_while_malloc() {
+    let code = "
+        extern crate libc;
+        extern \"C\" {
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }
+        unsafe fn f(b: bool) {
+            let mut i = 0;
+            let mut p: *mut i32 = &mut i;
+            while i < 10 {
+                i += 1;
+                p = malloc(4) as *mut i32;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].heap.len(), 1);
+}

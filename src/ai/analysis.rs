@@ -141,6 +141,8 @@ pub struct Analyzer<'tcx> {
     pub alloc_param_map: BTreeMap<usize, usize>,
     pub static_allocs: BTreeMap<DefId, usize>,
     pub literal_allocs: BTreeMap<AllocId, usize>,
+    pub label_alloc_map: BTreeMap<Label, usize>,
+    pub label_user_fn_alloc_map: BTreeMap<(Label, MayPathSet, MustPathSet), BTreeMap<usize, usize>>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
@@ -162,6 +164,8 @@ impl<'tcx> Analyzer<'tcx> {
             alloc_param_map: BTreeMap::new(),
             static_allocs: BTreeMap::new(),
             literal_allocs: BTreeMap::new(),
+            label_alloc_map: BTreeMap::new(),
+            label_user_fn_alloc_map: BTreeMap::new(),
         }
     }
 }
@@ -207,6 +211,7 @@ impl<'tcx> Analyzer<'tcx> {
         let bot = AbsState::bot(body.local_decls.len());
         while let Some(label) = work_list.pop() {
             let state = states.get(&label).unwrap_or(&bot);
+            tracing::info!("\n{:?}\n{:?}", label, state);
             let Location {
                 block,
                 statement_index,
@@ -222,7 +227,8 @@ impl<'tcx> Analyzer<'tcx> {
                 (vec![new_next_state], vec![next_location])
             } else {
                 let terminator = bbd.terminator.as_ref().unwrap();
-                let (new_next_states, next_locations) = self.transfer_terminator(terminator, state);
+                let (new_next_states, next_locations) =
+                    self.transfer_terminator(terminator, state, &label);
                 (new_next_states, next_locations)
             };
             for new_next_state in new_next_states {
@@ -353,7 +359,9 @@ impl WorkList {
     }
 
     fn push(&mut self, label: Label) {
-        self.0.push_back(label)
+        if !self.0.contains(&label) {
+            self.0.push_back(label)
+        }
     }
 }
 

@@ -109,6 +109,15 @@ impl AbsHeap {
     pub fn get(&self, i: usize) -> &AbsValue {
         &self.0[i]
     }
+
+    pub fn get_mut(&mut self, i: usize) -> &mut AbsValue {
+        &mut self.0[i]
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 #[derive(Clone)]
