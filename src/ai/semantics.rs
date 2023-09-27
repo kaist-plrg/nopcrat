@@ -68,7 +68,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
             }
         } else {
-            todo!()
+            tracing::warn!("indirect_assign to top");
         }
     }
 
@@ -134,25 +134,32 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 for reads2 in readss {
                     reads.extend(reads2);
                 }
-                let fns = some_or!(func.fnv.gamma(), todo!("{:?}", terminator.kind));
-                let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
-                for def_id in fns {
-                    let states = self.transfer_call(
-                        *def_id,
-                        &args,
-                        destination,
-                        state.clone(),
-                        reads.clone(),
-                    );
-                    for state in states {
-                        let rw = (state.reads.clone(), state.writes.clone());
-                        new_states_map.entry(rw).or_default().push(state);
+                let new_states = if let Some(fns) = func.fnv.gamma() {
+                    let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                    for def_id in fns {
+                        let states = self.transfer_call(
+                            *def_id,
+                            &args,
+                            destination,
+                            state.clone(),
+                            reads.clone(),
+                        );
+                        for state in states {
+                            let rw = (state.reads.clone(), state.writes.clone());
+                            new_states_map.entry(rw).or_default().push(state);
+                        }
                     }
-                }
-                let new_states = new_states_map
-                    .into_values()
-                    .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
-                    .collect();
+                    new_states_map
+                        .into_values()
+                        .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
+                        .collect()
+                } else {
+                    tracing::warn!("call to top");
+                    let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
+                    new_state.add_reads(reads.into_iter());
+                    new_state.add_writes(writes.into_iter());
+                    vec![new_state]
+                };
                 let locations = target
                     .as_ref()
                     .map(|target| vec![block_entry(*target)])
@@ -284,12 +291,35 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             let inputs = sig.inputs().skip_binder();
             let output = sig.output().skip_binder();
 
-            let (read_args, write_args) = if name.ends_with("::{extern#0}::realloc") {
-                (vec![0], vec![])
-            } else if name.ends_with("::{extern#0}::free") {
+            let (read_args, write_args) = if name.ends_with("::{extern#0}::free") {
                 (vec![], vec![])
+            } else if name.ends_with("::{extern#0}::getcwd") {
+                (vec![], vec![0])
             } else if name.ends_with("::{extern#0}::getgroups") {
                 (vec![], vec![1])
+            } else if name.ends_with("::{extern#0}::realloc")
+                || name.ends_with("::{extern#0}::strlen")
+                || name.ends_with("::{extern#0}::eaccess")
+                || name.ends_with("::{extern#0}::strchr")
+                || name.ends_with("::{extern#0}::getenv")
+                || name.ends_with("::{extern#0}::getpwnam")
+            {
+                (vec![0], vec![])
+            } else if name.ends_with("::{extern#0}::fprintf")
+                || name.ends_with("::{extern#0}::strcmp")
+                || name.ends_with("::{extern#0}::strncmp")
+                || name.ends_with("::{extern#0}::fputs")
+            {
+                (vec![0, 1], vec![])
+            } else if name.ends_with("::{extern#0}::fputc") {
+                (vec![1], vec![])
+            } else if name.ends_with("::{extern#0}::memcpy")
+                || name.ends_with("::{extern#0}::strcpy")
+                || name.ends_with("::{extern#0}::strncpy")
+            {
+                (vec![1], vec![0])
+            } else if name.ends_with("::{extern#0}::__xstat") {
+                (vec![1], vec![2])
             } else if inputs.iter().any(|ty| !ty.is_primitive()) {
                 todo!("{:?}", callee)
             } else {
@@ -304,13 +334,22 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 writes.extend(writes2);
             }
 
-            if output.is_primitive() || output.is_unit() {
+            if output.is_primitive() || output.is_unit() || output.is_never() {
                 self.top_value_of_ty(&output, None, &mut BTreeSet::new())
             } else if name.ends_with("::{extern#0}::malloc")
                 || name.ends_with("::{extern#0}::realloc")
+                || name.ends_with("::{extern#0}::getenv")
+                || name.ends_with("::{extern#0}::getpwnam")
             {
                 let i = state.heap.push(AbsValue::top());
                 AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
+            } else if name.ends_with("::{extern#0}::getcwd")
+                || name.ends_with("::{extern#0}::strchr")
+                || name.ends_with("::{extern#0}::memcpy")
+                || name.ends_with("::{extern#0}::strcpy")
+                || name.ends_with("::{extern#0}::strncpy")
+            {
+                args[0].clone()
             } else {
                 todo!("{:?}", callee)
             }
@@ -333,7 +372,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     };
                     AbsValue::ptr(ptr)
                 }
-                "::ptr::mut_ptr::{impl#0}::offset" => {
+                "::ptr::mut_ptr::{impl#0}::offset" | "::ptr::const_ptr::{impl#0}::offset" => {
                     let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                         AbsPtr::alphas(
                             ptrs.iter()
@@ -352,7 +391,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     };
                     AbsValue::ptr(ptr)
                 }
-                "::ptr::mut_ptr::{impl#0}::is_null" => {
+                "::ptr::mut_ptr::{impl#0}::is_null" | "::ptr::const_ptr::{impl#0}::is_null" => {
                     let b = if let Some(ptrs) = args[0].ptrv.gamma() {
                         AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
                     } else {
@@ -445,7 +484,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         PointerCoercion::ReifyFnPointer => v,
                         PointerCoercion::UnsafeFnPointer => unreachable!("{:?}", rvalue),
                         PointerCoercion::ClosureFnPointer(_) => unreachable!("{:?}", rvalue),
-                        PointerCoercion::MutToConstPointer => unreachable!("{:?}", rvalue),
+                        PointerCoercion::MutToConstPointer => v,
                         PointerCoercion::ArrayToPointer => {
                             if let AbsPtr::Set(ptrs) = v.ptrv {
                                 AbsValue::ptr(AbsPtr::Set(
@@ -702,6 +741,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         AbsValue::float(v)
                     }
                     TyKind::Bool => AbsValue::boolean(i.try_to_bool().unwrap()),
+                    TyKind::Char => AbsValue::uint(i.try_to_u32().unwrap() as _),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
@@ -805,7 +845,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Generator(_, _, _) => unreachable!("{:?}", ty),
             TyKind::GeneratorWitness(_) => unreachable!("{:?}", ty),
             TyKind::GeneratorWitnessMIR(_, _) => unreachable!("{:?}", ty),
-            TyKind::Never => unreachable!("{:?}", ty),
+            TyKind::Never => AbsValue::bot(),
             TyKind::Tuple(tys) => AbsValue::list(
                 tys.iter()
                     .map(|ty| self.top_value_of_ty(&ty, heap.as_deref_mut(), adts))

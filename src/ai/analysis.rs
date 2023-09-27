@@ -344,7 +344,7 @@ pub struct Label {
     pub reads: MayPathSet,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct WorkList(VecDeque<Label>);
 
 impl WorkList {

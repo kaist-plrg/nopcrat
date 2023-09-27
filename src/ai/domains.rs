@@ -172,6 +172,10 @@ pub struct AbsValue {
 
 impl std::fmt::Debug for AbsValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_top() {
+            return write!(f, "⊤");
+        }
+
         let mut not_bot = false;
         if !self.intv.is_bot() {
             write!(f, "{:?}", self.intv)?;
@@ -227,7 +231,7 @@ impl std::fmt::Debug for AbsValue {
             not_bot = true;
         }
         if !not_bot {
-            write!(f, "Bot")?;
+            write!(f, "⊥")?;
         }
         Ok(())
     }
@@ -282,6 +286,17 @@ impl AbsValue {
             && self.ptrv.ord(&other.ptrv)
             && self.optionv.ord(&other.optionv)
             && self.fnv.ord(&other.fnv)
+    }
+
+    pub fn is_top(&self) -> bool {
+        self.intv.is_top()
+            && self.uintv.is_top()
+            && self.floatv.is_top()
+            && self.boolv.is_top()
+            && self.listv.is_top()
+            && self.ptrv.is_top()
+            && self.optionv.is_top()
+            && self.fnv.is_top()
     }
 
     pub fn is_bot(&self) -> bool {
@@ -705,7 +720,7 @@ impl AbsValue {
 
     pub fn compare_pointers<'a, 'b>(&'a self, other: &'b Self) -> Vec<(&'a AbsPtr, &'b AbsPtr)> {
         let mut res = vec![];
-        if !self.ptrv.is_bot() && !other.ptrv.is_bot() {
+        if !self.ptrv.is_bot() && !self.ptrv.is_top() {
             res.push((&self.ptrv, &other.ptrv));
         }
         if let (AbsList::List(l1), AbsList::List(l2)) = (&self.listv, &other.listv) {
@@ -744,9 +759,9 @@ pub enum AbsInt {
 impl std::fmt::Debug for AbsInt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_i"),
+            Self::Top => write!(f, "⊤_i"),
             Self::Set(s) => match s.len() {
-                0 => write!(f, "Bot_i"),
+                0 => write!(f, "⊥_i"),
                 1 => write!(f, "{}_i", s.first().unwrap()),
                 _ => {
                     write!(f, "{{")?;
@@ -1019,9 +1034,9 @@ pub enum AbsUint {
 impl std::fmt::Debug for AbsUint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_u"),
+            Self::Top => write!(f, "⊤_u"),
             Self::Set(s) => match s.len() {
-                0 => write!(f, "Bot_u"),
+                0 => write!(f, "⊥_u"),
                 1 => write!(f, "{}_u", s.first().unwrap()),
                 _ => {
                     write!(f, "{{")?;
@@ -1290,9 +1305,9 @@ pub enum AbsFloat {
 impl std::fmt::Debug for AbsFloat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_f"),
+            Self::Top => write!(f, "⊤_f"),
             Self::Set(s) => match s.len() {
-                0 => write!(f, "Bot_f"),
+                0 => write!(f, "⊥_f"),
                 1 => write!(f, "{}_f", f64::from_bits(*s.first().unwrap())),
                 _ => {
                     write!(f, "{{")?;
@@ -1320,6 +1335,10 @@ impl AbsFloat {
         } else {
             Self::Set(set)
         }
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn bot() -> Self {
@@ -1520,10 +1539,10 @@ pub enum AbsBool {
 impl std::fmt::Debug for AbsBool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_b"),
-            Self::True => write!(f, "true"),
-            Self::False => write!(f, "false"),
-            Self::Bot => write!(f, "Bot_b"),
+            Self::Top => write!(f, "⊤_b"),
+            Self::True => write!(f, "#t"),
+            Self::False => write!(f, "#f"),
+            Self::Bot => write!(f, "⊥_b"),
         }
     }
 }
@@ -1535,6 +1554,10 @@ impl AbsBool {
 
     pub fn bot() -> Self {
         Self::Bot
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn is_bot(&self) -> bool {
@@ -1651,7 +1674,7 @@ pub enum AbsList {
 impl std::fmt::Debug for AbsList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_l"),
+            Self::Top => write!(f, "⊤_l"),
             Self::List(l) => {
                 write!(f, "[")?;
                 for (i, v) in l.iter().enumerate() {
@@ -1662,7 +1685,7 @@ impl std::fmt::Debug for AbsList {
                 }
                 write!(f, "]")
             }
-            Self::Bot => write!(f, "Bot_l"),
+            Self::Bot => write!(f, "⊥_l"),
         }
     }
 }
@@ -1674,6 +1697,10 @@ impl AbsList {
 
     pub fn bot() -> Self {
         Self::Bot
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn is_bot(&self) -> bool {
@@ -1814,9 +1841,9 @@ pub enum AbsPtr {
 impl std::fmt::Debug for AbsPtr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Top => write!(f, "Top_p"),
+            Self::Top => write!(f, "⊤_p"),
             Self::Set(s) => match s.len() {
-                0 => write!(f, "Bot_p"),
+                0 => write!(f, "⊥_p"),
                 1 => write!(f, "{:?}", s.first().unwrap()),
                 _ => {
                     write!(f, "{{")?;
@@ -1840,6 +1867,10 @@ impl AbsPtr {
 
     pub fn bot() -> Self {
         Self::Set(BTreeSet::new())
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn is_bot(&self) -> bool {
@@ -1946,12 +1977,23 @@ impl AbsPtr {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AbsOption {
     Top,
     Some(Box<AbsValue>),
     None,
     Bot,
+}
+
+impl std::fmt::Debug for AbsOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Top => write!(f, "⊤_o"),
+            Self::Some(v) => write!(f, "Some({:?})", v),
+            Self::None => write!(f, "None"),
+            Self::Bot => write!(f, "⊥_o"),
+        }
+    }
 }
 
 impl AbsOption {
@@ -1961,6 +2003,10 @@ impl AbsOption {
 
     pub fn bot() -> Self {
         Self::Bot
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn is_bot(&self) -> bool {
@@ -1993,10 +2039,32 @@ impl AbsOption {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AbsFn {
     Top,
     Set(BTreeSet<DefId>),
+}
+
+impl std::fmt::Debug for AbsFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Top => write!(f, "⊤_fn"),
+            Self::Set(s) => match s.len() {
+                0 => write!(f, "⊥_fn"),
+                1 => write!(f, "{:?}", s.first().unwrap()),
+                _ => {
+                    write!(f, "{{")?;
+                    for (i, n) in s.iter().enumerate() {
+                        if i != 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{:?}", n)?;
+                    }
+                    write!(f, "}}")
+                }
+            },
+        }
+    }
 }
 
 impl AbsFn {
@@ -2006,6 +2074,10 @@ impl AbsFn {
 
     pub fn bot() -> Self {
         Self::Set(BTreeSet::new())
+    }
+
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
     }
 
     pub fn is_bot(&self) -> bool {
