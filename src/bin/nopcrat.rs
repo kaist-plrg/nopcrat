@@ -33,18 +33,6 @@ fn main() {
     // analysis::find_mutable_globals(&path);
     // ai::analysis::analyze_code(
     //     "
-    //     extern crate libc;
-    //     extern \"C\" {
-    //         fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
-    //     }
-    //     unsafe fn f() -> i32 {
-    //         let q = g();
-    //         *q = 1;
-    //         *q
-    //     }
-    //     unsafe fn g() -> *mut i32 {
-    //         malloc(4) as *mut i32
-    //     }
-    // ",
+    //     ",
     // );
 }

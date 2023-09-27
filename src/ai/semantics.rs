@@ -9,7 +9,7 @@ use rustc_middle::{
         Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
-    ty::{AdtKind, Ty, TyKind, TypeAndMut},
+    ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind, TypeAndMut},
 };
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
@@ -441,7 +441,29 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         assert_eq!(v.uintv.gamma().unwrap(), &zero);
                         AbsValue::ptr(AbsPtr::null())
                     }
-                    CastKind::PointerCoercion(_) => v,
+                    CastKind::PointerCoercion(coercion) => match coercion {
+                        PointerCoercion::ReifyFnPointer => v,
+                        PointerCoercion::UnsafeFnPointer => unreachable!("{:?}", rvalue),
+                        PointerCoercion::ClosureFnPointer(_) => unreachable!("{:?}", rvalue),
+                        PointerCoercion::MutToConstPointer => unreachable!("{:?}", rvalue),
+                        PointerCoercion::ArrayToPointer => {
+                            if let AbsPtr::Set(ptrs) = v.ptrv {
+                                AbsValue::ptr(AbsPtr::Set(
+                                    ptrs.iter()
+                                        .cloned()
+                                        .map(|mut ptr| {
+                                            let zero = AbsUint::alpha(0);
+                                            ptr.projection.push(AbsProjElem::Index(zero));
+                                            ptr
+                                        })
+                                        .collect(),
+                                ))
+                            } else {
+                                AbsValue::ptr(AbsPtr::Top)
+                            }
+                        }
+                        PointerCoercion::Unsize => v,
+                    },
                     CastKind::DynStar => unreachable!("{:?}", rvalue),
                     CastKind::IntToInt | CastKind::FloatToInt => match ty.kind() {
                         TyKind::Int(int_ty) => match int_ty {
@@ -691,7 +713,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             let i = self.static_allocs.get(&def_id).unwrap();
                             AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(*i)))
                         }
-                        GlobalAlloc::Memory(_) => unreachable!("{:?}", alloc),
+                        GlobalAlloc::Memory(_) => {
+                            let i = self.literal_allocs.get(&ptr.provenance).unwrap();
+                            AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(*i)))
+                        }
                     }
                 }
             },

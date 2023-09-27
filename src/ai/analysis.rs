@@ -1,12 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fmt::Write as _,
     path::Path,
 };
 
 use rustc_abi::VariantIdx;
+use rustc_const_eval::interpret::{AllocId, ConstValue, GlobalAlloc, Scalar};
+use rustc_hir::{
+    def::{DefKind, Res},
+    intravisit::Visitor as HVisitor,
+    Expr, ExprKind, QPath,
+};
 use rustc_middle::{
     hir::nested_filter,
-    mir::{Body, ClearCrossCrate, Local, LocalInfo, Location, TerminatorKind},
+    mir::{
+        visit::Visitor as MVisitor, Body, ClearCrossCrate, Constant, ConstantKind, Local,
+        LocalInfo, Location, TerminatorKind,
+    },
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
@@ -43,7 +53,6 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
         let def_id = item.item_id().owner_id.def_id.to_def_id();
         inputs_map.insert(def_id, inputs);
         let mut visitor = CallVisitor::new(tcx);
-        use rustc_hir::intravisit::Visitor;
         visitor.visit_item(item);
         call_graph.insert(def_id, visitor.callees);
     }
@@ -69,11 +78,38 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
 
         let static_tys = get_static_tys(def_id, tcx);
         let inputs = *inputs_map.get(&def_id).unwrap();
+
         let body = tcx.optimized_mir(def_id);
-        let mut analyzer = Analyzer::new(tcx, inputs, static_tys, summaries);
+
+        let mut param_tys = vec![];
+        for (i, local) in body.local_decls.iter().enumerate() {
+            if i > inputs {
+                break;
+            }
+            let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
+                TypeInfo::from_ty(&tm.ty, tcx)
+            } else {
+                TypeInfo::NonStruct
+            };
+            param_tys.push(ty);
+        }
+
+        let mut visitor = LiteralVisitor::new(tcx);
+        visitor.visit_body(body);
+
+        let mut analyzer = Analyzer::new(
+            tcx,
+            inputs,
+            param_tys,
+            static_tys,
+            visitor.alloc_ty_map,
+            summaries,
+        );
         let (result, init_state) = analyzer.analyze_body(body);
         summaries = analyzer.summaries;
+
         tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
+
         let return_states = return_location(body)
             .map(|ret| {
                 result
@@ -97,47 +133,41 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
 pub struct Analyzer<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub inputs: usize,
+    pub param_tys: Vec<TypeInfo>,
     pub static_tys: BTreeMap<DefId, Ty<'tcx>>,
+    pub literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
     pub summaries: BTreeMap<DefId, FunctionSummary>,
 
     pub alloc_param_map: BTreeMap<usize, usize>,
-    pub param_tys: Vec<TypeInfo>,
     pub static_allocs: BTreeMap<DefId, usize>,
+    pub literal_allocs: BTreeMap<AllocId, usize>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
     pub fn new(
         tcx: TyCtxt<'tcx>,
         inputs: usize,
+        param_tys: Vec<TypeInfo>,
         static_tys: BTreeMap<DefId, Ty<'tcx>>,
+        literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
         summaries: BTreeMap<DefId, FunctionSummary>,
     ) -> Self {
         Self {
             tcx,
             inputs,
+            param_tys,
             static_tys,
+            literal_ty_map,
             summaries,
             alloc_param_map: BTreeMap::new(),
-            param_tys: vec![],
             static_allocs: BTreeMap::new(),
+            literal_allocs: BTreeMap::new(),
         }
     }
 }
 
 impl<'tcx> Analyzer<'tcx> {
     pub fn analyze_body(&mut self, body: &Body<'tcx>) -> (BTreeMap<Label, AbsState>, AbsState) {
-        for (i, local) in body.local_decls.iter().enumerate() {
-            if i > self.inputs {
-                break;
-            }
-            let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
-                TypeInfo::from_ty(&tm.ty, self.tcx)
-            } else {
-                TypeInfo::NonStruct
-            };
-            self.param_tys.push(ty);
-        }
-
         let mut work_list = WorkList::default();
         let mut states: BTreeMap<Label, AbsState> = BTreeMap::new();
 
@@ -158,6 +188,12 @@ impl<'tcx> Analyzer<'tcx> {
         for (def_id, ty) in &self.static_tys {
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             self.static_allocs.insert(*def_id, v.heap_addr());
+        }
+
+        for (alloc_id, ty) in &self.literal_ty_map {
+            let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
+            let i = start_state.heap.push(v);
+            self.literal_allocs.insert(*alloc_id, i);
         }
 
         let start_label = Label {
@@ -250,23 +286,54 @@ impl<'tcx> CallVisitor<'tcx> {
     }
 }
 
-impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for CallVisitor<'tcx> {
+impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
         self.tcx.hir()
     }
 
-    fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
-        use rustc_hir::{def, ExprKind};
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         if let ExprKind::Call(callee, _) = expr.kind {
-            if let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = callee.kind {
-                if let def::Res::Def(def::DefKind::Fn, def_id) = path.res {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = callee.kind {
+                if let Res::Def(DefKind::Fn, def_id) = path.res {
                     self.callees.insert(def_id);
                 }
             }
         }
         rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+struct LiteralVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    alloc_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
+}
+
+impl<'tcx> LiteralVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            alloc_ty_map: BTreeMap::new(),
+        }
+    }
+}
+
+impl<'tcx> MVisitor<'tcx> for LiteralVisitor<'tcx> {
+    fn visit_constant(&mut self, constant: &Constant<'tcx>, location: Location) {
+        if let ConstantKind::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), ty) = constant.literal {
+            if matches!(
+                self.tcx.global_alloc(ptr.provenance),
+                GlobalAlloc::Memory(_)
+            ) {
+                if let TyKind::Ref(_, ty, _) = ty.kind() {
+                    if ty.is_array() {
+                        self.alloc_ty_map.insert(ptr.provenance, *ty);
+                    }
+                }
+            }
+        }
+        self.super_constant(constant, location);
     }
 }
 
@@ -318,7 +385,6 @@ fn analysis_result_to_string(
     body: &Body<'_>,
     states: &BTreeMap<Label, AbsState>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use std::fmt::Write as _;
     let mut res = String::new();
     for block in body.basic_blocks.indices() {
         let bbd = &body.basic_blocks[block];

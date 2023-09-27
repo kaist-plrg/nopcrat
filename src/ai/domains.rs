@@ -1047,6 +1047,10 @@ impl AbsUint {
         Self::alphas(BTreeSet::new())
     }
 
+    pub fn is_top(&self) -> bool {
+        matches!(self, Self::Top)
+    }
+
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()

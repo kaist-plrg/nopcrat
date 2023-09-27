@@ -603,3 +603,16 @@ fn test_malloc() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
 }
+
+#[test]
+fn test_literal() {
+    let code = "
+        unsafe fn f(b: bool) -> u8 {
+            let str = b\".\\0\" as *const u8;
+            *str
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert!(ret(&result[0]).uintv.is_top());
+}
