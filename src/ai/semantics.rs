@@ -636,7 +636,15 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             let reads = readss.into_iter().flatten().collect();
                             (v, reads)
                         }
-                        AdtKind::Union => todo!("{:?}", rvalue),
+                        AdtKind::Union => {
+                            assert_eq!(fields.len(), 1);
+                            let operand = &fields[FieldIdx::from_usize(0)];
+                            let (v, reads) = self.transfer_operand(operand, state);
+                            let variant = adt_def.variant(VariantIdx::from_usize(0));
+                            let v =
+                                AbsValue::list(variant.fields.iter().map(|_| v.clone()).collect());
+                            (v, reads)
+                        }
                         AdtKind::Enum => {
                             assert_eq!(
                                 format!("{:?}", adt_def),
@@ -832,7 +840,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Uint(_) => AbsValue::uint_top(),
             TyKind::Float(_) => AbsValue::float_top(),
             TyKind::Adt(adt, arg) => match adt.adt_kind() {
-                AdtKind::Struct => {
+                AdtKind::Struct | AdtKind::Union => {
                     let variant = adt.variant(VariantIdx::from_usize(0));
                     AbsValue::list(
                         variant
@@ -845,7 +853,6 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             .collect(),
                     )
                 }
-                AdtKind::Union => todo!("{:?}", ty),
                 AdtKind::Enum => {
                     let ty = format!("{:?}", adt);
                     match ty.as_str() {
@@ -1021,12 +1028,17 @@ fn block_entry(block: BasicBlock) -> Location {
 
 lazy_static! {
     static ref WRITE_FUNCTIONS: BTreeSet<&'static str> = [
+        "__fxstat",
+        "__xstat",
+        "_setjmp",
         "getcwd",
         "getgroups",
+        "getopt_long",
         "fgets",
         "longjmp",
         "memcpy",
         "setvbuf",
+        "sigaction",
         "sigaddset",
         "sigemptyset",
         "sigprocmask",
@@ -1034,9 +1046,6 @@ lazy_static! {
         "strcpy",
         "strncpy",
         "strtol",
-        "__fxstat",
-        "__xstat",
-        "getopt_long",
     ]
     .into_iter()
     .collect();

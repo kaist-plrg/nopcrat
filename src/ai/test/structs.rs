@@ -142,3 +142,50 @@ fn test_array() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), (0..=10).collect::<Vec<_>>());
 }
+
+#[test]
+fn test_union_read() {
+    let code = "
+        union U { x: i32, y: f32 }
+        unsafe fn f() -> i32 {
+            let u1 = U { x: 0 };
+            let u2 = U { y: 1.0 };
+            u1.x + u2.y as i32
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
+
+#[test]
+fn test_union_write() {
+    let code = "
+        union U { x: i32, y: f32 }
+        unsafe fn f() -> i32 {
+            let mut u1 = U { x: 0 };
+            let mut u2 = U { y: 1.0 };
+            u1.x = 1;
+            u2.y = 2.0;
+            u1.x + u2.y as i32
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![3]);
+}
+
+#[test]
+fn test_union_param() {
+    let code = "
+        union U { x: i32, y: f32 }
+        unsafe fn f(mut u1: U, mut u2: U) -> i32 {
+            u1.x = 0;
+            u2.y = 1.0;
+            u1.x + u2.y as i32
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}
