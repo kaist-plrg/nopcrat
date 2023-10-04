@@ -144,6 +144,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "etrace",
+ "lazy_static",
  "rustfix",
  "tracing",
  "tracing-subscriber",

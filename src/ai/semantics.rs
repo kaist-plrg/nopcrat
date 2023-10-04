@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
+use lazy_static::lazy_static;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Operand,
-        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Mutability,
+        Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind, TypeAndMut},
@@ -312,37 +313,40 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             let inputs = sig.inputs().skip_binder();
             let output = sig.output().skip_binder();
 
-            let (read_args, write_args) = if name.ends_with("::{extern#0}::free") {
+            assert!(name.contains("{extern#0}"));
+            let fn_name = name.split("::").last().unwrap();
+            let (read_args, write_args) = if LIBC_FUNCTIONS.contains(fn_name) {
+                let const_ptrs: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ty)| {
+                        matches!(
+                            ty.kind(),
+                            TyKind::RawPtr(TypeAndMut {
+                                mutbl: Mutability::Not,
+                                ..
+                            })
+                        )
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut_ptrs: Vec<_> = inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ty)| {
+                        matches!(
+                            ty.kind(),
+                            TyKind::RawPtr(TypeAndMut {
+                                mutbl: Mutability::Mut,
+                                ..
+                            })
+                        )
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                (const_ptrs, mut_ptrs)
+            } else if fn_name == "free" || fn_name == "realloc" {
                 (vec![], vec![])
-            } else if name.ends_with("::{extern#0}::getcwd") {
-                (vec![], vec![0])
-            } else if name.ends_with("::{extern#0}::getgroups") {
-                (vec![], vec![1])
-            } else if name.ends_with("::{extern#0}::realloc")
-                || name.ends_with("::{extern#0}::strlen")
-                || name.ends_with("::{extern#0}::eaccess")
-                || name.ends_with("::{extern#0}::strchr")
-                || name.ends_with("::{extern#0}::getenv")
-                || name.ends_with("::{extern#0}::getpwnam")
-            {
-                (vec![0], vec![])
-            } else if name.ends_with("::{extern#0}::fprintf")
-                || name.ends_with("::{extern#0}::strcmp")
-                || name.ends_with("::{extern#0}::strncmp")
-                || name.ends_with("::{extern#0}::fputs")
-            {
-                (vec![0, 1], vec![])
-            } else if name.ends_with("::{extern#0}::fputc") {
-                (vec![1], vec![])
-            } else if name.ends_with("::{extern#0}::memcpy")
-                || name.ends_with("::{extern#0}::strcpy")
-                || name.ends_with("::{extern#0}::strncpy")
-            {
-                (vec![1], vec![0])
-            } else if name.ends_with("::{extern#0}::__xstat") {
-                (vec![1], vec![2])
-            } else if name.ends_with("::{extern#0}::getopt_long") {
-                (vec![1, 2, 3], vec![4])
             } else if inputs.iter().any(|ty| !ty.is_primitive()) {
                 todo!("{:?}", callee)
             } else {
@@ -359,10 +363,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
 
             if output.is_primitive() || output.is_unit() || output.is_never() {
                 self.top_value_of_ty(&output, None, &mut BTreeSet::new())
-            } else if name.ends_with("::{extern#0}::malloc")
-                || name.ends_with("::{extern#0}::realloc")
-                || name.ends_with("::{extern#0}::getenv")
-                || name.ends_with("::{extern#0}::getpwnam")
+            } else if fn_name == "__ctype_b_loc"
+                || fn_name == "malloc"
+                || fn_name == "realloc"
+                || fn_name == "getenv"
+                || fn_name == "getpwnam"
+                || fn_name == "getpwuid"
             {
                 let i = if let Some(i) = self.label_alloc_map.get(label) {
                     if *i < state.heap.len() {
@@ -376,11 +382,14 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 };
                 self.label_alloc_map.insert(label.clone(), i);
                 AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
-            } else if name.ends_with("::{extern#0}::getcwd")
-                || name.ends_with("::{extern#0}::strchr")
-                || name.ends_with("::{extern#0}::memcpy")
-                || name.ends_with("::{extern#0}::strcpy")
-                || name.ends_with("::{extern#0}::strncpy")
+            } else if fn_name == "fgets"
+                || fn_name == "getcwd"
+                || fn_name == "memcpy"
+                || fn_name == "strcat"
+                || fn_name == "strchr"
+                || fn_name == "strcpy"
+                || fn_name == "strncpy"
+                || fn_name == "strrchr"
             {
                 args[0].clone()
             } else {
@@ -1003,4 +1012,31 @@ fn block_entry(block: BasicBlock) -> Location {
         block,
         statement_index: 0,
     }
+}
+
+lazy_static! {
+    static ref LIBC_FUNCTIONS: BTreeSet<&'static str> = [
+        "getcwd",
+        "getgroups",
+        "strlen",
+        "eaccess",
+        "strchr",
+        "getenv",
+        "getpwnam",
+        "fprintf",
+        "strcmp",
+        "strncmp",
+        "fgets",
+        "fputs",
+        "fputc",
+        "memcpy",
+        "strcat",
+        "strcpy",
+        "strncpy",
+        "strrchr",
+        "__xstat",
+        "getopt_long",
+    ]
+    .into_iter()
+    .collect();
 }

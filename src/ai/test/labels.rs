@@ -423,8 +423,7 @@ fn test_realloc() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1]);
+    assert_eq!(result[0].reads.len(), 0);
 }
 
 #[test]

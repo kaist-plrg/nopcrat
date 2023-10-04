@@ -45,6 +45,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
     let mut inputs_map = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
+        if item.ident.name.to_ident_string() == "main" {
+            continue;
+        }
         let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
             sig.decl.inputs.len()
         } else {
