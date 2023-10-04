@@ -526,3 +526,19 @@ fn test_mutually_recursive() {
     assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
     assert_eq!(result[0].reads.len(), 0);
 }
+
+#[test]
+fn test_volatile_write() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32) -> i32 {
+            std::ptr::write_volatile(p, if b { 0 } else { 1 });
+            *p
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert_eq!(result[0].writes.len(), 1);
+    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].reads.len(), 0);
+}

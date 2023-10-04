@@ -637,3 +637,18 @@ fn test_while_malloc() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].heap.len(), 1);
 }
+
+#[test]
+fn test_volatile_write() {
+    let code = "
+        unsafe fn f(b: bool) -> i32 {
+            let mut x: i32 = 0;
+            let p: *mut i32 = &mut x;
+            std::ptr::write_volatile(p, if b { 0 } else { 1 });
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}

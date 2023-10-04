@@ -430,6 +430,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 }
                 "::ptr::mut_ptr::{impl#0}::offset_from"
                 | "::ptr::const_ptr::{impl#0}::offset_from" => AbsValue::int_top(),
+                "::ptr::write_volatile" => {
+                    self.indirect_assign(&args[0].ptrv, &args[1], &[], &mut state);
+                    let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
+                    writes.extend(writes2);
+                    AbsValue::top()
+                }
                 "::option::{impl#0}::is_some" => {
                     let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
                     reads.extend(reads2);
@@ -1059,6 +1065,7 @@ lazy_static! {
         "getpwnam",
         "getpwuid",
         "popen",
+        "setlocale",
         "strerror",
         "tmpfile",
     ]
