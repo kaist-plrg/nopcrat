@@ -121,6 +121,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
 
             for def_id in def_ids {
                 println!("{:?}", def_id);
+                tracing::info!("{:?}", def_id);
                 let inputs = *inputs_map.get(def_id).unwrap();
                 let static_tys = static_tys_map.get(def_id).unwrap().clone();
                 let body = tcx.optimized_mir(def_id);
@@ -289,6 +290,15 @@ impl<'tcx> Analyzer<'tcx> {
                     let next_state = states.get(&next_label).unwrap_or(&bot);
                     let joined = next_state.join(&new_next_state);
                     if !joined.ord(next_state) {
+                        let max = joined
+                            .local
+                            .iter()
+                            .chain(joined.heap.iter())
+                            .flat_map(|v| v.allocs())
+                            .max();
+                        if let Some(max) = max {
+                            assert!(max < joined.heap.len(), "{:?}", joined);
+                        }
                         states.insert(next_label.clone(), joined);
                         work_list.push(next_label);
                     }

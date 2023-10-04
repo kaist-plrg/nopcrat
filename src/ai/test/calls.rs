@@ -699,3 +699,29 @@ fn test_malloc_malloc() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![1]);
 }
+
+#[test]
+fn test_malloc_null() {
+    let code = "
+        extern crate libc;
+        extern \"C\" {
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }
+        unsafe fn f(b: bool) -> i32 {
+            let p = g(b);
+            *p
+        }
+        unsafe fn g(b: bool) -> *mut i32 {
+            if b {
+                let p = malloc(4) as *mut i32;
+                *p = 1;
+                p
+            } else {
+                0 as *mut i32
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}

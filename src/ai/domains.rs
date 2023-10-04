@@ -118,6 +118,10 @@ impl AbsHeap {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AbsValue> {
+        self.0.iter()
+    }
 }
 
 #[derive(Clone)]
@@ -1947,7 +1951,7 @@ impl AbsPtr {
                     let alloc = match &place.base {
                         AbsBase::Local(_) => return Self::bot(),
                         AbsBase::Heap(alloc) => alloc,
-                        AbsBase::Null => return self.clone(),
+                        AbsBase::Null => return Self::null(),
                     };
                     let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
                         ptrs
