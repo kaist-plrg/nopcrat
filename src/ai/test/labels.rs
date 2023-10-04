@@ -481,3 +481,48 @@ fn test_unknown_file() {
     assert_eq!(result[0].writes.len(), 0);
     assert_eq!(result[0].reads.len(), 0);
 }
+
+#[test]
+fn test_recursive() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32) {
+            if b {
+                f(b, p);
+            } else {
+                *p = 1;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert_eq!(result[0].writes.len(), 1);
+    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].reads.len(), 0);
+}
+
+#[test]
+fn test_mutually_recursive() {
+    let code = "
+        unsafe fn f(b: bool, p: *mut i32) {
+            if b {
+                g(b, p);
+            } else {
+                *p = 1;
+            }
+        }
+        unsafe fn g(b: bool, p: *mut i32) {
+            if b {
+                f(b, p);
+            } else {
+                *p = 1;
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert_eq!(result[0].writes.len(), 1);
+    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].reads.len(), 0);
+}

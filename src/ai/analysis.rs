@@ -84,6 +84,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
         call_graph.insert(def_id, visitor.callees);
     }
 
+    let static_tys_map: BTreeMap<_, _> = call_graph
+        .keys()
+        .map(|def_id| (*def_id, get_static_tys(*def_id, tcx)))
+        .collect();
+
     let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
@@ -98,61 +103,58 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
     let mut summaries = BTreeMap::new();
     for id in &po {
         let def_ids = elems.get(id).unwrap();
-        assert_eq!(def_ids.len(), 1);
+        let recursive = if def_ids.len() == 1 {
+            let def_id = def_ids.first().unwrap();
+            call_graph.get(def_id).unwrap().contains(def_id)
+        } else {
+            true
+        };
 
-        let def_id = *def_ids.iter().next().unwrap();
-        println!("{:?}", def_id);
+        loop {
+            let mut input_summaries = summaries.clone();
+            if recursive {
+                for def_id in def_ids {
+                    let len = tcx.optimized_mir(*def_id).local_decls.len();
+                    let _ = input_summaries.try_insert(*def_id, FunctionSummary::bot(len));
+                }
+            }
 
-        let static_tys = get_static_tys(def_id, tcx);
-        let inputs = *inputs_map.get(&def_id).unwrap();
+            for def_id in def_ids {
+                println!("{:?}", def_id);
+                let inputs = *inputs_map.get(def_id).unwrap();
+                let static_tys = static_tys_map.get(def_id).unwrap().clone();
+                let body = tcx.optimized_mir(def_id);
+                let param_tys = get_param_tys(body, inputs, tcx);
+                let alloc_ty_map = get_alloc_ty_map(body, tcx);
 
-        let body = tcx.optimized_mir(def_id);
+                let mut analyzer = Analyzer::new(
+                    tcx,
+                    inputs,
+                    param_tys,
+                    static_tys,
+                    alloc_ty_map,
+                    input_summaries.clone(),
+                );
+                let summary = analyzer.make_summary(body);
 
-        let mut param_tys = vec![];
-        for (i, local) in body.local_decls.iter().enumerate() {
-            if i > inputs {
+                let summary = if let Some(old) = input_summaries.get(def_id) {
+                    summary.join(old)
+                } else {
+                    summary
+                };
+                summaries.insert(*def_id, summary);
+            }
+
+            if !recursive
+                || def_ids.iter().all(|def_id| {
+                    let old = input_summaries.get(def_id).unwrap();
+                    let new = summaries.get(def_id).unwrap();
+                    new.ord(old)
+                })
+            {
                 break;
             }
-            let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
-                TypeInfo::from_ty(&tm.ty, tcx)
-            } else {
-                TypeInfo::NonStruct
-            };
-            param_tys.push(ty);
         }
-
-        let mut visitor = LiteralVisitor::new(tcx);
-        visitor.visit_body(body);
-
-        let mut analyzer = Analyzer::new(
-            tcx,
-            inputs,
-            param_tys,
-            static_tys,
-            visitor.alloc_ty_map,
-            summaries,
-        );
-        let (result, init_state) = analyzer.analyze_body(body);
-        summaries = analyzer.summaries;
-
-        tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
-
-        let return_states = return_location(body)
-            .map(|ret| {
-                result
-                    .into_iter()
-                    .filter_map(|(label, state)| {
-                        if label.location == ret {
-                            Some(state)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let summary = FunctionSummary::new(init_state, return_states);
-        summaries.insert(def_id, summary);
     }
     summaries
 }
@@ -195,9 +197,28 @@ impl<'tcx> Analyzer<'tcx> {
             label_user_fn_alloc_map: BTreeMap::new(),
         }
     }
-}
 
-impl<'tcx> Analyzer<'tcx> {
+    fn make_summary(&mut self, body: &Body<'tcx>) -> FunctionSummary {
+        let (result, init_state) = self.analyze_body(body);
+        tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
+
+        let return_states = return_location(body)
+            .map(|ret| {
+                result
+                    .into_iter()
+                    .filter_map(|(label, state)| {
+                        if label.location == ret {
+                            Some(state)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        FunctionSummary::new(init_state, return_states)
+    }
+
     pub fn analyze_body(&mut self, body: &Body<'tcx>) -> (BTreeMap<Label, AbsState>, AbsState) {
         let mut work_list = WorkList::default();
         let mut states: BTreeMap<Label, AbsState> = BTreeMap::new();
@@ -301,6 +322,55 @@ impl FunctionSummary {
         Self {
             init_state,
             return_states,
+        }
+    }
+
+    fn bot(len: usize) -> Self {
+        Self {
+            init_state: AbsState::bot(len),
+            return_states: vec![],
+        }
+    }
+
+    fn join(&self, that: &Self) -> Self {
+        let init_state = self.init_state.join(&that.init_state);
+        let this_map: BTreeMap<_, _> = self
+            .return_states
+            .iter()
+            .map(|s| ((&s.reads, &s.writes), s))
+            .collect();
+        let that_map: BTreeMap<_, _> = that
+            .return_states
+            .iter()
+            .map(|s| ((&s.reads, &s.writes), s))
+            .collect();
+        let keys: BTreeSet<_> = this_map.keys().chain(that_map.keys()).collect();
+        let return_states = keys
+            .into_iter()
+            .map(|k| match (this_map.get(k), that_map.get(k)) {
+                (Some(v1), Some(v2)) => v1.join(v2),
+                (Some(v), None) | (None, Some(v)) => (*v).clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        Self::new(init_state, return_states)
+    }
+
+    fn ord(&self, that: &Self) -> bool {
+        self.init_state.ord(&that.init_state) && {
+            let this_map: BTreeMap<_, _> = self
+                .return_states
+                .iter()
+                .map(|s| ((&s.reads, &s.writes), s))
+                .collect();
+            let that_map: BTreeMap<_, _> = that
+                .return_states
+                .iter()
+                .map(|s| ((&s.reads, &s.writes), s))
+                .collect();
+            this_map
+                .iter()
+                .all(|(k, v)| that_map.get(k).map_or(false, |w| v.ord(w)))
         }
     }
 }
@@ -454,7 +524,7 @@ fn analysis_result_to_string(
     Ok(res)
 }
 
-pub fn get_static_tys(def_id: DefId, tcx: TyCtxt<'_>) -> BTreeMap<DefId, Ty<'_>> {
+fn get_static_tys(def_id: DefId, tcx: TyCtxt<'_>) -> BTreeMap<DefId, Ty<'_>> {
     let body = tcx.mir_built(def_id.as_local().unwrap()).borrow();
     let mut static_tys = BTreeMap::new();
     for local in &body.local_decls {
@@ -465,7 +535,29 @@ pub fn get_static_tys(def_id: DefId, tcx: TyCtxt<'_>) -> BTreeMap<DefId, Ty<'_>>
     static_tys
 }
 
-pub fn return_location(body: &Body<'_>) -> Option<Location> {
+fn get_param_tys<'tcx>(body: &Body<'tcx>, inputs: usize, tcx: TyCtxt<'tcx>) -> Vec<TypeInfo> {
+    let mut param_tys = vec![];
+    for (i, local) in body.local_decls.iter().enumerate() {
+        if i > inputs {
+            break;
+        }
+        let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
+            TypeInfo::from_ty(&tm.ty, tcx)
+        } else {
+            TypeInfo::NonStruct
+        };
+        param_tys.push(ty);
+    }
+    param_tys
+}
+
+fn get_alloc_ty_map<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> BTreeMap<AllocId, Ty<'tcx>> {
+    let mut visitor = LiteralVisitor::new(tcx);
+    visitor.visit_body(body);
+    visitor.alloc_ty_map
+}
+
+fn return_location(body: &Body<'_>) -> Option<Location> {
     for block in body.basic_blocks.indices() {
         let bbd = &body.basic_blocks[block];
         if let Some(terminator) = &bbd.terminator {

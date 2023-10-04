@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
 use lazy_static::lazy_static;
-use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_const_eval::interpret::{ConstValue, GlobalAlloc, Scalar};
+use rustc_abi::{FieldIdx, Size, VariantIdx};
+use rustc_const_eval::interpret::{AllocRange, ConstValue, GlobalAlloc, Scalar};
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Mutability,
@@ -163,10 +163,14 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     new_state.add_writes(writes.into_iter());
                     vec![new_state]
                 };
-                let locations = target
-                    .as_ref()
-                    .map(|target| vec![block_entry(*target)])
-                    .unwrap_or(vec![]);
+                let locations = if new_states.is_empty() {
+                    vec![]
+                } else {
+                    target
+                        .as_ref()
+                        .map(|target| vec![block_entry(*target)])
+                        .unwrap_or(vec![])
+                };
                 (new_states, locations)
             }
             TerminatorKind::Assert { cond, target, .. } => {
@@ -196,6 +200,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
+                if summary.return_states.is_empty() {
+                    return vec![];
+                }
+
                 let mut ptr_maps = BTreeMap::new();
                 let mut allocs = BTreeSet::new();
                 for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
@@ -420,6 +428,8 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     };
                     AbsValue::bools(b)
                 }
+                "::ptr::mut_ptr::{impl#0}::offset_from"
+                | "::ptr::const_ptr::{impl#0}::offset_from" => AbsValue::int_top(),
                 "::option::{impl#0}::is_some" => {
                     let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
                     reads.extend(reads2);
@@ -437,9 +447,11 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     _ => AbsValue::bot(),
                 },
                 "::mem::size_of" => AbsValue::uint_top(),
+                "::panicking::begin_panic" => AbsValue::bot(),
                 _ if name.ends_with("::wrapping_add") => args[0].add(&args[1]),
                 _ if name.ends_with("::wrapping_sub") => args[0].sub(&args[1]),
                 _ if name.ends_with("::wrapping_mul") => args[0].mul(&args[1]),
+                _ if name.ends_with("::wrapping_div") => args[0].div(&args[1]),
                 _ => todo!("{}", name),
             }
         };
@@ -556,7 +568,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     }
                     CastKind::PtrToPtr => v,
                     CastKind::FnPtrToPtr => v,
-                    CastKind::Transmute => unreachable!("{:?}", rvalue),
+                    CastKind::Transmute => v,
                 };
                 (v, reads)
             }
@@ -788,7 +800,21 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     unreachable!("{:?}", v)
                 }
             }
-            ConstValue::Slice { .. } => unreachable!("{:?}", v),
+            ConstValue::Slice { data, start, end } => {
+                let start = Size::from_bytes(*start);
+                let size = Size::from_bytes(*end) - start;
+                let range = AllocRange { start, size };
+                let arr = data
+                    .inner()
+                    .get_bytes_strip_provenance(&self.tcx, range)
+                    .unwrap();
+                let msg = String::from_utf8(arr.to_vec()).unwrap();
+                if msg == "explicit panic" {
+                    AbsValue::top()
+                } else {
+                    unreachable!("{:?}", msg)
+                }
+            }
             ConstValue::ByRef { .. } => unreachable!("{:?}", v),
         }
     }
@@ -1007,6 +1033,8 @@ lazy_static! {
         "strcat",
         "strcpy",
         "strncpy",
+        "strtol",
+        "__fxstat",
         "__xstat",
         "getopt_long",
     ]
@@ -1015,18 +1043,21 @@ lazy_static! {
     static ref ALLOC_FUNCTIONS: BTreeSet<&'static str> = [
         "__ctype_b_loc",
         "__errno_location",
+        "fopen",
         "malloc",
         "realloc",
         "getenv",
         "getpwnam",
         "getpwuid",
+        "popen",
         "strerror",
         "tmpfile",
     ]
     .into_iter()
     .collect();
-    static ref RETURN_FIRST_FUNCTIONS: BTreeSet<&'static str> =
-        ["fgets", "getcwd", "memcpy", "strcat", "strchr", "strcpy", "strncpy", "strrchr",]
-            .into_iter()
-            .collect();
+    static ref RETURN_FIRST_FUNCTIONS: BTreeSet<&'static str> = [
+        "fgets", "getcwd", "memchr", "memcpy", "strcat", "strchr", "strcpy", "strncpy", "strrchr",
+    ]
+    .into_iter()
+    .collect();
 }
