@@ -40,6 +40,7 @@ pub fn analyze_input(input: Input) {
         for (def_id, summary) in results {
             let (readss, writess): (Vec<_>, Vec<_>) = summary
                 .return_states
+                .clone()
                 .into_iter()
                 .map(|st| (st.reads, st.writes))
                 .unzip();
@@ -57,6 +58,25 @@ pub fn analyze_input(input: Input) {
             for w in writes {
                 let must = writess.iter().all(|s| s.contains(w));
                 println!("  {:?}{}", w, if must { " (must)" } else { " (may)" });
+                if !must {
+                    let (wst, nwst): (Vec<_>, Vec<_>) = summary
+                        .return_states
+                        .iter()
+                        .partition(|st| st.writes.contains(w));
+                    let w = wst
+                        .into_iter()
+                        .map(|st| st.local.get(0))
+                        .cloned()
+                        .reduce(|a, b| a.join(&b))
+                        .unwrap();
+                    let nw = nwst
+                        .into_iter()
+                        .map(|st| st.local.get(0))
+                        .cloned()
+                        .reduce(|a, b| a.join(&b))
+                        .unwrap();
+                    println!("  {:?} / {:?}", w, nw);
+                }
             }
         }
     });
