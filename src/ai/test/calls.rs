@@ -675,3 +675,27 @@ fn test_while_malloc() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].heap.len(), 1);
 }
+
+#[test]
+fn test_malloc_malloc() {
+    let code = "
+        extern crate libc;
+        extern \"C\" {
+            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
+        }
+        unsafe fn f() -> i32 {
+            let p = g();
+            **p
+        }
+        unsafe fn g() -> *mut *mut i32 {
+            let p = malloc(4) as *mut i32;
+            *p = 1;
+            let q = malloc(4) as *mut *mut i32;
+            *q = p;
+            q
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![1]);
+}

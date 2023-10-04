@@ -2205,6 +2205,10 @@ impl MustPathSet {
         Self::All
     }
 
+    pub fn is_bot(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
     pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (s, Self::All) | (Self::All, s) => s.clone(),
@@ -2251,6 +2255,13 @@ impl MustPathSet {
         match self {
             Self::All => panic!(),
             Self::Set(set) => set.iter(),
+        }
+    }
+
+    pub fn into_inner(self) -> BTreeSet<AbsPath> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set,
         }
     }
 
@@ -2309,6 +2320,10 @@ impl MayPathSet {
 
     pub fn iter(&self) -> impl Iterator<Item = &AbsPath> {
         self.0.iter()
+    }
+
+    pub fn into_inner(self) -> BTreeSet<AbsPath> {
+        self.0
     }
 
     pub fn as_set(&self) -> &BTreeSet<AbsPath> {

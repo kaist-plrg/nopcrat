@@ -63,7 +63,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         if let AbsPtr::Set(ptrs) = ptr {
             let weak = ptrs.len() > 1;
             for ptr in ptrs {
-                let old_v = state.get_mut(ptr.base).unwrap();
+                let old_v = some_or!(state.get_mut(ptr.base), continue);
                 let mut ptr_projection = ptr.projection.clone();
                 ptr_projection.extend(projection.to_owned());
                 self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
@@ -222,7 +222,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     let mut state = state.clone();
                     let mut ptr_maps = ptr_maps.clone();
                     let ret_v = return_state.local.get(0);
-                    let allocs: BTreeSet<_> = ptr_maps
+                    let mut allocs: BTreeSet<_> = ptr_maps
                         .keys()
                         .map(|p| return_state.heap.get(*p))
                         .chain(std::iter::once(ret_v))
@@ -236,9 +236,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             return_state.writes.clone(),
                         ))
                         .or_default();
-                    for alloc in allocs {
+                    while let Some(alloc) = allocs.pop_first() {
                         ptr_maps.entry(alloc).or_insert_with(|| {
                             let alloc_v = return_state.heap.get(alloc);
+                            allocs.extend(alloc_v.allocs());
                             let i = if let Some(i) = label_alloc_map.get(&alloc) {
                                 if *i < state.heap.len() {
                                     let old_v = state.heap.get_mut(*i);
@@ -315,42 +316,34 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
 
             assert!(name.contains("{extern#0}"));
             let fn_name = name.split("::").last().unwrap();
-            let (read_args, write_args) = if LIBC_FUNCTIONS.contains(fn_name) {
-                let const_ptrs: Vec<_> = inputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ty)| {
-                        matches!(
-                            ty.kind(),
-                            TyKind::RawPtr(TypeAndMut {
-                                mutbl: Mutability::Not,
-                                ..
-                            })
-                        )
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                let mut_ptrs: Vec<_> = inputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, ty)| {
-                        matches!(
-                            ty.kind(),
-                            TyKind::RawPtr(TypeAndMut {
-                                mutbl: Mutability::Mut,
-                                ..
-                            })
-                        )
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                (const_ptrs, mut_ptrs)
-            } else if fn_name == "free" || fn_name == "realloc" {
+            let (read_args, write_args) = if inputs.iter().all(|ty| ty.is_primitive())
+                || fn_name == "free"
+                || fn_name == "realloc"
+            {
                 (vec![], vec![])
-            } else if inputs.iter().any(|ty| !ty.is_primitive()) {
-                todo!("{:?}", callee)
             } else {
-                (vec![], vec![])
+                let (const_ptrs, mut_ptrs): (Vec<_>, Vec<_>) = inputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, ty)| {
+                        if let TyKind::RawPtr(TypeAndMut { ty, mutbl }) = ty.kind() {
+                            if let TyKind::Adt(adt, _) = ty.kind() {
+                                if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
+                                    return None;
+                                }
+                            }
+                            return Some((i, mutbl));
+                        }
+                        None
+                    })
+                    .partition(|(_, mutbl)| matches!(mutbl, Mutability::Not));
+                let const_ptrs: Vec<_> = const_ptrs.into_iter().map(|(i, _)| i).collect();
+                let mut_ptrs: Vec<_> = mut_ptrs.into_iter().map(|(i, _)| i).collect();
+                if mut_ptrs.is_empty() || WRITE_FUNCTIONS.contains(fn_name) {
+                    (const_ptrs, mut_ptrs)
+                } else {
+                    todo!("{:?}", callee)
+                }
             };
             for arg in read_args {
                 let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
@@ -363,13 +356,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
 
             if output.is_primitive() || output.is_unit() || output.is_never() {
                 self.top_value_of_ty(&output, None, &mut BTreeSet::new())
-            } else if fn_name == "__ctype_b_loc"
-                || fn_name == "malloc"
-                || fn_name == "realloc"
-                || fn_name == "getenv"
-                || fn_name == "getpwnam"
-                || fn_name == "getpwuid"
-            {
+            } else if ALLOC_FUNCTIONS.contains(fn_name) {
                 let i = if let Some(i) = self.label_alloc_map.get(label) {
                     if *i < state.heap.len() {
                         *state.heap.get_mut(*i) = AbsValue::top();
@@ -382,15 +369,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 };
                 self.label_alloc_map.insert(label.clone(), i);
                 AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
-            } else if fn_name == "fgets"
-                || fn_name == "getcwd"
-                || fn_name == "memcpy"
-                || fn_name == "strcat"
-                || fn_name == "strchr"
-                || fn_name == "strcpy"
-                || fn_name == "strncpy"
-                || fn_name == "strrchr"
-            {
+            } else if RETURN_FIRST_FUNCTIONS.contains(fn_name) {
                 args[0].clone()
             } else {
                 todo!("{:?}", callee)
@@ -1015,28 +994,39 @@ fn block_entry(block: BasicBlock) -> Location {
 }
 
 lazy_static! {
-    static ref LIBC_FUNCTIONS: BTreeSet<&'static str> = [
+    static ref WRITE_FUNCTIONS: BTreeSet<&'static str> = [
         "getcwd",
         "getgroups",
-        "strlen",
-        "eaccess",
-        "strchr",
-        "getenv",
-        "getpwnam",
-        "fprintf",
-        "strcmp",
-        "strncmp",
         "fgets",
-        "fputs",
-        "fputc",
+        "longjmp",
         "memcpy",
+        "setvbuf",
+        "sigaddset",
+        "sigemptyset",
+        "sigprocmask",
         "strcat",
         "strcpy",
         "strncpy",
-        "strrchr",
         "__xstat",
         "getopt_long",
     ]
     .into_iter()
     .collect();
+    static ref ALLOC_FUNCTIONS: BTreeSet<&'static str> = [
+        "__ctype_b_loc",
+        "__errno_location",
+        "malloc",
+        "realloc",
+        "getenv",
+        "getpwnam",
+        "getpwuid",
+        "strerror",
+        "tmpfile",
+    ]
+    .into_iter()
+    .collect();
+    static ref RETURN_FIRST_FUNCTIONS: BTreeSet<&'static str> =
+        ["fgets", "getcwd", "memcpy", "strcat", "strchr", "strcpy", "strncpy", "strrchr",]
+            .into_iter()
+            .collect();
 }

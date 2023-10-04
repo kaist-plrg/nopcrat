@@ -33,9 +33,33 @@ pub fn analyze_code(code: &str) {
     analyze_input(compile_util::str_to_input(code));
 }
 
-pub fn analyze_input(input: Input) -> BTreeMap<DefId, FunctionSummary> {
+pub fn analyze_input(input: Input) {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| analyze(tcx)).unwrap()
+    compile_util::run_compiler(config, |_, tcx| {
+        let results = analyze(tcx);
+        for (def_id, summary) in results {
+            let (readss, writess): (Vec<_>, Vec<_>) = summary
+                .return_states
+                .into_iter()
+                .map(|st| (st.reads, st.writes))
+                .unzip();
+            let reads: BTreeSet<_> = readss.into_iter().flat_map(|s| s.into_inner()).collect();
+            if writess.iter().any(|s| s.is_bot()) {
+                continue;
+            }
+            let writess: Vec<_> = writess.into_iter().map(|s| s.into_inner()).collect();
+            let mut writes: BTreeSet<_> = writess.iter().flatten().collect();
+            writes.retain(|w| !reads.contains(w));
+            if writes.is_empty() {
+                continue;
+            }
+            println!("{}:", tcx.def_path_str(def_id));
+            for w in writes {
+                let must = writess.iter().all(|s| s.contains(w));
+                println!("  {:?}{}", w, if must { " (must)" } else { " (may)" });
+            }
+        }
+    });
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
