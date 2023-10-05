@@ -37,41 +37,69 @@ pub fn analyze_input(input: Input) {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |_, tcx| {
         let results = analyze(tcx);
-        for (def_id, summary) in results {
-            let (readss, writess): (Vec<_>, Vec<_>) = summary
+        for (def_id, (summary, param_tys)) in results {
+            let reads: BTreeSet<_> = summary
                 .return_states
-                .clone()
-                .into_iter()
-                .map(|st| (st.rw.reads, st.rw.writes))
-                .unzip();
-            let reads: BTreeSet<_> = readss.into_iter().flat_map(|s| s.into_inner()).collect();
-            if writess.iter().any(|s| s.is_bot()) {
+                .iter()
+                .flat_map(|st| st.rw.reads.as_set())
+                .map(|p| p.base())
+                .collect();
+            if summary.return_states.iter().any(|st| st.rw.writes.is_bot()) {
                 continue;
             }
-            let writess: Vec<_> = writess.into_iter().map(|s| s.into_inner()).collect();
-            let mut writes: BTreeSet<_> = writess.iter().flatten().collect();
-            writes.retain(|w| !reads.contains(w));
+            let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..param_tys.len())
+                .map(|i| {
+                    let expanded = expands_path(&[i], &param_tys, vec![]).into_iter().collect();
+                    (i, expanded)
+                })
+                .collect();
+            let ret_writes: Vec<_> = summary
+                .return_states
+                .iter()
+                .map(|st| {
+                    let writes = st.rw.writes.as_set();
+                    let mut per_base: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+                    for w in writes {
+                        per_base.entry(w.base()).or_default().insert(w.0.clone());
+                    }
+                    let writes: BTreeSet<_> = per_base
+                        .into_iter()
+                        .filter_map(|(i, paths)| {
+                            if reads.contains(&i) || expanded_map.get(&i).unwrap() != &paths {
+                                None
+                            } else {
+                                Some(i)
+                            }
+                        })
+                        .collect();
+                    (st.local.get(0).clone(), writes)
+                })
+                .collect();
+            let writes: BTreeSet<_> = ret_writes
+                .iter()
+                .flat_map(|(_, writes)| writes)
+                .cloned()
+                .collect();
             if writes.is_empty() {
                 continue;
             }
             println!("{}:", tcx.def_path_str(def_id));
             for w in writes {
-                let must = writess.iter().all(|s| s.contains(w));
+                let must = ret_writes.iter().all(|(_, writes)| writes.contains(&w));
                 println!("  {:?}{}", w, if must { " (must)" } else { " (may)" });
                 if !must {
-                    let (wst, nwst): (Vec<_>, Vec<_>) = summary
-                        .return_states
+                    let (wst, nwst): (Vec<_>, Vec<_>) = ret_writes
                         .iter()
-                        .partition(|st| st.rw.writes.contains(w));
+                        .partition(|(_, writes)| writes.contains(&w));
                     let w = wst
                         .into_iter()
-                        .map(|st| st.local.get(0))
+                        .map(|(v, _)| v)
                         .cloned()
                         .reduce(|a, b| a.join(&b))
                         .unwrap();
                     let nw = nwst
                         .into_iter()
-                        .map(|st| st.local.get(0))
+                        .map(|(v, _)| v)
                         .cloned()
                         .reduce(|a, b| a.join(&b))
                         .unwrap();
@@ -82,7 +110,7 @@ pub fn analyze_input(input: Input) {
     });
 }
 
-pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
+pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)> {
     let hir = tcx.hir();
 
     let mut call_graph = BTreeMap::new();
@@ -104,11 +132,6 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
         call_graph.insert(def_id, visitor.callees);
     }
 
-    let static_tys_map: BTreeMap<_, _> = call_graph
-        .keys()
-        .map(|def_id| (*def_id, get_static_tys(*def_id, tcx)))
-        .collect();
-
     let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
@@ -120,6 +143,12 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
         .flatten()
         .collect();
 
+    let static_tys_map: BTreeMap<_, _> = funcs
+        .iter()
+        .map(|def_id| (*def_id, get_static_tys(*def_id, tcx)))
+        .collect();
+
+    let mut param_tys_map = BTreeMap::new();
     let mut summaries = BTreeMap::new();
     for id in &po {
         let def_ids = elems.get(id).unwrap();
@@ -147,6 +176,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
                 let body = tcx.optimized_mir(def_id);
                 let param_tys = get_param_tys(body, inputs, tcx);
                 let alloc_ty_map = get_alloc_ty_map(body, tcx);
+
+                param_tys_map
+                    .entry(*def_id)
+                    .or_insert_with(|| param_tys.clone());
 
                 let mut analyzer = Analyzer::new(
                     tcx,
@@ -177,7 +210,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, FunctionSummary> {
             }
         }
     }
+
     summaries
+        .into_iter()
+        .map(|(def_id, summary)| (def_id, (summary, param_tys_map.remove(&def_id).unwrap())))
+        .collect()
 }
 
 pub struct Analyzer<'tcx> {

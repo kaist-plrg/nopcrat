@@ -325,6 +325,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             let (read_args, write_args) = if inputs.iter().all(|ty| ty.is_primitive())
                 || fn_name == "free"
                 || fn_name == "realloc"
+                || fn_name == "regfree"
             {
                 (vec![], vec![])
             } else {
@@ -1042,6 +1043,8 @@ lazy_static! {
         "fread",
         "longjmp",
         "memcpy",
+        "regcomp",
+        "regerror",
         "regexec",
         "setvbuf",
         "sigaction",
