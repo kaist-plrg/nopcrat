@@ -652,3 +652,99 @@ fn test_volatile_write() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
 }
+
+#[test]
+fn test_eq() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p == q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}
+
+#[test]
+fn test_lt() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p < q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}
+
+#[test]
+fn test_le() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p <= q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}
+
+#[test]
+fn test_ne() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p != q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}
+
+#[test]
+fn test_gt() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p > q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}
+
+#[test]
+fn test_ge() {
+    let code = "
+        unsafe fn f(p: *mut i32, q: *mut i32) -> i32 {
+            if p >= q {
+                0
+            } else {
+                1
+            }
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+}

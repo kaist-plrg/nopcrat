@@ -666,7 +666,8 @@ impl AbsValue {
                 .eq(&other.intv)
                 .join(&self.uintv.eq(&other.uintv))
                 .join(&self.floatv.eq(&other.floatv))
-                .join(&self.boolv.eq(&other.boolv)),
+                .join(&self.boolv.eq(&other.boolv))
+                .join(&self.ptrv.compare(&other.ptrv)),
             ..Self::bot()
         }
     }
@@ -677,7 +678,8 @@ impl AbsValue {
                 .intv
                 .lt(&other.intv)
                 .join(&self.uintv.lt(&other.uintv))
-                .join(&self.floatv.lt(&other.floatv)),
+                .join(&self.floatv.lt(&other.floatv))
+                .join(&self.ptrv.compare(&other.ptrv)),
             ..Self::bot()
         }
     }
@@ -688,7 +690,8 @@ impl AbsValue {
                 .intv
                 .le(&other.intv)
                 .join(&self.uintv.le(&other.uintv))
-                .join(&self.floatv.le(&other.floatv)),
+                .join(&self.floatv.le(&other.floatv))
+                .join(&self.ptrv.compare(&other.ptrv)),
             ..Self::bot()
         }
     }
@@ -700,7 +703,8 @@ impl AbsValue {
                 .ne(&other.intv)
                 .join(&self.uintv.ne(&other.uintv))
                 .join(&self.floatv.ne(&other.floatv))
-                .join(&self.boolv.ne(&other.boolv)),
+                .join(&self.boolv.ne(&other.boolv))
+                .join(&self.ptrv.compare(&other.ptrv)),
             ..Self::bot()
         }
     }
@@ -711,7 +715,9 @@ impl AbsValue {
                 .intv
                 .ge(&other.intv)
                 .join(&self.uintv.ge(&other.uintv))
-                .join(&self.floatv.ge(&other.floatv)),
+                .join(&self.floatv.ge(&other.floatv))
+                .join(&self.ptrv.compare(&other.ptrv)),
+
             ..Self::bot()
         }
     }
@@ -722,7 +728,8 @@ impl AbsValue {
                 .intv
                 .gt(&other.intv)
                 .join(&self.uintv.gt(&other.uintv))
-                .join(&self.floatv.gt(&other.floatv)),
+                .join(&self.floatv.gt(&other.floatv))
+                .join(&self.ptrv.compare(&other.ptrv)),
             ..Self::bot()
         }
     }
@@ -1926,6 +1933,13 @@ impl AbsPtr {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
             (Self::Set(s1), Self::Set(s2)) => s1.is_subset(s2),
+        }
+    }
+
+    pub fn compare(&self, other: &Self) -> AbsBool {
+        match (self, other) {
+            (Self::Set(s), _) | (_, Self::Set(s)) if s.is_empty() => AbsBool::Bot,
+            _ => AbsBool::Top,
         }
     }
 
