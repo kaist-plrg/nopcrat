@@ -42,7 +42,7 @@ pub fn analyze_input(input: Input) {
                 .return_states
                 .clone()
                 .into_iter()
-                .map(|st| (st.reads, st.writes))
+                .map(|st| (st.rw.reads, st.rw.writes))
                 .unzip();
             let reads: BTreeSet<_> = readss.into_iter().flat_map(|s| s.into_inner()).collect();
             if writess.iter().any(|s| s.is_bot()) {
@@ -62,7 +62,7 @@ pub fn analyze_input(input: Input) {
                     let (wst, nwst): (Vec<_>, Vec<_>) = summary
                         .return_states
                         .iter()
-                        .partition(|st| st.writes.contains(w));
+                        .partition(|st| st.rw.writes.contains(w));
                     let w = wst
                         .into_iter()
                         .map(|st| st.local.get(0))
@@ -192,7 +192,7 @@ pub struct Analyzer<'tcx> {
     pub static_allocs: BTreeMap<DefId, usize>,
     pub literal_allocs: BTreeMap<AllocId, usize>,
     pub label_alloc_map: BTreeMap<Label, usize>,
-    pub label_user_fn_alloc_map: BTreeMap<(Label, MayPathSet, MustPathSet), BTreeMap<usize, usize>>,
+    pub label_user_fn_alloc_map: BTreeMap<(Label, RwSets), BTreeMap<usize, usize>>,
 }
 
 impl<'tcx> Analyzer<'tcx> {
@@ -245,7 +245,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut states: BTreeMap<Label, AbsState> = BTreeMap::new();
 
         let mut start_state = AbsState::bot(body.local_decls.len());
-        start_state.writes = MustPathSet::top();
+        start_state.rw.writes = MustPathSet::top();
 
         for i in 1..=self.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
@@ -271,8 +271,7 @@ impl<'tcx> Analyzer<'tcx> {
 
         let start_label = Label {
             location: Location::START,
-            writes: start_state.writes.clone(),
-            reads: start_state.reads.clone(),
+            rw: start_state.rw.clone(),
         };
         states.insert(start_label.clone(), start_state);
         work_list.push(start_label.clone());
@@ -304,8 +303,7 @@ impl<'tcx> Analyzer<'tcx> {
                 for location in &next_locations {
                     let next_label = Label {
                         location: *location,
-                        writes: new_next_state.writes.clone(),
-                        reads: new_next_state.reads.clone(),
+                        rw: new_next_state.rw.clone(),
                     };
                     let next_state = states.get(&next_label).unwrap_or(&bot);
                     let joined = next_state.join(&new_next_state);
@@ -362,18 +360,14 @@ impl FunctionSummary {
         }
     }
 
+    fn return_state_map(&self) -> BTreeMap<&RwSets, &AbsState> {
+        self.return_states.iter().map(|s| (&s.rw, s)).collect()
+    }
+
     fn join(&self, that: &Self) -> Self {
         let init_state = self.init_state.join(&that.init_state);
-        let this_map: BTreeMap<_, _> = self
-            .return_states
-            .iter()
-            .map(|s| ((&s.reads, &s.writes), s))
-            .collect();
-        let that_map: BTreeMap<_, _> = that
-            .return_states
-            .iter()
-            .map(|s| ((&s.reads, &s.writes), s))
-            .collect();
+        let this_map = self.return_state_map();
+        let that_map = that.return_state_map();
         let keys: BTreeSet<_> = this_map.keys().chain(that_map.keys()).collect();
         let return_states = keys
             .into_iter()
@@ -388,16 +382,8 @@ impl FunctionSummary {
 
     fn ord(&self, that: &Self) -> bool {
         self.init_state.ord(&that.init_state) && {
-            let this_map: BTreeMap<_, _> = self
-                .return_states
-                .iter()
-                .map(|s| ((&s.reads, &s.writes), s))
-                .collect();
-            let that_map: BTreeMap<_, _> = that
-                .return_states
-                .iter()
-                .map(|s| ((&s.reads, &s.writes), s))
-                .collect();
+            let this_map = self.return_state_map();
+            let that_map = that.return_state_map();
             this_map
                 .iter()
                 .all(|(k, v)| that_map.get(k).map_or(false, |w| v.ord(w)))
@@ -473,8 +459,7 @@ impl<'tcx> MVisitor<'tcx> for LiteralVisitor<'tcx> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Label {
     pub location: Location,
-    pub writes: MustPathSet,
-    pub reads: MayPathSet,
+    pub rw: RwSets,
 }
 
 #[derive(Default, Debug)]

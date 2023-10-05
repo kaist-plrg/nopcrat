@@ -16,9 +16,9 @@ fn test_write_merge() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -34,15 +34,15 @@ fn test_write() {
     let result = analyze(code);
     assert_eq!(result.len(), 2);
 
-    assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
-    assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[1].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[1].reads.len(), 0);
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].rw.writes.len(), 0);
+    assert_eq!(result[1].rw.reads.len(), 1);
+    assert_eq!(result[1].rw.reads.as_vec()[0].0, vec![2]);
 }
 
 #[test]
@@ -61,15 +61,15 @@ fn test_write_weak() {
     let result = analyze(code);
     assert_eq!(result.len(), 2);
 
-    assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![3]);
+    assert_eq!(as_int(ret(&result[0])), vec![0]);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![3]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
-    assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[1].writes.as_vec()[0].0, vec![3]);
-    assert_eq!(result[1].reads.len(), 0);
+    assert!(ret(&result[1]).intv.is_top());
+    assert_eq!(result[1].rw.writes.len(), 0);
+    assert_eq!(result[1].rw.reads.len(), 1);
+    assert_eq!(result[1].rw.reads.as_vec()[0].0, vec![3]);
 }
 
 #[test]
@@ -90,9 +90,9 @@ fn test_read_merge() {
     assert_eq!(result.len(), 1);
 
     assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![2]);
 }
 
 #[test]
@@ -110,13 +110,13 @@ fn test_read() {
     assert_eq!(result.len(), 2);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
     assert!(ret(&result[1]).intv.is_top());
-    assert_eq!(result[1].writes.len(), 0);
-    assert_eq!(result[1].reads.len(), 1);
-    assert_eq!(result[1].reads.as_vec()[0].0, vec![2]);
+    assert_eq!(result[1].rw.writes.len(), 0);
+    assert_eq!(result[1].rw.reads.len(), 1);
+    assert_eq!(result[1].rw.reads.as_vec()[0].0, vec![2]);
 }
 
 #[test]
@@ -138,15 +138,15 @@ fn test_read_weak() {
     assert_eq!(result.len(), 2);
 
     assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![3]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![3]);
 
     assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 0);
-    assert_eq!(result[1].reads.len(), 2);
-    assert_eq!(result[1].reads.as_vec()[0].0, vec![3]);
-    assert_eq!(result[1].reads.as_vec()[1].0, vec![4]);
+    assert_eq!(result[1].rw.writes.len(), 0);
+    assert_eq!(result[1].rw.reads.len(), 2);
+    assert_eq!(result[1].rw.reads.as_vec()[0].0, vec![3]);
+    assert_eq!(result[1].rw.reads.as_vec()[1].0, vec![4]);
 }
 
 #[test]
@@ -162,9 +162,9 @@ fn test_read_write() {
     assert_eq!(result.len(), 1);
 
     assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1]);
 }
 
 #[test]
@@ -183,14 +183,14 @@ fn test_write2() {
     assert_eq!(result.len(), 2);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
     assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[1].writes.as_vec()[0].0, vec![3]);
-    assert_eq!(result[1].reads.len(), 0);
+    assert_eq!(result[1].rw.writes.len(), 1);
+    assert_eq!(result[1].rw.writes.as_vec()[0].0, vec![3]);
+    assert_eq!(result[1].rw.reads.len(), 0);
 }
 
 #[test]
@@ -210,14 +210,14 @@ fn test_read2() {
     assert_eq!(result.len(), 2);
 
     assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![2]);
 
     assert!(ret(&result[1]).intv.is_top());
-    assert_eq!(result[1].writes.len(), 0);
-    assert_eq!(result[1].reads.len(), 1);
-    assert_eq!(result[1].reads.as_vec()[0].0, vec![3]);
+    assert_eq!(result[1].rw.writes.len(), 0);
+    assert_eq!(result[1].rw.reads.len(), 1);
+    assert_eq!(result[1].rw.reads.as_vec()[0].0, vec![3]);
 }
 
 #[test]
@@ -237,14 +237,14 @@ fn test_write_struct() {
     assert_eq!(result.len(), 2);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2, 0]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2, 0]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
     assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[1].writes.as_vec()[0].0, vec![2, 1]);
-    assert_eq!(result[1].reads.len(), 0);
+    assert_eq!(result[1].rw.writes.len(), 1);
+    assert_eq!(result[1].rw.writes.as_vec()[0].0, vec![2, 1]);
+    assert_eq!(result[1].rw.reads.len(), 0);
 }
 
 #[test]
@@ -260,10 +260,10 @@ fn test_write_struct_assign() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 2);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![1, 0]);
-    assert_eq!(result[0].writes.as_vec()[1].0, vec![1, 1]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 2);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![1, 0]);
+    assert_eq!(result[0].rw.writes.as_vec()[1].0, vec![1, 1]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -280,10 +280,10 @@ fn test_read_write_struct() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![1, 1]);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1, 0]);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![1, 1]);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1, 0]);
 }
 
 #[test]
@@ -300,10 +300,10 @@ fn test_write_read_struct() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![1, 0]);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1, 1]);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![1, 0]);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1, 1]);
 }
 
 #[test]
@@ -318,8 +318,8 @@ fn test_write_array() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -333,9 +333,9 @@ fn test_read_array() {
     assert_eq!(result.len(), 1);
 
     assert!(ret(&result[0]).intv.is_top());
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1]);
 }
 
 #[test]
@@ -352,12 +352,12 @@ fn test_write_struct2_assign() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 4);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![1, 0, 0]);
-    assert_eq!(result[0].writes.as_vec()[1].0, vec![1, 0, 1]);
-    assert_eq!(result[0].writes.as_vec()[2].0, vec![1, 1, 0]);
-    assert_eq!(result[0].writes.as_vec()[3].0, vec![1, 1, 1]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 4);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![1, 0, 0]);
+    assert_eq!(result[0].rw.writes.as_vec()[1].0, vec![1, 0, 1]);
+    assert_eq!(result[0].rw.writes.as_vec()[2].0, vec![1, 1, 0]);
+    assert_eq!(result[0].rw.writes.as_vec()[3].0, vec![1, 1, 1]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -376,12 +376,12 @@ fn test_write_read_write_struct2() {
     assert_eq!(result.len(), 1);
 
     assert_eq!(as_int(ret(&result[0])), vec![0]);
-    assert_eq!(result[0].writes.len(), 3);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![1, 0, 0]);
-    assert_eq!(result[0].writes.as_vec()[1].0, vec![1, 1, 0]);
-    assert_eq!(result[0].writes.as_vec()[2].0, vec![1, 1, 1]);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1, 0, 1]);
+    assert_eq!(result[0].rw.writes.len(), 3);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![1, 0, 0]);
+    assert_eq!(result[0].rw.writes.as_vec()[1].0, vec![1, 1, 0]);
+    assert_eq!(result[0].rw.writes.as_vec()[2].0, vec![1, 1, 1]);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1, 0, 1]);
 }
 
 #[test]
@@ -399,13 +399,13 @@ fn test_div() {
     assert_eq!(result.len(), 2);
 
     assert_eq!(as_int(ret(&result[0])), vec![-1]);
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 0);
 
     assert_eq!(as_int(ret(&result[1])), vec![0]);
-    assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[1].writes.as_vec()[0].0, vec![3]);
-    assert_eq!(result[1].reads.len(), 0);
+    assert_eq!(result[1].rw.writes.len(), 1);
+    assert_eq!(result[1].rw.writes.as_vec()[0].0, vec![3]);
+    assert_eq!(result[1].rw.reads.len(), 0);
 }
 
 #[test]
@@ -422,8 +422,8 @@ fn test_realloc() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -440,9 +440,9 @@ fn test_getgroups() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -458,9 +458,9 @@ fn test_unknown_read() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 1);
-    assert_eq!(result[0].reads.as_vec()[0].0, vec![1]);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1]);
 }
 
 #[test]
@@ -478,8 +478,8 @@ fn test_unknown_file() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -496,9 +496,9 @@ fn test_recursive() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -522,9 +522,9 @@ fn test_mutually_recursive() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn test_volatile_write() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
 
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
+    assert_eq!(result[0].rw.writes.len(), 1);
+    assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
+    assert_eq!(result[0].rw.reads.len(), 0);
 }

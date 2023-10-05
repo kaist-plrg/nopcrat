@@ -7,8 +7,7 @@ use rustc_span::def_id::DefId;
 pub struct AbsState {
     pub local: AbsLocal,
     pub heap: AbsHeap,
-    pub writes: MustPathSet,
-    pub reads: MayPathSet,
+    pub rw: RwSets,
 }
 
 impl AbsState {
@@ -16,8 +15,7 @@ impl AbsState {
         Self {
             local: AbsLocal::bot(len),
             heap: AbsHeap::bot(),
-            writes: MustPathSet::bot(),
-            reads: MayPathSet::bot(),
+            rw: RwSets::bot(),
         }
     }
 
@@ -25,16 +23,12 @@ impl AbsState {
         Self {
             local: self.local.join(&other.local),
             heap: self.heap.join(&other.heap),
-            writes: self.writes.join(&other.writes),
-            reads: self.reads.join(&other.reads),
+            rw: self.rw.join(&other.rw),
         }
     }
 
     pub fn ord(&self, other: &Self) -> bool {
-        self.local.ord(&other.local)
-            && self.heap.ord(&other.heap)
-            && self.writes.ord(&other.writes)
-            && self.reads.ord(&other.reads)
+        self.local.ord(&other.local) && self.heap.ord(&other.heap) && self.rw.ord(&other.rw)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -55,16 +49,16 @@ impl AbsState {
 
     pub fn add_reads<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
-            if !self.writes.contains(&path) {
-                self.reads.insert(path);
+            if !self.rw.writes.contains(&path) {
+                self.rw.reads.insert(path);
             }
         }
     }
 
     pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
-            if !self.reads.contains(&path) {
-                self.writes.insert(path);
+            if !self.rw.reads.contains(&path) {
+                self.rw.writes.insert(path);
             }
         }
     }
@@ -2350,5 +2344,37 @@ impl MayPathSet {
 
     pub fn as_vec(&self) -> Vec<&AbsPath> {
         self.0.iter().collect()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RwSets {
+    pub reads: MayPathSet,
+    pub writes: MustPathSet,
+}
+
+impl std::fmt::Debug for RwSets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reads: {:?}, writes: {:?}", self.reads, self.writes)
+    }
+}
+
+impl RwSets {
+    pub fn bot() -> Self {
+        Self {
+            reads: MayPathSet::bot(),
+            writes: MustPathSet::bot(),
+        }
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        Self {
+            reads: self.reads.join(&other.reads),
+            writes: self.writes.join(&other.writes),
+        }
+    }
+
+    pub fn ord(&self, other: &Self) -> bool {
+        self.reads.ord(&other.reads) && self.writes.ord(&other.writes)
     }
 }
