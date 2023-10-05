@@ -1,6 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+    sync::Arc,
+};
 
 use etrace::some_or;
+use lazy_static::lazy_static;
 use rustc_span::def_id::DefId;
 
 #[derive(Debug, Clone)]
@@ -11,6 +16,7 @@ pub struct AbsState {
 }
 
 impl AbsState {
+    #[inline]
     pub fn bot(len: usize) -> Self {
         Self {
             local: AbsLocal::bot(len),
@@ -74,24 +80,24 @@ impl std::fmt::Debug for AbsHeap {
 }
 
 impl AbsHeap {
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self(vec![])
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         Self(
             (0..self.0.len().max(other.0.len()))
-                .map(|i| {
-                    let bot = AbsValue::bot();
-                    let v1 = self.0.get(i).unwrap_or(&bot);
-                    let v2 = other.0.get(i).unwrap_or(&bot);
-                    v1.join(v2)
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(v1), Some(v2)) => v1.join(v2),
+                    (Some(v), None) | (None, Some(v)) => v.clone(),
+                    _ => unreachable!(),
                 })
                 .collect(),
         )
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
     }
 
@@ -128,11 +134,12 @@ impl std::fmt::Debug for AbsLocal {
 }
 
 impl AbsLocal {
-    pub fn bot(len: usize) -> Self {
+    #[inline]
+    fn bot(len: usize) -> Self {
         Self(vec![AbsValue::bot(); len])
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         assert_eq!(self.0.len(), other.0.len());
         Self(
             self.0
@@ -143,9 +150,14 @@ impl AbsLocal {
         )
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         assert_eq!(self.0.len(), other.0.len());
         self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
     pub fn get(&self, i: usize) -> &AbsValue {
@@ -165,8 +177,427 @@ impl AbsLocal {
     }
 }
 
+lazy_static! {
+    static ref V_BOT: AbsValue = AbsValue::new(AbsVal::bot());
+    static ref V_TOP: AbsValue = AbsValue::new(AbsVal::top());
+    static ref V_TOP_INT: AbsValue = AbsValue::new(AbsVal::top_int());
+    static ref V_TOP_UINT: AbsValue = AbsValue::new(AbsVal::top_uint());
+    static ref V_TOP_FLOAT: AbsValue = AbsValue::new(AbsVal::top_float());
+    static ref V_TOP_BOOL: AbsValue = AbsValue::new(AbsVal::top_bool());
+    static ref V_TOP_LIST: AbsValue = AbsValue::new(AbsVal::top_list());
+    static ref V_TOP_PTR: AbsValue = AbsValue::new(AbsVal::top_ptr());
+    static ref V_TOP_OPTION: AbsValue = AbsValue::new(AbsVal::top_option());
+    static ref V_TOP_FN: AbsValue = AbsValue::new(AbsVal::top_fn());
+    static ref V_TRUE: AbsValue = AbsValue::new(AbsVal::alpha_bool(true));
+    static ref V_FALSE: AbsValue = AbsValue::new(AbsVal::alpha_bool(false));
+    static ref V_NULL: AbsValue = AbsValue::new(AbsVal::null());
+    static ref V_NONE: AbsValue = AbsValue::new(AbsVal::none());
+}
+
+#[repr(transparent)]
+#[derive(Clone, Debug)]
+pub struct AbsValue(Arc<AbsVal>);
+
+impl Deref for AbsValue {
+    type Target = AbsVal;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AbsValue {
+    #[inline]
+    fn new(val: AbsVal) -> Self {
+        Self(Arc::new(val))
+    }
+
+    #[inline]
+    pub fn bot() -> Self {
+        V_BOT.clone()
+    }
+
+    #[inline]
+    pub fn top() -> Self {
+        V_TOP.clone()
+    }
+
+    #[inline]
+    pub fn top_int() -> Self {
+        V_TOP_INT.clone()
+    }
+
+    #[inline]
+    pub fn top_uint() -> Self {
+        V_TOP_UINT.clone()
+    }
+
+    #[inline]
+    pub fn top_float() -> Self {
+        V_TOP_FLOAT.clone()
+    }
+
+    #[inline]
+    pub fn top_bool() -> Self {
+        V_TOP_BOOL.clone()
+    }
+
+    #[inline]
+    pub fn top_list() -> Self {
+        V_TOP_LIST.clone()
+    }
+
+    #[inline]
+    pub fn top_ptr() -> Self {
+        V_TOP_PTR.clone()
+    }
+
+    #[inline]
+    pub fn top_option() -> Self {
+        V_TOP_OPTION.clone()
+    }
+
+    #[inline]
+    pub fn top_fn() -> Self {
+        V_TOP_FN.clone()
+    }
+
+    #[inline]
+    pub fn bool_true() -> Self {
+        V_TRUE.clone()
+    }
+
+    #[inline]
+    pub fn bool_false() -> Self {
+        V_FALSE.clone()
+    }
+
+    #[inline]
+    pub fn null() -> Self {
+        V_NULL.clone()
+    }
+
+    #[inline]
+    pub fn none() -> Self {
+        V_NONE.clone()
+    }
+
+    pub fn alpha_int(n: i128) -> Self {
+        Self::new(AbsVal::alpha_int(n))
+    }
+
+    pub fn alpha_uint(n: u128) -> Self {
+        Self::new(AbsVal::alpha_uint(n))
+    }
+
+    pub fn alpha_float(f: f64) -> Self {
+        Self::new(AbsVal::alpha_float(f))
+    }
+
+    #[inline]
+    pub fn alpha_bool(b: bool) -> Self {
+        if b {
+            V_TRUE.clone()
+        } else {
+            V_FALSE.clone()
+        }
+    }
+
+    pub fn alpha_list(l: Vec<AbsValue>) -> Self {
+        Self::new(AbsVal::alpha_list(l))
+    }
+
+    pub fn alpha_ptr(p: AbsPlace) -> Self {
+        Self::new(AbsVal::alpha_ptr(p))
+    }
+
+    pub fn alpha_fn(f: DefId) -> Self {
+        Self::new(AbsVal::alpha_fn(f))
+    }
+
+    pub fn int(intv: AbsInt) -> Self {
+        if intv.is_top() {
+            V_TOP_INT.clone()
+        } else if intv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::int(intv))
+        }
+    }
+
+    pub fn uint(uintv: AbsUint) -> Self {
+        if uintv.is_top() {
+            V_TOP_UINT.clone()
+        } else if uintv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::uint(uintv))
+        }
+    }
+
+    pub fn float(floatv: AbsFloat) -> Self {
+        if floatv.is_top() {
+            V_TOP_FLOAT.clone()
+        } else if floatv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::float(floatv))
+        }
+    }
+
+    #[inline]
+    pub fn boolean(boolv: AbsBool) -> Self {
+        match boolv {
+            AbsBool::Top => V_TOP_BOOL.clone(),
+            AbsBool::True => V_TRUE.clone(),
+            AbsBool::False => V_FALSE.clone(),
+            AbsBool::Bot => V_BOT.clone(),
+        }
+    }
+
+    pub fn list(listv: AbsList) -> Self {
+        if listv.is_top() {
+            V_TOP.clone()
+        } else if listv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::list(listv))
+        }
+    }
+
+    pub fn ptr(ptrv: AbsPtr) -> Self {
+        if ptrv.is_top() {
+            V_TOP_PTR.clone()
+        } else if ptrv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::ptr(ptrv))
+        }
+    }
+
+    pub fn option(optionv: AbsOption) -> Self {
+        match optionv {
+            AbsOption::Top => V_TOP_OPTION.clone(),
+            AbsOption::None => V_NONE.clone(),
+            AbsOption::Some(v) => Self::some(v),
+            AbsOption::Bot => V_BOT.clone(),
+        }
+    }
+
+    pub fn func(fnv: AbsFn) -> Self {
+        if fnv.is_top() {
+            V_TOP_FN.clone()
+        } else if fnv.is_bot() {
+            V_BOT.clone()
+        } else {
+            Self::new(AbsVal::func(fnv))
+        }
+    }
+
+    pub fn some(v: AbsValue) -> Self {
+        Self::new(AbsVal::some(v))
+    }
+
+    pub fn alloc(i: usize) -> Self {
+        Self::ptr(AbsPtr::alloc(i))
+    }
+
+    #[inline]
+    fn iub(iub: Iub) -> Self {
+        match (iub.0.is_bot(), iub.1.is_bot(), iub.2.is_bot()) {
+            (_, true, true) => Self::int(iub.0),
+            (true, _, true) => Self::uint(iub.1),
+            (true, true, _) => Self::boolean(iub.2),
+            _ => Self::new(AbsVal::iub(iub)),
+        }
+    }
+
+    #[inline]
+    fn iuf(iuf: Iuf) -> Self {
+        match (iuf.0.is_bot(), iuf.1.is_bot(), iuf.2.is_bot()) {
+            (_, true, true) => Self::int(iuf.0),
+            (true, _, true) => Self::uint(iuf.1),
+            (true, true, _) => Self::float(iuf.2),
+            _ => Self::new(AbsVal::iuf(iuf)),
+        }
+    }
+
+    pub fn not(&self) -> Self {
+        Self::iub(self.0.not())
+    }
+
+    pub fn neg(&self) -> Self {
+        Self::iuf(self.0.neg())
+    }
+
+    pub fn to_i8(&self) -> Self {
+        Self::int(self.0.to_i8())
+    }
+
+    pub fn to_i16(&self) -> Self {
+        Self::int(self.0.to_i16())
+    }
+
+    pub fn to_i32(&self) -> Self {
+        Self::int(self.0.to_i32())
+    }
+
+    pub fn to_i64(&self) -> Self {
+        Self::int(self.0.to_i64())
+    }
+
+    pub fn to_i128(&self) -> Self {
+        Self::int(self.0.to_i128())
+    }
+
+    pub fn to_u8(&self) -> Self {
+        Self::uint(self.0.to_u8())
+    }
+
+    pub fn to_u16(&self) -> Self {
+        Self::uint(self.0.to_u16())
+    }
+
+    pub fn to_u32(&self) -> Self {
+        Self::uint(self.0.to_u32())
+    }
+
+    pub fn to_u64(&self) -> Self {
+        Self::uint(self.0.to_u64())
+    }
+
+    pub fn to_u128(&self) -> Self {
+        Self::uint(self.0.to_u128())
+    }
+
+    pub fn to_f32(&self) -> Self {
+        Self::float(self.0.to_f32())
+    }
+
+    pub fn to_f64(&self) -> Self {
+        Self::float(self.0.to_f64())
+    }
+
+    pub fn add(&self, other: &Self) -> Self {
+        Self::iuf(self.0.add(&other.0))
+    }
+
+    pub fn sub(&self, other: &Self) -> Self {
+        Self::iuf(self.0.sub(&other.0))
+    }
+
+    pub fn mul(&self, other: &Self) -> Self {
+        Self::iuf(self.0.mul(&other.0))
+    }
+
+    pub fn div(&self, other: &Self) -> Self {
+        Self::iuf(self.0.div(&other.0))
+    }
+
+    pub fn rem(&self, other: &Self) -> Self {
+        Self::iuf(self.0.rem(&other.0))
+    }
+
+    pub fn bit_xor(&self, other: &Self) -> Self {
+        Self::iub(self.0.bit_xor(&other.0))
+    }
+
+    pub fn bit_and(&self, other: &Self) -> Self {
+        Self::iub(self.0.bit_and(&other.0))
+    }
+
+    pub fn bit_or(&self, other: &Self) -> Self {
+        Self::iub(self.0.bit_or(&other.0))
+    }
+
+    pub fn shl(&self, other: &Self) -> Self {
+        Self::iub(self.0.shl(&other.0))
+    }
+
+    pub fn shr(&self, other: &Self) -> Self {
+        Self::iub(self.0.shr(&other.0))
+    }
+
+    pub fn eq(&self, other: &Self) -> Self {
+        Self::boolean(self.0.eq(&other.0))
+    }
+
+    pub fn le(&self, other: &Self) -> Self {
+        Self::boolean(self.0.le(&other.0))
+    }
+
+    pub fn lt(&self, other: &Self) -> Self {
+        Self::boolean(self.0.lt(&other.0))
+    }
+
+    pub fn ne(&self, other: &Self) -> Self {
+        Self::boolean(self.0.ne(&other.0))
+    }
+
+    pub fn ge(&self, other: &Self) -> Self {
+        Self::boolean(self.0.ge(&other.0))
+    }
+
+    pub fn gt(&self, other: &Self) -> Self {
+        Self::boolean(self.0.gt(&other.0))
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        if self.is_top() || other.is_top() {
+            Self::top()
+        } else {
+            let intv = self.intv.join(&other.intv);
+            let uintv = self.uintv.join(&other.uintv);
+            let floatv = self.floatv.join(&other.floatv);
+            let boolv = self.boolv.join(&other.boolv);
+            let listv = self.listv.join(&other.listv);
+            let ptrv = self.ptrv.join(&other.ptrv);
+            let optionv = self.optionv.join(&other.optionv);
+            let fnv = self.fnv.join(&other.fnv);
+            let is_bots = (
+                intv.is_bot(),
+                uintv.is_bot(),
+                floatv.is_bot(),
+                boolv.is_bot(),
+                listv.is_bot(),
+                ptrv.is_bot(),
+                optionv.is_bot(),
+                fnv.is_bot(),
+            );
+            match is_bots {
+                (_, true, true, true, true, true, true, true) => Self::int(intv),
+                (true, _, true, true, true, true, true, true) => Self::uint(uintv),
+                (true, true, _, true, true, true, true, true) => Self::float(floatv),
+                (true, true, true, _, true, true, true, true) => Self::boolean(boolv),
+                (true, true, true, true, _, true, true, true) => Self::list(listv),
+                (true, true, true, true, true, _, true, true) => Self::ptr(ptrv),
+                (true, true, true, true, true, true, _, true) => Self::option(optionv),
+                (true, true, true, true, true, true, true, _) => Self::func(fnv),
+                _ => Self::new(AbsVal {
+                    intv,
+                    uintv,
+                    floatv,
+                    boolv,
+                    listv,
+                    ptrv,
+                    optionv,
+                    fnv,
+                }),
+            }
+        }
+    }
+
+    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+        Self::new(self.0.subst(map))
+    }
+
+    pub fn make_mut(this: &mut Self) -> &mut AbsVal {
+        Arc::make_mut(&mut this.0)
+    }
+}
+
 #[derive(Clone)]
-pub struct AbsValue {
+pub struct AbsVal {
     pub intv: AbsInt,
     pub uintv: AbsUint,
     pub floatv: AbsFloat,
@@ -177,7 +608,7 @@ pub struct AbsValue {
     pub fnv: AbsFn,
 }
 
-impl std::fmt::Debug for AbsValue {
+impl std::fmt::Debug for AbsVal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_top() {
             return write!(f, "⊤");
@@ -244,8 +675,12 @@ impl std::fmt::Debug for AbsValue {
     }
 }
 
-impl AbsValue {
-    pub fn top() -> Self {
+type Iub = (AbsInt, AbsUint, AbsBool);
+type Iuf = (AbsInt, AbsUint, AbsFloat);
+
+impl AbsVal {
+    #[inline]
+    fn top() -> Self {
         Self {
             intv: AbsInt::top(),
             uintv: AbsUint::top(),
@@ -258,7 +693,8 @@ impl AbsValue {
         }
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self {
             intv: AbsInt::bot(),
             uintv: AbsUint::bot(),
@@ -271,19 +707,7 @@ impl AbsValue {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.join(&other.intv),
-            uintv: self.uintv.join(&other.uintv),
-            floatv: self.floatv.join(&other.floatv),
-            boolv: self.boolv.join(&other.boolv),
-            listv: self.listv.join(&other.listv),
-            ptrv: self.ptrv.join(&other.ptrv),
-            optionv: self.optionv.join(&other.optionv),
-            fnv: self.fnv.join(&other.fnv),
-        }
-    }
-
+    #[inline]
     pub fn ord(&self, other: &Self) -> bool {
         self.intv.ord(&other.intv)
             && self.uintv.ord(&other.uintv)
@@ -295,6 +719,7 @@ impl AbsValue {
             && self.fnv.ord(&other.fnv)
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         self.intv.is_top()
             && self.uintv.is_top()
@@ -306,6 +731,7 @@ impl AbsValue {
             && self.fnv.is_top()
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         self.intv.is_bot()
             && self.uintv.is_bot()
@@ -317,417 +743,476 @@ impl AbsValue {
             && self.fnv.is_bot()
     }
 
-    pub fn int_top() -> Self {
+    #[inline]
+    fn top_int() -> Self {
         Self {
             intv: AbsInt::top(),
             ..Self::bot()
         }
     }
 
-    pub fn uint_top() -> Self {
+    #[inline]
+    fn top_uint() -> Self {
         Self {
             uintv: AbsUint::top(),
             ..Self::bot()
         }
     }
 
-    pub fn float_top() -> Self {
+    #[inline]
+    fn top_float() -> Self {
         Self {
             floatv: AbsFloat::top(),
             ..Self::bot()
         }
     }
 
-    pub fn bool_top() -> Self {
+    #[inline]
+    fn top_bool() -> Self {
         Self {
             boolv: AbsBool::top(),
             ..Self::bot()
         }
     }
 
-    pub fn int(n: i128) -> Self {
+    #[inline]
+    fn top_list() -> Self {
+        Self {
+            listv: AbsList::top(),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn top_ptr() -> Self {
+        Self {
+            ptrv: AbsPtr::top(),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn top_option() -> Self {
+        Self {
+            optionv: AbsOption::top(),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn top_fn() -> Self {
+        Self {
+            fnv: AbsFn::top(),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn null() -> Self {
+        Self::ptr(AbsPtr::null())
+    }
+
+    #[inline]
+    fn alpha_int(n: i128) -> Self {
         Self {
             intv: AbsInt::alpha(n),
             ..Self::bot()
         }
     }
 
-    pub fn uint(n: u128) -> Self {
+    #[inline]
+    fn alpha_uint(n: u128) -> Self {
         Self {
             uintv: AbsUint::alpha(n),
             ..Self::bot()
         }
     }
 
-    pub fn float(f: f64) -> Self {
+    #[inline]
+    fn alpha_float(f: f64) -> Self {
         Self {
             floatv: AbsFloat::alpha(f),
             ..Self::bot()
         }
     }
 
-    pub fn boolean(b: bool) -> Self {
+    #[inline]
+    fn alpha_bool(b: bool) -> Self {
         Self {
             boolv: AbsBool::alpha(b),
             ..Self::bot()
         }
     }
 
-    pub fn bools(boolv: AbsBool) -> Self {
-        Self {
-            boolv,
-            ..Self::bot()
-        }
-    }
-
-    pub fn list(l: Vec<AbsValue>) -> Self {
+    #[inline]
+    fn alpha_list(l: Vec<AbsValue>) -> Self {
         Self {
             listv: AbsList::List(l),
             ..Self::bot()
         }
     }
 
-    pub fn ptr(ptrv: AbsPtr) -> Self {
+    #[inline]
+    fn alpha_ptr(p: AbsPlace) -> Self {
+        Self {
+            ptrv: AbsPtr::alpha(p),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn alpha_fn(f: DefId) -> Self {
+        Self {
+            fnv: AbsFn::alpha(f),
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn int(intv: AbsInt) -> Self {
+        Self {
+            intv,
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn uint(uintv: AbsUint) -> Self {
+        Self {
+            uintv,
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn float(floatv: AbsFloat) -> Self {
+        Self {
+            floatv,
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn list(listv: AbsList) -> Self {
+        Self {
+            listv,
+            ..Self::bot()
+        }
+    }
+
+    #[inline]
+    fn ptr(ptrv: AbsPtr) -> Self {
         Self {
             ptrv,
             ..Self::bot()
         }
     }
 
-    pub fn option(optionv: AbsOption) -> Self {
+    #[inline]
+    fn option(optionv: AbsOption) -> Self {
         Self {
             optionv,
             ..Self::bot()
         }
     }
 
-    pub fn func(fnv: AbsFn) -> Self {
+    #[inline]
+    fn none() -> Self {
+        Self::option(AbsOption::None)
+    }
+
+    #[inline]
+    fn some(v: AbsValue) -> Self {
+        Self::option(AbsOption::Some(v))
+    }
+
+    #[inline]
+    fn func(fnv: AbsFn) -> Self {
         Self { fnv, ..Self::bot() }
     }
 
-    pub fn not(&self) -> Self {
+    #[inline]
+    fn iub(iub: Iub) -> Self {
+        let (intv, uintv, boolv) = iub;
         Self {
-            intv: self.intv.not(),
-            uintv: self.uintv.not(),
-            boolv: self.boolv.not(),
+            intv,
+            uintv,
+            boolv,
             ..Self::bot()
         }
     }
 
-    pub fn neg(&self) -> Self {
+    #[inline]
+    fn iuf(iuf: Iuf) -> Self {
+        let (intv, uintv, floatv) = iuf;
         Self {
-            intv: self.intv.neg(),
-            floatv: self.floatv.neg(),
+            intv,
+            uintv,
+            floatv,
             ..Self::bot()
         }
     }
 
-    pub fn to_i8(&self) -> Self {
-        Self {
-            intv: self
-                .intv
-                .to_i8()
-                .join(&self.uintv.to_i8())
-                .join(&self.floatv.to_i8()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn not(&self) -> Iub {
+        (self.intv.not(), self.uintv.not(), self.boolv.not())
     }
 
-    pub fn to_i16(&self) -> Self {
-        Self {
-            intv: self
-                .intv
-                .to_i16()
-                .join(&self.uintv.to_i16())
-                .join(&self.floatv.to_i16()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn neg(&self) -> Iuf {
+        (self.intv.neg(), AbsUint::bot(), self.floatv.neg())
     }
 
-    pub fn to_i32(&self) -> Self {
-        Self {
-            intv: self
-                .intv
-                .to_i32()
-                .join(&self.uintv.to_i32())
-                .join(&self.floatv.to_i32()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_i8(&self) -> AbsInt {
+        self.intv
+            .to_i8()
+            .join(&self.uintv.to_i8())
+            .join(&self.floatv.to_i8())
     }
 
-    pub fn to_i64(&self) -> Self {
-        Self {
-            intv: self
-                .intv
-                .to_i64()
-                .join(&self.uintv.to_i64())
-                .join(&self.floatv.to_i64()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_i16(&self) -> AbsInt {
+        self.intv
+            .to_i16()
+            .join(&self.uintv.to_i16())
+            .join(&self.floatv.to_i16())
     }
 
-    pub fn to_i128(&self) -> Self {
-        Self {
-            intv: self
-                .intv
-                .join(&self.uintv.to_i128())
-                .join(&self.floatv.to_i128()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_i32(&self) -> AbsInt {
+        self.intv
+            .to_i32()
+            .join(&self.uintv.to_i32())
+            .join(&self.floatv.to_i32())
     }
 
-    pub fn to_u8(&self) -> Self {
-        Self {
-            uintv: self
-                .intv
-                .to_u8()
-                .join(&self.uintv.to_u8())
-                .join(&self.floatv.to_u8()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_i64(&self) -> AbsInt {
+        self.intv
+            .to_i64()
+            .join(&self.uintv.to_i64())
+            .join(&self.floatv.to_i64())
     }
 
-    pub fn to_u16(&self) -> Self {
-        Self {
-            uintv: self
-                .intv
-                .to_u16()
-                .join(&self.uintv.to_u16())
-                .join(&self.floatv.to_u16()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_i128(&self) -> AbsInt {
+        self.intv
+            .join(&self.uintv.to_i128())
+            .join(&self.floatv.to_i128())
     }
 
-    pub fn to_u32(&self) -> Self {
-        Self {
-            uintv: self
-                .intv
-                .to_u32()
-                .join(&self.uintv.to_u32())
-                .join(&self.floatv.to_u32()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_u8(&self) -> AbsUint {
+        self.intv
+            .to_u8()
+            .join(&self.uintv.to_u8())
+            .join(&self.floatv.to_u8())
     }
 
-    pub fn to_u64(&self) -> Self {
-        Self {
-            uintv: self
-                .intv
-                .to_u64()
-                .join(&self.uintv.to_u64())
-                .join(&self.floatv.to_u64()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_u16(&self) -> AbsUint {
+        self.intv
+            .to_u16()
+            .join(&self.uintv.to_u16())
+            .join(&self.floatv.to_u16())
     }
 
-    pub fn to_u128(&self) -> Self {
-        Self {
-            uintv: self
-                .intv
-                .to_u128()
-                .join(&self.uintv)
-                .join(&self.floatv.to_u128()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_u32(&self) -> AbsUint {
+        self.intv
+            .to_u32()
+            .join(&self.uintv.to_u32())
+            .join(&self.floatv.to_u32())
     }
 
-    pub fn to_f32(&self) -> Self {
-        Self {
-            floatv: self
-                .intv
-                .to_f32()
-                .join(&self.uintv.to_f32())
-                .join(&self.floatv.to_f32()),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_u64(&self) -> AbsUint {
+        self.intv
+            .to_u64()
+            .join(&self.uintv.to_u64())
+            .join(&self.floatv.to_u64())
     }
 
-    pub fn to_f64(&self) -> Self {
-        Self {
-            floatv: self
-                .intv
-                .to_f64()
-                .join(&self.uintv.to_f64())
-                .join(&self.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_u128(&self) -> AbsUint {
+        self.intv
+            .to_u128()
+            .join(&self.uintv)
+            .join(&self.floatv.to_u128())
     }
 
-    pub fn add(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.add(&other.intv),
-            uintv: self.uintv.add(&other.uintv),
-            floatv: self.floatv.add(&other.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_f32(&self) -> AbsFloat {
+        self.intv
+            .to_f32()
+            .join(&self.uintv.to_f32())
+            .join(&self.floatv.to_f32())
     }
 
-    pub fn sub(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.sub(&other.intv),
-            uintv: self.uintv.sub(&other.uintv),
-            floatv: self.floatv.sub(&other.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn to_f64(&self) -> AbsFloat {
+        self.intv
+            .to_f64()
+            .join(&self.uintv.to_f64())
+            .join(&self.floatv)
     }
 
-    pub fn mul(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.mul(&other.intv),
-            uintv: self.uintv.mul(&other.uintv),
-            floatv: self.floatv.mul(&other.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn add(&self, other: &Self) -> Iuf {
+        (
+            self.intv.add(&other.intv),
+            self.uintv.add(&other.uintv),
+            self.floatv.add(&other.floatv),
+        )
     }
 
-    pub fn div(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.div(&other.intv),
-            uintv: self.uintv.div(&other.uintv),
-            floatv: self.floatv.div(&other.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn sub(&self, other: &Self) -> Iuf {
+        (
+            self.intv.sub(&other.intv),
+            self.uintv.sub(&other.uintv),
+            self.floatv.sub(&other.floatv),
+        )
     }
 
-    pub fn rem(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.rem(&other.intv),
-            uintv: self.uintv.rem(&other.uintv),
-            floatv: self.floatv.rem(&other.floatv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn mul(&self, other: &Self) -> Iuf {
+        (
+            self.intv.mul(&other.intv),
+            self.uintv.mul(&other.uintv),
+            self.floatv.mul(&other.floatv),
+        )
     }
 
-    pub fn bit_xor(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.bit_xor(&other.intv),
-            uintv: self.uintv.bit_xor(&other.uintv),
-            boolv: self.boolv.bit_xor(&other.boolv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn div(&self, other: &Self) -> Iuf {
+        (
+            self.intv.div(&other.intv),
+            self.uintv.div(&other.uintv),
+            self.floatv.div(&other.floatv),
+        )
     }
 
-    pub fn bit_and(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.bit_and(&other.intv),
-            uintv: self.uintv.bit_and(&other.uintv),
-            boolv: self.boolv.bit_and(&other.boolv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn rem(&self, other: &Self) -> Iuf {
+        (
+            self.intv.rem(&other.intv),
+            self.uintv.rem(&other.uintv),
+            self.floatv.rem(&other.floatv),
+        )
     }
 
-    pub fn bit_or(&self, other: &Self) -> Self {
-        Self {
-            intv: self.intv.bit_or(&other.intv),
-            uintv: self.uintv.bit_or(&other.uintv),
-            boolv: self.boolv.bit_or(&other.boolv),
-            ..Self::bot()
-        }
+    #[inline]
+    fn bit_xor(&self, other: &Self) -> Iub {
+        (
+            self.intv.bit_xor(&other.intv),
+            self.uintv.bit_xor(&other.uintv),
+            self.boolv.bit_xor(&other.boolv),
+        )
     }
 
-    pub fn shl(&self, other: &Self) -> Self {
-        Self {
-            intv: self
-                .intv
+    #[inline]
+    fn bit_and(&self, other: &Self) -> Iub {
+        (
+            self.intv.bit_and(&other.intv),
+            self.uintv.bit_and(&other.uintv),
+            self.boolv.bit_and(&other.boolv),
+        )
+    }
+
+    #[inline]
+    fn bit_or(&self, other: &Self) -> Iub {
+        (
+            self.intv.bit_or(&other.intv),
+            self.uintv.bit_or(&other.uintv),
+            self.boolv.bit_or(&other.boolv),
+        )
+    }
+
+    #[inline]
+    fn shl(&self, other: &Self) -> Iub {
+        (
+            self.intv
                 .shl(&other.intv)
                 .join(&self.intv.shlu(&other.uintv)),
-            uintv: self
-                .uintv
+            self.uintv
                 .shl(&other.uintv)
                 .join(&self.uintv.shli(&other.intv)),
-            ..Self::bot()
-        }
+            AbsBool::bot(),
+        )
     }
 
-    pub fn shr(&self, other: &Self) -> Self {
-        Self {
-            intv: self
-                .intv
+    #[inline]
+    fn shr(&self, other: &Self) -> Iub {
+        (
+            self.intv
                 .shr(&other.intv)
                 .join(&self.intv.shru(&other.uintv)),
-            uintv: self
-                .uintv
+            self.uintv
                 .shr(&other.uintv)
                 .join(&self.uintv.shri(&other.intv)),
-            ..Self::bot()
-        }
+            AbsBool::bot(),
+        )
     }
 
-    pub fn eq(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .eq(&other.intv)
-                .join(&self.uintv.eq(&other.uintv))
-                .join(&self.floatv.eq(&other.floatv))
-                .join(&self.boolv.eq(&other.boolv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-            ..Self::bot()
-        }
+    #[inline]
+    fn eq(&self, other: &Self) -> AbsBool {
+        self.intv
+            .eq(&other.intv)
+            .join(&self.uintv.eq(&other.uintv))
+            .join(&self.floatv.eq(&other.floatv))
+            .join(&self.boolv.eq(&other.boolv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
-    pub fn lt(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .lt(&other.intv)
-                .join(&self.uintv.lt(&other.uintv))
-                .join(&self.floatv.lt(&other.floatv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-            ..Self::bot()
-        }
+    #[inline]
+    fn lt(&self, other: &Self) -> AbsBool {
+        self.intv
+            .lt(&other.intv)
+            .join(&self.uintv.lt(&other.uintv))
+            .join(&self.floatv.lt(&other.floatv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
-    pub fn le(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .le(&other.intv)
-                .join(&self.uintv.le(&other.uintv))
-                .join(&self.floatv.le(&other.floatv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-            ..Self::bot()
-        }
+    #[inline]
+    fn le(&self, other: &Self) -> AbsBool {
+        self.intv
+            .le(&other.intv)
+            .join(&self.uintv.le(&other.uintv))
+            .join(&self.floatv.le(&other.floatv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
-    pub fn ne(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .ne(&other.intv)
-                .join(&self.uintv.ne(&other.uintv))
-                .join(&self.floatv.ne(&other.floatv))
-                .join(&self.boolv.ne(&other.boolv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-            ..Self::bot()
-        }
+    #[inline]
+    fn ne(&self, other: &Self) -> AbsBool {
+        self.intv
+            .ne(&other.intv)
+            .join(&self.uintv.ne(&other.uintv))
+            .join(&self.floatv.ne(&other.floatv))
+            .join(&self.boolv.ne(&other.boolv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
-    pub fn ge(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .ge(&other.intv)
-                .join(&self.uintv.ge(&other.uintv))
-                .join(&self.floatv.ge(&other.floatv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-
-            ..Self::bot()
-        }
+    #[inline]
+    fn ge(&self, other: &Self) -> AbsBool {
+        self.intv
+            .ge(&other.intv)
+            .join(&self.uintv.ge(&other.uintv))
+            .join(&self.floatv.ge(&other.floatv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
-    pub fn gt(&self, other: &Self) -> Self {
-        Self {
-            boolv: self
-                .intv
-                .gt(&other.intv)
-                .join(&self.uintv.gt(&other.uintv))
-                .join(&self.floatv.gt(&other.floatv))
-                .join(&self.ptrv.compare(&other.ptrv)),
-            ..Self::bot()
-        }
+    #[inline]
+    fn gt(&self, other: &Self) -> AbsBool {
+        self.intv
+            .gt(&other.intv)
+            .join(&self.uintv.gt(&other.uintv))
+            .join(&self.floatv.gt(&other.floatv))
+            .join(&self.ptrv.compare(&other.ptrv))
     }
 
+    #[inline]
     pub fn heap_addr(&self) -> usize {
         self.ptrv.heap_addr()
     }
@@ -745,7 +1230,8 @@ impl AbsValue {
         res
     }
 
-    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+    #[inline]
+    fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
         Self {
             ptrv: self.ptrv.subst(map),
             listv: self.listv.subst(map),
@@ -793,18 +1279,22 @@ impl std::fmt::Debug for AbsInt {
 }
 
 impl AbsInt {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::alphas(BTreeSet::new())
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -813,11 +1303,11 @@ impl AbsInt {
         }
     }
 
-    pub fn alpha(n: i128) -> Self {
+    fn alpha(n: i128) -> Self {
         Self::alphas([n].into_iter().collect())
     }
 
-    pub fn alphas(set: BTreeSet<i128>) -> Self {
+    fn alphas(set: BTreeSet<i128>) -> Self {
         if set.len() > MAX_SIZE {
             Self::Top
         } else {
@@ -833,14 +1323,14 @@ impl AbsInt {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
@@ -855,27 +1345,27 @@ impl AbsInt {
         }
     }
 
-    pub fn not(&self) -> Self {
+    fn not(&self) -> Self {
         self.unary(|n| !n)
     }
 
-    pub fn neg(&self) -> Self {
+    fn neg(&self) -> Self {
         self.unary(|n| -n)
     }
 
-    pub fn to_i8(&self) -> Self {
+    fn to_i8(&self) -> Self {
         self.unary(|n| n as i8 as i128)
     }
 
-    pub fn to_i16(&self) -> Self {
+    fn to_i16(&self) -> Self {
         self.unary(|n| n as i16 as i128)
     }
 
-    pub fn to_i32(&self) -> Self {
+    fn to_i32(&self) -> Self {
         self.unary(|n| n as i32 as i128)
     }
 
-    pub fn to_i64(&self) -> Self {
+    fn to_i64(&self) -> Self {
         self.unary(|n| n as i64 as i128)
     }
 
@@ -886,15 +1376,15 @@ impl AbsInt {
         }
     }
 
-    pub fn to_u8(&self) -> AbsUint {
+    fn to_u8(&self) -> AbsUint {
         self.unaryu(|n| n as u8 as u128)
     }
 
-    pub fn to_u16(&self) -> AbsUint {
+    fn to_u16(&self) -> AbsUint {
         self.unaryu(|n| n as u16 as u128)
     }
 
-    pub fn to_u32(&self) -> AbsUint {
+    fn to_u32(&self) -> AbsUint {
         self.unaryu(|n| n as u32 as u128)
     }
 
@@ -902,7 +1392,7 @@ impl AbsInt {
         self.unaryu(|n| n as u64 as u128)
     }
 
-    pub fn to_u128(&self) -> AbsUint {
+    fn to_u128(&self) -> AbsUint {
         self.unaryu(|n| n as u128)
     }
 
@@ -913,11 +1403,11 @@ impl AbsInt {
         }
     }
 
-    pub fn to_f32(&self) -> AbsFloat {
+    fn to_f32(&self) -> AbsFloat {
         self.unaryf(|n| n as f32 as f64)
     }
 
-    pub fn to_f64(&self) -> AbsFloat {
+    fn to_f64(&self) -> AbsFloat {
         self.unaryf(|n| n as f64)
     }
 
@@ -940,39 +1430,39 @@ impl AbsInt {
         self.binary(other, |n1, n2| n1 + n2)
     }
 
-    pub fn sub(&self, other: &Self) -> Self {
+    fn sub(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 - n2)
     }
 
-    pub fn mul(&self, other: &Self) -> Self {
+    fn mul(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 * n2)
     }
 
-    pub fn div(&self, other: &Self) -> Self {
+    fn div(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 / n2)
     }
 
-    pub fn rem(&self, other: &Self) -> Self {
+    fn rem(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 % n2)
     }
 
-    pub fn bit_xor(&self, other: &Self) -> Self {
+    fn bit_xor(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 ^ n2)
     }
 
-    pub fn bit_and(&self, other: &Self) -> Self {
+    fn bit_and(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 & n2)
     }
 
-    pub fn bit_or(&self, other: &Self) -> Self {
+    fn bit_or(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 | n2)
     }
 
-    pub fn shl(&self, other: &Self) -> Self {
+    fn shl(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 << n2)
     }
 
-    pub fn shr(&self, other: &Self) -> Self {
+    fn shr(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 >> n2)
     }
 
@@ -991,11 +1481,11 @@ impl AbsInt {
         }
     }
 
-    pub fn shlu(&self, other: &AbsUint) -> Self {
+    fn shlu(&self, other: &AbsUint) -> Self {
         self.binaryu(other, |n1, n2| n1 << n2)
     }
 
-    pub fn shru(&self, other: &AbsUint) -> Self {
+    fn shru(&self, other: &AbsUint) -> Self {
         self.binaryu(other, |n1, n2| n1 >> n2)
     }
 
@@ -1014,27 +1504,27 @@ impl AbsInt {
         }
     }
 
-    pub fn eq(&self, other: &Self) -> AbsBool {
+    fn eq(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 == n2)
     }
 
-    pub fn lt(&self, other: &Self) -> AbsBool {
+    fn lt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 < n2)
     }
 
-    pub fn le(&self, other: &Self) -> AbsBool {
+    fn le(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 <= n2)
     }
 
-    pub fn ne(&self, other: &Self) -> AbsBool {
+    fn ne(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 != n2)
     }
 
-    pub fn ge(&self, other: &Self) -> AbsBool {
+    fn ge(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 >= n2)
     }
 
-    pub fn gt(&self, other: &Self) -> AbsBool {
+    fn gt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 > n2)
     }
 }
@@ -1068,18 +1558,22 @@ impl std::fmt::Debug for AbsUint {
 }
 
 impl AbsUint {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::alphas(BTreeSet::new())
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -1092,7 +1586,7 @@ impl AbsUint {
         Self::alphas([n].into_iter().collect())
     }
 
-    pub fn alphas(set: BTreeSet<u128>) -> Self {
+    fn alphas(set: BTreeSet<u128>) -> Self {
         if set.len() > MAX_SIZE {
             Self::Top
         } else {
@@ -1108,14 +1602,14 @@ impl AbsUint {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
@@ -1130,23 +1624,23 @@ impl AbsUint {
         }
     }
 
-    pub fn not(&self) -> Self {
+    fn not(&self) -> Self {
         self.unary(|n| !n)
     }
 
-    pub fn to_u8(&self) -> Self {
+    fn to_u8(&self) -> Self {
         self.unary(|n| n as u8 as u128)
     }
 
-    pub fn to_u16(&self) -> Self {
+    fn to_u16(&self) -> Self {
         self.unary(|n| n as u16 as u128)
     }
 
-    pub fn to_u32(&self) -> Self {
+    fn to_u32(&self) -> Self {
         self.unary(|n| n as u32 as u128)
     }
 
-    pub fn to_u64(&self) -> Self {
+    fn to_u64(&self) -> Self {
         self.unary(|n| n as u64 as u128)
     }
 
@@ -1157,15 +1651,15 @@ impl AbsUint {
         }
     }
 
-    pub fn to_i8(&self) -> AbsInt {
+    fn to_i8(&self) -> AbsInt {
         self.unaryi(|n| n as i8 as i128)
     }
 
-    pub fn to_i16(&self) -> AbsInt {
+    fn to_i16(&self) -> AbsInt {
         self.unaryi(|n| n as i16 as i128)
     }
 
-    pub fn to_i32(&self) -> AbsInt {
+    fn to_i32(&self) -> AbsInt {
         self.unaryi(|n| n as i32 as i128)
     }
 
@@ -1173,7 +1667,7 @@ impl AbsUint {
         self.unaryi(|n| n as i64 as i128)
     }
 
-    pub fn to_i128(&self) -> AbsInt {
+    fn to_i128(&self) -> AbsInt {
         self.unaryi(|n| n as i128)
     }
 
@@ -1184,11 +1678,11 @@ impl AbsUint {
         }
     }
 
-    pub fn to_f32(&self) -> AbsFloat {
+    fn to_f32(&self) -> AbsFloat {
         self.unaryf(|n| n as f32 as f64)
     }
 
-    pub fn to_f64(&self) -> AbsFloat {
+    fn to_f64(&self) -> AbsFloat {
         self.unaryf(|n| n as f64)
     }
 
@@ -1207,43 +1701,43 @@ impl AbsUint {
         }
     }
 
-    pub fn add(&self, other: &Self) -> Self {
+    fn add(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 + n2)
     }
 
-    pub fn sub(&self, other: &Self) -> Self {
+    fn sub(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 - n2)
     }
 
-    pub fn mul(&self, other: &Self) -> Self {
+    fn mul(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 * n2)
     }
 
-    pub fn div(&self, other: &Self) -> Self {
+    fn div(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 / n2)
     }
 
-    pub fn rem(&self, other: &Self) -> Self {
+    fn rem(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 % n2)
     }
 
-    pub fn bit_xor(&self, other: &Self) -> Self {
+    fn bit_xor(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 ^ n2)
     }
 
-    pub fn bit_and(&self, other: &Self) -> Self {
+    fn bit_and(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 & n2)
     }
 
-    pub fn bit_or(&self, other: &Self) -> Self {
+    fn bit_or(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 | n2)
     }
 
-    pub fn shl(&self, other: &Self) -> Self {
+    fn shl(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 << n2)
     }
 
-    pub fn shr(&self, other: &Self) -> Self {
+    fn shr(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 >> n2)
     }
 
@@ -1262,11 +1756,11 @@ impl AbsUint {
         }
     }
 
-    pub fn shli(&self, other: &AbsInt) -> Self {
+    fn shli(&self, other: &AbsInt) -> Self {
         self.binaryi(other, |n1, n2| n1 << n2)
     }
 
-    pub fn shri(&self, other: &AbsInt) -> Self {
+    fn shri(&self, other: &AbsInt) -> Self {
         self.binaryi(other, |n1, n2| n1 >> n2)
     }
 
@@ -1285,27 +1779,27 @@ impl AbsUint {
         }
     }
 
-    pub fn eq(&self, other: &Self) -> AbsBool {
+    fn eq(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 == n2)
     }
 
-    pub fn lt(&self, other: &Self) -> AbsBool {
+    fn lt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 < n2)
     }
 
-    pub fn le(&self, other: &Self) -> AbsBool {
+    fn le(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 <= n2)
     }
 
-    pub fn ne(&self, other: &Self) -> AbsBool {
+    fn ne(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 != n2)
     }
 
-    pub fn ge(&self, other: &Self) -> AbsBool {
+    fn ge(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 >= n2)
     }
 
-    pub fn gt(&self, other: &Self) -> AbsBool {
+    fn gt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 > n2)
     }
 }
@@ -1339,7 +1833,8 @@ impl std::fmt::Debug for AbsFloat {
 }
 
 impl AbsFloat {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
@@ -1351,14 +1846,17 @@ impl AbsFloat {
         }
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::new(BTreeSet::new())
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -1367,11 +1865,11 @@ impl AbsFloat {
         }
     }
 
-    pub fn alpha(n: f64) -> Self {
+    fn alpha(n: f64) -> Self {
         Self::new([n.to_bits()].into_iter().collect())
     }
 
-    pub fn alphas(v: Vec<f64>) -> Self {
+    fn alphas(v: Vec<f64>) -> Self {
         Self::new(v.into_iter().map(|n| n.to_bits()).collect())
     }
 
@@ -1383,14 +1881,14 @@ impl AbsFloat {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::new(s1.union(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
@@ -1405,11 +1903,11 @@ impl AbsFloat {
         }
     }
 
-    pub fn neg(&self) -> Self {
+    fn neg(&self) -> Self {
         self.unary(|n| -n)
     }
 
-    pub fn to_f32(&self) -> Self {
+    fn to_f32(&self) -> Self {
         self.unary(|n| n as f32 as f64)
     }
 
@@ -1420,23 +1918,23 @@ impl AbsFloat {
         }
     }
 
-    pub fn to_i8(&self) -> AbsInt {
+    fn to_i8(&self) -> AbsInt {
         self.unaryi(|n| n as i8 as i128)
     }
 
-    pub fn to_i16(&self) -> AbsInt {
+    fn to_i16(&self) -> AbsInt {
         self.unaryi(|n| n as i16 as i128)
     }
 
-    pub fn to_i32(&self) -> AbsInt {
+    fn to_i32(&self) -> AbsInt {
         self.unaryi(|n| n as i32 as i128)
     }
 
-    pub fn to_i64(&self) -> AbsInt {
+    fn to_i64(&self) -> AbsInt {
         self.unaryi(|n| n as i64 as i128)
     }
 
-    pub fn to_i128(&self) -> AbsInt {
+    fn to_i128(&self) -> AbsInt {
         self.unaryi(|n| n as i128)
     }
 
@@ -1447,23 +1945,23 @@ impl AbsFloat {
         }
     }
 
-    pub fn to_u8(&self) -> AbsUint {
+    fn to_u8(&self) -> AbsUint {
         self.unaryu(|n| n as u8 as u128)
     }
 
-    pub fn to_u16(&self) -> AbsUint {
+    fn to_u16(&self) -> AbsUint {
         self.unaryu(|n| n as u16 as u128)
     }
 
-    pub fn to_u32(&self) -> AbsUint {
+    fn to_u32(&self) -> AbsUint {
         self.unaryu(|n| n as u32 as u128)
     }
 
-    pub fn to_u64(&self) -> AbsUint {
+    fn to_u64(&self) -> AbsUint {
         self.unaryu(|n| n as u64 as u128)
     }
 
-    pub fn to_u128(&self) -> AbsUint {
+    fn to_u128(&self) -> AbsUint {
         self.unaryu(|n| n as u128)
     }
 
@@ -1482,23 +1980,23 @@ impl AbsFloat {
         }
     }
 
-    pub fn add(&self, other: &Self) -> Self {
+    fn add(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 + n2)
     }
 
-    pub fn sub(&self, other: &Self) -> Self {
+    fn sub(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 - n2)
     }
 
-    pub fn mul(&self, other: &Self) -> Self {
+    fn mul(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 * n2)
     }
 
-    pub fn div(&self, other: &Self) -> Self {
+    fn div(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 / n2)
     }
 
-    pub fn rem(&self, other: &Self) -> Self {
+    fn rem(&self, other: &Self) -> Self {
         self.binary(other, |n1, n2| n1 % n2)
     }
 
@@ -1517,27 +2015,27 @@ impl AbsFloat {
         }
     }
 
-    pub fn eq(&self, other: &Self) -> AbsBool {
+    fn eq(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 == n2)
     }
 
-    pub fn lt(&self, other: &Self) -> AbsBool {
+    fn lt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 < n2)
     }
 
-    pub fn le(&self, other: &Self) -> AbsBool {
+    fn le(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 <= n2)
     }
 
-    pub fn ne(&self, other: &Self) -> AbsBool {
+    fn ne(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 != n2)
     }
 
-    pub fn ge(&self, other: &Self) -> AbsBool {
+    fn ge(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 >= n2)
     }
 
-    pub fn gt(&self, other: &Self) -> AbsBool {
+    fn gt(&self, other: &Self) -> AbsBool {
         self.binaryb(other, |n1, n2| n1 > n2)
     }
 }
@@ -1562,23 +2060,27 @@ impl std::fmt::Debug for AbsBool {
 }
 
 impl AbsBool {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::Bot
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         matches!(self, Self::Bot)
     }
 
-    pub fn alpha(b: bool) -> Self {
+    fn alpha(b: bool) -> Self {
         if b {
             Self::True
         } else {
@@ -1607,7 +2109,7 @@ impl AbsBool {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::True, Self::True) => Self::True,
             (Self::False, Self::False) => Self::False,
@@ -1616,14 +2118,14 @@ impl AbsBool {
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         matches!(
             (self, other),
             (_, Self::Top) | (Self::Bot, _) | (Self::True, Self::True) | (Self::False, Self::False)
         )
     }
 
-    pub fn not(&self) -> Self {
+    fn not(&self) -> Self {
         match self {
             Self::Top => Self::Top,
             Self::True => Self::False,
@@ -1632,7 +2134,7 @@ impl AbsBool {
         }
     }
 
-    pub fn eq(&self, other: &Self) -> AbsBool {
+    fn eq(&self, other: &Self) -> AbsBool {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::True,
@@ -1641,7 +2143,7 @@ impl AbsBool {
         }
     }
 
-    pub fn ne(&self, other: &Self) -> AbsBool {
+    fn ne(&self, other: &Self) -> AbsBool {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::False,
@@ -1650,7 +2152,7 @@ impl AbsBool {
         }
     }
 
-    pub fn bit_xor(&self, other: &Self) -> Self {
+    fn bit_xor(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::False,
@@ -1659,7 +2161,7 @@ impl AbsBool {
         }
     }
 
-    pub fn bit_and(&self, other: &Self) -> Self {
+    fn bit_and(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::False, _) | (_, Self::False) => Self::False,
@@ -1668,7 +2170,7 @@ impl AbsBool {
         }
     }
 
-    pub fn bit_or(&self, other: &Self) -> Self {
+    fn bit_or(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, _) | (_, Self::True) => Self::True,
@@ -1705,23 +2207,27 @@ impl std::fmt::Debug for AbsList {
 }
 
 impl AbsList {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::Bot
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         matches!(self, Self::Bot)
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, v) | (v, Self::Bot) => v.clone(),
             (Self::List(l1), Self::List(l2)) if l1.len() == l2.len() => Self::List(
@@ -1734,22 +2240,13 @@ impl AbsList {
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) | (Self::Bot, _) => true,
             (Self::List(l1), Self::List(l2)) if l1.len() == l2.len() => {
                 l1.iter().zip(l2.iter()).all(|(v1, v2)| v1.ord(v2))
             }
             _ => false,
-        }
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> Option<usize> {
-        if let Self::List(l) = self {
-            Some(l.len())
-        } else {
-            None
         }
     }
 
@@ -1761,7 +2258,7 @@ impl AbsList {
         }
     }
 
-    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+    fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
         match self {
             Self::Top => Self::Top,
             Self::List(l) => Self::List(l.iter().map(|v| v.subst(map)).collect()),
@@ -1769,7 +2266,7 @@ impl AbsList {
         }
     }
 
-    pub fn allocs(&self) -> BTreeSet<usize> {
+    fn allocs(&self) -> BTreeSet<usize> {
         if let Self::List(l) = self {
             l.iter().flat_map(|v| v.allocs()).collect()
         } else {
@@ -1795,20 +2292,21 @@ impl std::fmt::Debug for AbsPlace {
 }
 
 impl AbsPlace {
-    pub fn null() -> Self {
+    fn null() -> Self {
         Self {
             base: AbsBase::Null,
             projection: Vec::new(),
         }
     }
 
-    pub fn alloc(i: usize) -> Self {
+    fn alloc(i: usize) -> Self {
         Self {
             base: AbsBase::Heap(i),
             projection: Vec::new(),
         }
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         self.base == AbsBase::Null
     }
@@ -1875,18 +2373,22 @@ impl std::fmt::Debug for AbsPtr {
 }
 
 impl AbsPtr {
+    #[inline]
     pub fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::Set(BTreeSet::new())
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -1895,7 +2397,7 @@ impl AbsPtr {
         }
     }
 
-    pub fn alpha(n: AbsPlace) -> Self {
+    fn alpha(n: AbsPlace) -> Self {
         Self::alphas([n].into_iter().collect())
     }
 
@@ -1915,14 +2417,14 @@ impl AbsPtr {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
@@ -1930,15 +2432,19 @@ impl AbsPtr {
         }
     }
 
-    pub fn compare(&self, other: &Self) -> AbsBool {
+    fn compare(&self, other: &Self) -> AbsBool {
         match (self, other) {
             (Self::Set(s), _) | (_, Self::Set(s)) if s.is_empty() => AbsBool::Bot,
             _ => AbsBool::Top,
         }
     }
 
-    pub fn null() -> Self {
+    fn null() -> Self {
         Self::alpha(AbsPlace::null())
+    }
+
+    pub fn alloc(i: usize) -> Self {
+        Self::alpha(AbsPlace::alloc(i))
     }
 
     pub fn heap_addr(&self) -> usize {
@@ -1952,7 +2458,7 @@ impl AbsPtr {
         }
     }
 
-    pub fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
+    fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
         if let Self::Set(ptrs) = self {
             ptrs.iter()
                 .map(|place| {
@@ -1983,7 +2489,7 @@ impl AbsPtr {
         }
     }
 
-    pub fn allocs(&self) -> BTreeSet<usize> {
+    fn allocs(&self) -> BTreeSet<usize> {
         if let Self::Set(ptrs) = self {
             ptrs.iter()
                 .filter_map(|place| match &place.base {
@@ -2001,7 +2507,7 @@ impl AbsPtr {
 #[derive(Clone)]
 pub enum AbsOption {
     Top,
-    Some(Box<AbsValue>),
+    Some(AbsValue),
     None,
     Bot,
 }
@@ -2018,32 +2524,36 @@ impl std::fmt::Debug for AbsOption {
 }
 
 impl AbsOption {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::Bot
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         matches!(self, Self::Bot)
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Bot, v) | (v, Self::Bot) => v.clone(),
             (Self::None, Self::None) => Self::None,
-            (Self::Some(v1), Self::Some(v2)) => Self::Some(Box::new(v1.join(v2))),
+            (Self::Some(v1), Self::Some(v2)) => Self::Some(v1.join(v2)),
             _ => Self::Top,
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) | (Self::Bot, _) | (Self::None, Self::None) => true,
             (Self::Some(v1), Self::Some(v2)) => v1.ord(v2),
@@ -2051,12 +2561,9 @@ impl AbsOption {
         }
     }
 
+    #[inline]
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
-    }
-
-    pub fn some(v: AbsValue) -> Self {
-        Self::Some(Box::new(v))
     }
 }
 
@@ -2089,18 +2596,22 @@ impl std::fmt::Debug for AbsFn {
 }
 
 impl AbsFn {
-    pub fn top() -> Self {
+    #[inline]
+    fn top() -> Self {
         Self::Top
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::Set(BTreeSet::new())
     }
 
+    #[inline]
     pub fn is_top(&self) -> bool {
         matches!(self, Self::Top)
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         if let Self::Set(s) = self {
             s.is_empty()
@@ -2109,11 +2620,11 @@ impl AbsFn {
         }
     }
 
-    pub fn alpha(n: DefId) -> Self {
+    fn alpha(n: DefId) -> Self {
         Self::alphas([n].into_iter().collect())
     }
 
-    pub fn alphas(set: BTreeSet<DefId>) -> Self {
+    fn alphas(set: BTreeSet<DefId>) -> Self {
         if set.len() > MAX_SIZE {
             Self::Top
         } else {
@@ -2129,14 +2640,14 @@ impl AbsFn {
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
             (Self::Top, _) => false,
@@ -2209,26 +2720,29 @@ impl std::fmt::Debug for MustPathSet {
 }
 
 impl MustPathSet {
+    #[inline]
     pub fn top() -> Self {
         Self::Set(BTreeSet::new())
     }
 
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self::All
     }
 
+    #[inline]
     pub fn is_bot(&self) -> bool {
         matches!(self, Self::All)
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (s, Self::All) | (Self::All, s) => s.clone(),
             (Self::Set(s1), Self::Set(s2)) => Self::Set(s1.intersection(s2).cloned().collect()),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::All, _) => true,
             (_, Self::All) => false,
@@ -2236,12 +2750,14 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn insert(&mut self, place: AbsPath) {
         if let Self::Set(set) = self {
             set.insert(place);
         }
     }
 
+    #[inline]
     pub fn contains(&self, place: &AbsPath) -> bool {
         match self {
             Self::All => true,
@@ -2249,6 +2765,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         match self {
             Self::All => false,
@@ -2256,6 +2773,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::All => panic!(),
@@ -2263,6 +2781,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &AbsPath> {
         match self {
             Self::All => panic!(),
@@ -2270,6 +2789,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn into_inner(self) -> BTreeSet<AbsPath> {
         match self {
             Self::All => panic!(),
@@ -2277,6 +2797,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn as_set(&self) -> &BTreeSet<AbsPath> {
         match self {
             Self::All => panic!(),
@@ -2284,6 +2805,7 @@ impl MustPathSet {
         }
     }
 
+    #[inline]
     pub fn as_vec(&self) -> Vec<&AbsPath> {
         match self {
             Self::All => panic!(),
@@ -2302,46 +2824,56 @@ impl std::fmt::Debug for MayPathSet {
 }
 
 impl MayPathSet {
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self(BTreeSet::new())
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         Self(self.0.union(&other.0).cloned().collect())
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    #[inline]
+    fn ord(&self, other: &Self) -> bool {
         self.0.is_subset(&other.0)
     }
 
+    #[inline]
     pub fn insert(&mut self, place: AbsPath) {
         self.0.insert(place);
     }
 
+    #[inline]
     pub fn contains(&self, place: &AbsPath) -> bool {
         self.0.contains(place)
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &AbsPath> {
         self.0.iter()
     }
 
+    #[inline]
     pub fn into_inner(self) -> BTreeSet<AbsPath> {
         self.0
     }
 
+    #[inline]
     pub fn as_set(&self) -> &BTreeSet<AbsPath> {
         &self.0
     }
 
+    #[inline]
     pub fn as_vec(&self) -> Vec<&AbsPath> {
         self.0.iter().collect()
     }
@@ -2360,21 +2892,22 @@ impl std::fmt::Debug for RwSets {
 }
 
 impl RwSets {
-    pub fn bot() -> Self {
+    #[inline]
+    fn bot() -> Self {
         Self {
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
         }
     }
 
-    pub fn join(&self, other: &Self) -> Self {
+    fn join(&self, other: &Self) -> Self {
         Self {
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
         }
     }
 
-    pub fn ord(&self, other: &Self) -> bool {
+    fn ord(&self, other: &Self) -> bool {
         self.reads.ord(&other.reads) && self.writes.ord(&other.writes)
     }
 }

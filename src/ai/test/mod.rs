@@ -34,11 +34,11 @@ fn analyze(code: &str) -> Vec<AbsState> {
     .unwrap()
 }
 
-fn ret(st: &AbsState) -> &AbsValue {
+fn ret(st: &AbsState) -> &AbsVal {
     st.local.get(0)
 }
 
-fn as_int(v: &AbsValue) -> Vec<i128> {
+fn as_int(v: &AbsVal) -> Vec<i128> {
     assert!(v.uintv.is_bot());
     assert!(v.floatv.is_bot());
     assert!(v.boolv.is_bot());
@@ -49,7 +49,7 @@ fn as_int(v: &AbsValue) -> Vec<i128> {
     v.intv.gamma().unwrap().iter().cloned().collect()
 }
 
-fn as_uint(v: &AbsValue) -> Vec<u128> {
+fn as_uint(v: &AbsVal) -> Vec<u128> {
     assert!(v.intv.is_bot());
     assert!(v.floatv.is_bot());
     assert!(v.boolv.is_bot());
@@ -60,7 +60,7 @@ fn as_uint(v: &AbsValue) -> Vec<u128> {
     v.uintv.gamma().unwrap().iter().cloned().collect()
 }
 
-fn as_float(v: &AbsValue) -> Vec<f64> {
+fn as_float(v: &AbsVal) -> Vec<f64> {
     assert!(v.intv.is_bot());
     assert!(v.uintv.is_bot());
     assert!(v.boolv.is_bot());
@@ -71,7 +71,7 @@ fn as_float(v: &AbsValue) -> Vec<f64> {
     v.floatv.gamma().unwrap().iter().cloned().collect()
 }
 
-fn as_bool(v: &AbsValue) -> Vec<bool> {
+fn as_bool(v: &AbsVal) -> Vec<bool> {
     assert!(v.intv.is_bot());
     assert!(v.uintv.is_bot());
     assert!(v.floatv.is_bot());
@@ -82,7 +82,7 @@ fn as_bool(v: &AbsValue) -> Vec<bool> {
     v.boolv.gamma()
 }
 
-fn as_fn(v: &AbsValue) -> Vec<DefId> {
+fn as_fn(v: &AbsVal) -> Vec<DefId> {
     assert!(v.intv.is_bot());
     assert!(v.uintv.is_bot());
     assert!(v.floatv.is_bot());
@@ -93,7 +93,7 @@ fn as_fn(v: &AbsValue) -> Vec<DefId> {
     v.fnv.gamma().unwrap().iter().cloned().collect()
 }
 
-fn is_none(v: &AbsValue) {
+fn is_none(v: &AbsVal) {
     assert!(v.intv.is_bot());
     assert!(v.uintv.is_bot());
     assert!(v.floatv.is_bot());
@@ -104,7 +104,7 @@ fn is_none(v: &AbsValue) {
     assert!(v.fnv.is_bot());
 }
 
-fn as_some(v: &AbsValue) -> &AbsValue {
+fn as_some(v: &AbsVal) -> &AbsVal {
     assert!(v.intv.is_bot());
     assert!(v.uintv.is_bot());
     assert!(v.floatv.is_bot());
@@ -112,7 +112,7 @@ fn as_some(v: &AbsValue) -> &AbsValue {
     assert!(v.listv.is_bot());
     assert!(v.ptrv.is_bot());
     assert!(v.fnv.is_bot());
-    if let AbsOption::Some(box v) = &v.optionv {
+    if let AbsOption::Some(v) = &v.optionv {
         &v
     } else {
         panic!("not some")

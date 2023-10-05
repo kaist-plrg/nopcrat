@@ -32,60 +32,6 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    fn assign(
-        &self,
-        place: &Place<'tcx>,
-        new_v: AbsValue,
-        state: &AbsState,
-    ) -> (AbsState, Vec<AbsPath>) {
-        let mut new_state = state.clone();
-        let writes = if place.is_indirect_first_projection() {
-            let projection = self.abstract_projection(&place.projection[1..], state);
-            let ptr = state.local.get(place.local.index());
-            self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
-            self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
-        } else {
-            let old_v = new_state.local.get_mut(place.local.index());
-            let projection = self.abstract_projection(place.projection, state);
-            self.update_value(new_v, old_v, false, &projection);
-            vec![]
-        };
-        (new_state, writes)
-    }
-
-    fn indirect_assign(
-        &self,
-        ptr: &AbsPtr,
-        new_v: &AbsValue,
-        projection: &[AbsProjElem],
-        state: &mut AbsState,
-    ) {
-        if let AbsPtr::Set(ptrs) = ptr {
-            let weak = ptrs.len() > 1;
-            for ptr in ptrs {
-                let old_v = some_or!(state.get_mut(ptr.base), continue);
-                let mut ptr_projection = ptr.projection.clone();
-                ptr_projection.extend(projection.to_owned());
-                self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
-            }
-        } else {
-            tracing::warn!("indirect_assign to top");
-        }
-    }
-
-    fn get_write_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
-        if let AbsPtr::Set(ptrs) = ptr {
-            if ptrs.len() == 1 {
-                let mut ptr = ptrs.first().unwrap().clone();
-                ptr.projection.extend(projection.to_owned());
-                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
-                    return self.expands_path(&path);
-                }
-            }
-        }
-        vec![]
-    }
-
     pub fn transfer_terminator(
         &mut self,
         terminator: &Terminator<'tcx>,
@@ -256,7 +202,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 state.heap.push(alloc_v.clone())
                             };
                             label_alloc_map.insert(alloc, i);
-                            AbsPtr::alpha(AbsPlace::alloc(i))
+                            AbsPtr::alloc(i)
                         });
                     }
                     for (p, a) in &ptr_maps {
@@ -375,7 +321,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     state.heap.push(AbsValue::top())
                 };
                 self.label_alloc_map.insert(label.clone(), i);
-                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
+                AbsValue::alloc(i)
             } else if RETURN_FIRST_FUNCTIONS.contains(fn_name) {
                 args[0].clone()
             } else {
@@ -396,7 +342,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 .collect(),
                         )
                     } else {
-                        AbsPtr::Top
+                        AbsPtr::top()
                     };
                     AbsValue::ptr(ptr)
                 }
@@ -415,7 +361,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 .collect(),
                         )
                     } else {
-                        AbsPtr::Top
+                        AbsPtr::top()
                     };
                     AbsValue::ptr(ptr)
                 }
@@ -425,10 +371,10 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     } else {
                         AbsBool::Top
                     };
-                    AbsValue::bools(b)
+                    AbsValue::boolean(b)
                 }
                 "::ptr::mut_ptr::{impl#0}::offset_from"
-                | "::ptr::const_ptr::{impl#0}::offset_from" => AbsValue::int_top(),
+                | "::ptr::const_ptr::{impl#0}::offset_from" => AbsValue::top_int(),
                 "::ptr::write_volatile" => {
                     self.indirect_assign(&args[0].ptrv, &args[1], &[], &mut state);
                     let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
@@ -438,20 +384,19 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 "::option::{impl#0}::is_some" => {
                     let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
                     reads.extend(reads2);
-                    let b = match v.optionv {
-                        AbsOption::Top => AbsBool::Top,
-                        AbsOption::Some(_) => AbsBool::True,
-                        AbsOption::None => AbsBool::False,
-                        AbsOption::Bot => AbsBool::Bot,
-                    };
-                    AbsValue::bools(b)
+                    match v.optionv {
+                        AbsOption::Top => AbsValue::top_bool(),
+                        AbsOption::Some(_) => AbsValue::bool_true(),
+                        AbsOption::None => AbsValue::bool_false(),
+                        AbsOption::Bot => AbsValue::bot(),
+                    }
                 }
                 "::option::{impl#0}::unwrap" => match &args[0].optionv {
                     AbsOption::Top => AbsValue::top(),
-                    AbsOption::Some(box v) => v.clone(),
+                    AbsOption::Some(v) => v.clone(),
                     _ => AbsValue::bot(),
                 },
-                "::mem::size_of" => AbsValue::uint_top(),
+                "::mem::size_of" => AbsValue::top_uint(),
                 "::panicking::begin_panic" => AbsValue::bot(),
                 _ if name.ends_with("::wrapping_add") => args[0].add(&args[1]),
                 _ if name.ends_with("::wrapping_sub") => args[0].sub(&args[1]),
@@ -473,7 +418,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             Rvalue::Repeat(operand, len) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
-                (AbsValue::list(vec![v; len as usize]), reads)
+                (AbsValue::alpha_list(vec![v; len as usize]), reads)
             }
             Rvalue::Ref(_, _, place) => {
                 let v = if place.is_indirect_first_projection() {
@@ -493,11 +438,11 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 .collect(),
                         ))
                     } else {
-                        AbsValue::ptr(AbsPtr::Top)
+                        AbsValue::top_ptr()
                     }
                 } else {
                     let place = self.abstract_place(place, state);
-                    AbsValue::ptr(AbsPtr::alpha(place))
+                    AbsValue::alpha_ptr(place)
                 };
                 (v, vec![])
             }
@@ -506,7 +451,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 assert_eq!(place.projection.len(), 1);
                 assert!(place.is_indirect_first_projection());
                 let v = state.local.get(place.local.index());
-                (AbsValue::ptr(v.ptrv.clone()), vec![])
+                (v.clone(), vec![])
             }
             Rvalue::Len(_) => unreachable!("{:?}", rvalue),
             Rvalue::Cast(kind, operand, ty) => {
@@ -516,7 +461,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     CastKind::PointerFromExposedAddress => {
                         let zero: BTreeSet<u128> = [0].into_iter().collect();
                         assert_eq!(v.uintv.gamma().unwrap(), &zero);
-                        AbsValue::ptr(AbsPtr::null())
+                        AbsValue::null()
                     }
                     CastKind::PointerCoercion(coercion) => match coercion {
                         PointerCoercion::ReifyFnPointer => v,
@@ -524,7 +469,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         PointerCoercion::ClosureFnPointer(_) => unreachable!("{:?}", rvalue),
                         PointerCoercion::MutToConstPointer => v,
                         PointerCoercion::ArrayToPointer => {
-                            if let AbsPtr::Set(ptrs) = v.ptrv {
+                            if let Some(ptrs) = v.ptrv.gamma() {
                                 AbsValue::ptr(AbsPtr::Set(
                                     ptrs.iter()
                                         .cloned()
@@ -536,7 +481,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                         .collect(),
                                 ))
                             } else {
-                                AbsValue::ptr(AbsPtr::Top)
+                                AbsValue::top_ptr()
                             }
                         }
                         PointerCoercion::Unsize => v,
@@ -624,7 +569,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         .iter()
                         .map(|operand| self.transfer_operand(operand, state))
                         .unzip();
-                    let v = AbsValue::list(vs.into_iter().collect());
+                    let v = AbsValue::alpha_list(vs.into_iter().collect());
                     let reads = readss.into_iter().flatten().collect();
                     (v, reads)
                 }
@@ -637,7 +582,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                                 .iter()
                                 .map(|operand| self.transfer_operand(operand, state))
                                 .unzip();
-                            let v = AbsValue::list(vs.into_iter().collect());
+                            let v = AbsValue::alpha_list(vs.into_iter().collect());
                             let reads = readss.into_iter().flatten().collect();
                             (v, reads)
                         }
@@ -646,8 +591,9 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             let operand = &fields[FieldIdx::from_usize(0)];
                             let (v, reads) = self.transfer_operand(operand, state);
                             let variant = adt_def.variant(VariantIdx::from_usize(0));
-                            let v =
-                                AbsValue::list(variant.fields.iter().map(|_| v.clone()).collect());
+                            let v = AbsValue::alpha_list(
+                                variant.fields.iter().map(|_| v.clone()).collect(),
+                            );
                             (v, reads)
                         }
                         AdtKind::Enum => {
@@ -659,14 +605,13 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             );
                             if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
                                 let (v, reads) = self.transfer_operand(field, state);
-                                let opt_v = if v.is_bot() {
-                                    AbsOption::bot()
+                                if v.is_bot() {
+                                    (AbsValue::bot(), reads)
                                 } else {
-                                    AbsOption::some(v)
-                                };
-                                (AbsValue::option(opt_v), reads)
+                                    (AbsValue::some(v), reads)
+                                }
                             } else {
-                                (AbsValue::option(AbsOption::None), vec![])
+                                (AbsValue::none(), vec![])
                             }
                         }
                     }
@@ -702,43 +647,6 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    fn read_ptr(
-        &self,
-        ptr: &AbsPtr,
-        projection: &[AbsProjElem],
-        state: &AbsState,
-    ) -> (AbsValue, Vec<AbsPath>) {
-        let v = if let AbsPtr::Set(ptrs) = ptr {
-            ptrs.iter()
-                .filter_map(|ptr| {
-                    let v = state.get(ptr.base)?;
-                    let mut ptr_projection = ptr.projection.clone();
-                    ptr_projection.extend(projection.to_owned());
-                    Some(self.get_value(v, &ptr_projection))
-                })
-                .reduce(|v1, v2| v1.join(&v2))
-                .unwrap_or(AbsValue::bot())
-        } else {
-            AbsValue::top()
-        };
-        (v, self.get_read_paths_of_ptr(ptr, projection))
-    }
-
-    fn get_read_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
-        if let AbsPtr::Set(ptrs) = ptr {
-            ptrs.iter()
-                .cloned()
-                .filter_map(|mut ptr| {
-                    ptr.projection.extend(projection.to_owned());
-                    AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
-                })
-                .flat_map(|path| self.expands_path(&path))
-                .collect()
-        } else {
-            vec![]
-        }
-    }
-
     fn transfer_constant(&self, constant: &Constant<'tcx>) -> AbsValue {
         match constant.literal {
             ConstantKind::Ty(_) => unreachable!("{:?}", constant),
@@ -753,7 +661,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
-    pub fn transfer_const_value(&self, v: &ConstValue<'tcx>, ty: &Ty<'tcx>) -> AbsValue {
+    fn transfer_const_value(&self, v: &ConstValue<'tcx>, ty: &Ty<'tcx>) -> AbsValue {
         match v {
             ConstValue::Scalar(s) => match s {
                 Scalar::Int(i) => match ty.kind() {
@@ -766,7 +674,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             IntTy::I64 => i.try_to_i64().unwrap() as _,
                             IntTy::I128 => i.try_to_i128().unwrap(),
                         };
-                        AbsValue::int(v)
+                        AbsValue::alpha_int(v)
                     }
                     TyKind::Uint(uint_ty) => {
                         let v = match uint_ty {
@@ -777,17 +685,17 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                             UintTy::U64 => i.try_to_u64().unwrap() as _,
                             UintTy::U128 => i.try_to_u128().unwrap(),
                         };
-                        AbsValue::uint(v)
+                        AbsValue::alpha_uint(v)
                     }
                     TyKind::Float(float_ty) => {
                         let v = match float_ty {
                             FloatTy::F32 => f32::from_bits(i.try_to_u32().unwrap()) as _,
                             FloatTy::F64 => f64::from_bits(i.try_to_u64().unwrap()),
                         };
-                        AbsValue::float(v)
+                        AbsValue::alpha_float(v)
                     }
-                    TyKind::Bool => AbsValue::boolean(i.try_to_bool().unwrap()),
-                    TyKind::Char => AbsValue::uint(i.try_to_u32().unwrap() as _),
+                    TyKind::Bool => AbsValue::alpha_bool(i.try_to_bool().unwrap()),
+                    TyKind::Char => AbsValue::alpha_uint(i.try_to_u32().unwrap() as _),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
@@ -797,18 +705,18 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                         GlobalAlloc::VTable(_, _) => unreachable!("{:?}", alloc),
                         GlobalAlloc::Static(def_id) => {
                             let i = self.static_allocs.get(&def_id).unwrap();
-                            AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(*i)))
+                            AbsValue::alloc(*i)
                         }
                         GlobalAlloc::Memory(_) => {
                             let i = self.literal_allocs.get(&ptr.provenance).unwrap();
-                            AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(*i)))
+                            AbsValue::alloc(*i)
                         }
                     }
                 }
             },
             ConstValue::ZeroSized => {
                 if let TyKind::FnDef(def_id, _) = ty.kind() {
-                    AbsValue::func(AbsFn::alpha(*def_id))
+                    AbsValue::alpha_fn(*def_id)
                 } else {
                     unreachable!("{:?}", v)
                 }
@@ -839,15 +747,15 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         adts: &mut BTreeSet<DefId>,
     ) -> AbsValue {
         match ty.kind() {
-            TyKind::Bool => AbsValue::bool_top(),
+            TyKind::Bool => AbsValue::top_bool(),
             TyKind::Char => unreachable!("{:?}", ty),
-            TyKind::Int(_) => AbsValue::int_top(),
-            TyKind::Uint(_) => AbsValue::uint_top(),
-            TyKind::Float(_) => AbsValue::float_top(),
+            TyKind::Int(_) => AbsValue::top_int(),
+            TyKind::Uint(_) => AbsValue::top_uint(),
+            TyKind::Float(_) => AbsValue::top_float(),
             TyKind::Adt(adt, arg) => match adt.adt_kind() {
                 AdtKind::Struct | AdtKind::Union => {
                     let variant = adt.variant(VariantIdx::from_usize(0));
-                    AbsValue::list(
+                    AbsValue::alpha_list(
                         variant
                             .fields
                             .iter()
@@ -861,7 +769,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 AdtKind::Enum => {
                     let ty = format!("{:?}", adt);
                     match ty.as_str() {
-                        "std::option::Option" => AbsValue::option(AbsOption::Top),
+                        "std::option::Option" => AbsValue::top_option(),
                         "libc::c_void" => AbsValue::top(),
                         _ => unreachable!("{:?}", ty),
                     }
@@ -871,7 +779,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
-                AbsValue::list(
+                AbsValue::alpha_list(
                     (0..len)
                         .map(|_| self.top_value_of_ty(ty, heap.as_deref_mut(), adts))
                         .collect(),
@@ -884,7 +792,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                     if adts.insert(def_id) {
                         Some(def_id)
                     } else {
-                        return AbsValue::ptr(AbsPtr::Top);
+                        return AbsValue::top_ptr();
                     }
                 } else {
                     None
@@ -895,7 +803,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
                 }
                 let heap = heap.unwrap();
                 let i = heap.push(v);
-                AbsValue::ptr(AbsPtr::alpha(AbsPlace::alloc(i)))
+                AbsValue::alloc(i)
             }
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
             TyKind::FnPtr(_) => todo!("{:?}", ty),
@@ -905,7 +813,7 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             TyKind::GeneratorWitness(_) => unreachable!("{:?}", ty),
             TyKind::GeneratorWitnessMIR(_, _) => unreachable!("{:?}", ty),
             TyKind::Never => AbsValue::bot(),
-            TyKind::Tuple(tys) => AbsValue::list(
+            TyKind::Tuple(tys) => AbsValue::alpha_list(
                 tys.iter()
                     .map(|ty| self.top_value_of_ty(&ty, heap.as_deref_mut(), adts))
                     .collect(),
@@ -950,6 +858,60 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         }
     }
 
+    fn assign(
+        &self,
+        place: &Place<'tcx>,
+        new_v: AbsValue,
+        state: &AbsState,
+    ) -> (AbsState, Vec<AbsPath>) {
+        let mut new_state = state.clone();
+        let writes = if place.is_indirect_first_projection() {
+            let projection = self.abstract_projection(&place.projection[1..], state);
+            let ptr = state.local.get(place.local.index());
+            self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
+            self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
+        } else {
+            let old_v = new_state.local.get_mut(place.local.index());
+            let projection = self.abstract_projection(place.projection, state);
+            self.update_value(new_v, old_v, false, &projection);
+            vec![]
+        };
+        (new_state, writes)
+    }
+
+    fn indirect_assign(
+        &self,
+        ptr: &AbsPtr,
+        new_v: &AbsValue,
+        projection: &[AbsProjElem],
+        state: &mut AbsState,
+    ) {
+        if let AbsPtr::Set(ptrs) = ptr {
+            let weak = ptrs.len() > 1;
+            for ptr in ptrs {
+                let old_v = some_or!(state.get_mut(ptr.base), continue);
+                let mut ptr_projection = ptr.projection.clone();
+                ptr_projection.extend(projection.to_owned());
+                self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
+            }
+        } else {
+            tracing::warn!("indirect_assign to top");
+        }
+    }
+
+    fn get_write_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
+        if let AbsPtr::Set(ptrs) = ptr {
+            if ptrs.len() == 1 {
+                let mut ptr = ptrs.first().unwrap().clone();
+                ptr.projection.extend(projection.to_owned());
+                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
+                    return self.expands_path(&path);
+                }
+            }
+        }
+        vec![]
+    }
+
     fn update_value(
         &self,
         new_v: AbsValue,
@@ -960,12 +922,12 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
         if let Some(first) = projection.first() {
             match first {
                 AbsProjElem::Field(field) => {
-                    if let Some(old_v) = old_v.listv.get_mut(*field) {
+                    if let Some(old_v) = AbsValue::make_mut(old_v).listv.get_mut(*field) {
                         self.update_value(new_v, old_v, weak, &projection[1..]);
                     }
                 }
                 AbsProjElem::Index(idx) => {
-                    if let AbsList::List(l) = &mut old_v.listv {
+                    if let AbsList::List(l) = &mut AbsValue::make_mut(old_v).listv {
                         let (indices, new_weak): (Box<dyn Iterator<Item = usize>>, _) =
                             if let Some(indices) = idx.gamma() {
                                 (Box::new(indices.iter().map(|i| *i as _)), indices.len() > 1)
@@ -985,6 +947,43 @@ impl<'tcx> super::analysis::Analyzer<'tcx> {
             *old_v = new_v.join(old_v);
         } else {
             *old_v = new_v;
+        }
+    }
+
+    fn read_ptr(
+        &self,
+        ptr: &AbsPtr,
+        projection: &[AbsProjElem],
+        state: &AbsState,
+    ) -> (AbsValue, Vec<AbsPath>) {
+        let v = if let Some(ptrs) = ptr.gamma() {
+            ptrs.iter()
+                .filter_map(|ptr| {
+                    let v = state.get(ptr.base)?;
+                    let mut ptr_projection = ptr.projection.clone();
+                    ptr_projection.extend(projection.to_owned());
+                    Some(self.get_value(v, &ptr_projection))
+                })
+                .reduce(|v1, v2| v1.join(&v2))
+                .unwrap_or(AbsValue::bot())
+        } else {
+            AbsValue::top()
+        };
+        (v, self.get_read_paths_of_ptr(ptr, projection))
+    }
+
+    fn get_read_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
+        if let AbsPtr::Set(ptrs) = ptr {
+            ptrs.iter()
+                .cloned()
+                .filter_map(|mut ptr| {
+                    ptr.projection.extend(projection.to_owned());
+                    AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
+                })
+                .flat_map(|path| self.expands_path(&path))
+                .collect()
+        } else {
+            vec![]
         }
     }
 
