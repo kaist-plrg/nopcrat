@@ -195,8 +195,14 @@ lazy_static! {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AbsValue(Arc<AbsVal>);
+
+impl std::fmt::Debug for AbsValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl Deref for AbsValue {
     type Target = AbsVal;

@@ -321,20 +321,6 @@ impl<'tcx> Analyzer<'tcx> {
                 block,
                 statement_index,
             } = label.location;
-            if block.as_usize() == 172
-                && statement_index == 0
-                && label.rw.reads.len() == 8
-                && label.rw.reads.contains(&AbsPath(vec![2]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 1, 0, 0]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 1, 0, 1]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 1, 1, 0]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 1, 1, 1]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 1, 3]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 3, 0]))
-                && label.rw.reads.contains(&AbsPath(vec![4, 3, 1]))
-            {
-                println!("{:?}\n{:?}", state.local, state.heap);
-            }
             let bbd = &body.basic_blocks[block];
             let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
                 let stmt = &bbd.statements[statement_index];
