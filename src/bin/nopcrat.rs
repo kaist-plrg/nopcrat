@@ -28,9 +28,6 @@ fn main() {
     }
     assert!(path.is_file());
     ai::analysis::analyze_path(&path);
-
-    // analysis::find_ptr_param_use(&path);
-    // analysis::find_mutable_globals(&path);
     // ai::analysis::analyze_code(
     //     "
     //     ",
