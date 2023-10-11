@@ -18,7 +18,7 @@ use rustc_type_ir::{FloatTy, IntTy, UintTy};
 use super::{analysis::Label, domains::*};
 
 #[allow(clippy::only_used_in_recursion)]
-impl<'tcx> super::analysis::Analyzer<'tcx> {
+impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
         tracing::info!("\n{:?}", stmt);
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {

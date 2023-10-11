@@ -14,8 +14,8 @@ use rustc_hir::{
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        visit::Visitor as MVisitor, Body, ClearCrossCrate, Constant, ConstantKind, Local,
-        LocalInfo, Location, TerminatorKind,
+        visit::Visitor as MVisitor, BasicBlock, Body, ClearCrossCrate, Constant, ConstantKind,
+        Local, LocalInfo, Location, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -143,12 +143,28 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
         .flatten()
         .collect();
 
-    let static_tys_map: BTreeMap<_, _> = funcs
+    let mut info_map: BTreeMap<_, _> = funcs
         .iter()
-        .map(|def_id| (*def_id, get_static_tys(*def_id, tcx)))
+        .map(|def_id| {
+            let inputs = *inputs_map.get(def_id).unwrap();
+            let static_tys = get_static_tys(*def_id, tcx);
+            let body = tcx.optimized_mir(def_id);
+            let param_tys = get_param_tys(body, inputs, tcx);
+            let literal_ty_map = get_alloc_ty_map(body, tcx);
+            let dominating_map = get_dominating_map(body);
+            let loop_heads = get_loop_heads(body);
+            let info = FuncInfo {
+                inputs,
+                static_tys,
+                param_tys,
+                literal_ty_map,
+                dominating_map,
+                loop_heads,
+            };
+            (*def_id, info)
+        })
         .collect();
 
-    let mut param_tys_map = BTreeMap::new();
     let mut summaries = BTreeMap::new();
     for id in &po {
         let def_ids = elems.get(id).unwrap();
@@ -171,27 +187,9 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
             for def_id in def_ids {
                 println!("{:?}", def_id);
                 tracing::info!("{:?}", def_id);
-                let inputs = *inputs_map.get(def_id).unwrap();
-                let static_tys = static_tys_map.get(def_id).unwrap().clone();
-                let body = tcx.optimized_mir(def_id);
-                let param_tys = get_param_tys(body, inputs, tcx);
-                let alloc_ty_map = get_alloc_ty_map(body, tcx);
-                let loop_heads = get_loop_heads(body);
-
-                param_tys_map
-                    .entry(*def_id)
-                    .or_insert_with(|| param_tys.clone());
-
-                let mut analyzer = Analyzer::new(
-                    tcx,
-                    inputs,
-                    param_tys,
-                    static_tys,
-                    alloc_ty_map,
-                    loop_heads,
-                    input_summaries.clone(),
-                );
-                let summary = analyzer.make_summary(body);
+                let mut analyzer =
+                    Analyzer::new(tcx, info_map.get(def_id).unwrap(), input_summaries.clone());
+                let summary = analyzer.make_summary(tcx.optimized_mir(*def_id));
 
                 let summary = if let Some(old) = input_summaries.get(def_id) {
                     summary.join(old)
@@ -215,17 +213,28 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
 
     summaries
         .into_iter()
-        .map(|(def_id, summary)| (def_id, (summary, param_tys_map.remove(&def_id).unwrap())))
+        .map(|(def_id, summary)| {
+            (
+                def_id,
+                (summary, info_map.remove(&def_id).unwrap().param_tys),
+            )
+        })
         .collect()
 }
 
-pub struct Analyzer<'tcx> {
+#[derive(Debug, Clone)]
+struct FuncInfo<'tcx> {
+    inputs: usize,
+    param_tys: Vec<TypeInfo>,
+    static_tys: BTreeMap<DefId, Ty<'tcx>>,
+    literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
+    dominating_map: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
+    loop_heads: BTreeSet<Location>,
+}
+
+pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
-    pub inputs: usize,
-    pub param_tys: Vec<TypeInfo>,
-    pub static_tys: BTreeMap<DefId, Ty<'tcx>>,
-    pub literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
-    pub loop_heads: BTreeSet<Location>,
+    info: &'a FuncInfo<'tcx>,
     pub summaries: BTreeMap<DefId, FunctionSummary>,
 
     pub alloc_param_map: BTreeMap<usize, usize>,
@@ -235,23 +244,15 @@ pub struct Analyzer<'tcx> {
     pub label_user_fn_alloc_map: BTreeMap<(Label, RwSets), BTreeMap<usize, usize>>,
 }
 
-impl<'tcx> Analyzer<'tcx> {
-    pub fn new(
+impl<'a, 'tcx> Analyzer<'a, 'tcx> {
+    fn new(
         tcx: TyCtxt<'tcx>,
-        inputs: usize,
-        param_tys: Vec<TypeInfo>,
-        static_tys: BTreeMap<DefId, Ty<'tcx>>,
-        literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
-        loop_heads: BTreeSet<Location>,
+        info: &'a FuncInfo<'tcx>,
         summaries: BTreeMap<DefId, FunctionSummary>,
     ) -> Self {
         Self {
             tcx,
-            inputs,
-            param_tys,
-            static_tys,
-            literal_ty_map,
-            loop_heads,
+            info,
             summaries,
             alloc_param_map: BTreeMap::new(),
             static_allocs: BTreeMap::new(),
@@ -282,7 +283,7 @@ impl<'tcx> Analyzer<'tcx> {
         let mut start_state = AbsState::bot(body.local_decls.len());
         start_state.rw.writes = MustPathSet::top();
 
-        for i in 1..=self.inputs {
+        for i in 1..=self.info.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             if matches!(ty.kind(), TyKind::RawPtr(_)) {
@@ -293,12 +294,12 @@ impl<'tcx> Analyzer<'tcx> {
 
         let init_state = start_state.clone();
 
-        for (def_id, ty) in &self.static_tys {
+        for (def_id, ty) in &self.info.static_tys {
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             self.static_allocs.insert(*def_id, v.heap_addr());
         }
 
-        for (alloc_id, ty) in &self.literal_ty_map {
+        for (alloc_id, ty) in &self.info.literal_ty_map {
             let v = self.top_value_of_ty(ty, Some(&mut start_state.heap), &mut BTreeSet::new());
             let i = start_state.heap.push(v);
             self.literal_allocs.insert(*alloc_id, i);
@@ -310,6 +311,7 @@ impl<'tcx> Analyzer<'tcx> {
         };
         let bot = AbsState::bot(body.local_decls.len());
 
+        let mut merging_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
         loop {
             work_list = WorkList::default();
             work_list.push(start_label.clone());
@@ -346,13 +348,18 @@ impl<'tcx> Analyzer<'tcx> {
                         self.transfer_terminator(terminator, state, &label);
                     (new_next_states, next_locations)
                 };
-                for new_next_state in new_next_states {
-                    for location in &next_locations {
-                        let next_state = states
-                            .get(location)
-                            .and_then(|states| states.get(&new_next_state.rw))
-                            .unwrap_or(&bot);
-                        let joined = next_state.join(&new_next_state);
+                for location in &next_locations {
+                    if merging_blocks.contains(&location.block) {
+                        let next_state = if let Some(states) = states.get(location) {
+                            assert_eq!(states.len(), 1);
+                            states.first_key_value().unwrap().1
+                        } else {
+                            &bot
+                        };
+                        let mut joined = next_state.clone();
+                        for new_next_state in &new_next_states {
+                            joined = joined.join(new_next_state);
+                        }
                         if !joined.ord(next_state) {
                             let max = joined
                                 .local
@@ -363,24 +370,56 @@ impl<'tcx> Analyzer<'tcx> {
                             if let Some(max) = max {
                                 assert!(max < joined.heap.len(), "{:?}", joined);
                             }
+
+                            work_list.retain(|l| l.location != *location);
                             let next_label = Label {
                                 location: *location,
-                                rw: new_next_state.rw.clone(),
+                                rw: joined.rw.clone(),
                             };
-                            states
-                                .entry(*location)
-                                .or_default()
-                                .insert(next_label.rw.clone(), joined);
                             work_list.push(next_label);
+
+                            let mut new_map = BTreeMap::new();
+                            new_map.insert(joined.rw.clone(), joined);
+                            states.insert(*location, new_map);
+                        }
+                    } else {
+                        for new_next_state in &new_next_states {
+                            let next_state = states
+                                .get(location)
+                                .and_then(|states| states.get(&new_next_state.rw))
+                                .unwrap_or(&bot);
+                            let joined = next_state.join(new_next_state);
+                            if !joined.ord(next_state) {
+                                let max = joined
+                                    .local
+                                    .iter()
+                                    .chain(joined.heap.iter())
+                                    .flat_map(|v| v.allocs())
+                                    .max();
+                                if let Some(max) = max {
+                                    assert!(max < joined.heap.len(), "{:?}", joined);
+                                }
+                                let next_label = Label {
+                                    location: *location,
+                                    rw: new_next_state.rw.clone(),
+                                };
+                                states
+                                    .entry(*location)
+                                    .or_default()
+                                    .insert(next_label.rw.clone(), joined);
+                                work_list.push(next_label);
+                            }
                         }
                     }
                 }
                 for next_location in next_locations {
-                    if !self.loop_heads.contains(&next_location) {
+                    if !self.info.loop_heads.contains(&next_location) {
                         continue;
                     }
                     let len = states.get(&next_location).unwrap().keys().len();
                     if len > 10 {
+                        merging_blocks
+                            .extend(self.info.dominating_map.get(&next_location.block).unwrap());
                         restart = true;
                     }
                 }
@@ -397,7 +436,7 @@ impl<'tcx> Analyzer<'tcx> {
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
-        expands_path(&place.0, &self.param_tys, vec![])
+        expands_path(&place.0, &self.info.param_tys, vec![])
             .into_iter()
             .map(AbsPath)
             .collect()
@@ -544,6 +583,10 @@ impl WorkList {
             self.0.push_back(label)
         }
     }
+
+    fn retain<F: FnMut(&Label) -> bool>(&mut self, f: F) {
+        self.0.retain(f)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -653,6 +696,16 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
         }
     }
     None
+}
+
+fn get_dominating_map(body: &Body<'_>) -> BTreeMap<BasicBlock, BTreeSet<BasicBlock>> {
+    let dominators = body.basic_blocks.dominators();
+    let map = body
+        .basic_blocks
+        .indices()
+        .map(|bb| (bb, dominators.dominators(bb).collect()))
+        .collect();
+    graph::inverse(&map)
 }
 
 fn get_loop_heads(body: &Body<'_>) -> BTreeSet<Location> {
