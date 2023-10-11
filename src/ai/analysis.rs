@@ -315,6 +315,8 @@ impl<'tcx> Analyzer<'tcx> {
 
         let bot = AbsState::bot(body.local_decls.len());
         while let Some(label) = work_list.pop() {
+            // let rws: BTreeSet<_> = states.keys().map(|label| &label.rw).collect();
+            // println!("{}, {}", rws.len(), states.len());
             let state = states.get(&label).unwrap_or(&bot);
             tracing::info!("\n{:?}\n{:?}", label, state);
             let Location {

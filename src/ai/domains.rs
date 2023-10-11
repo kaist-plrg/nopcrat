@@ -551,6 +551,12 @@ impl AbsValue {
     pub fn join(&self, other: &Self) -> Self {
         if self.is_top() || other.is_top() {
             Self::top()
+        } else if Arc::ptr_eq(&self.0, &other.0) {
+            self.clone()
+        } else if self.is_bot() {
+            other.clone()
+        } else if other.is_bot() {
+            self.clone()
         } else {
             let intv = self.intv.join(&other.intv);
             let uintv = self.uintv.join(&other.uintv);
