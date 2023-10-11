@@ -14,8 +14,8 @@ use rustc_hir::{
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        visit::Visitor as MVisitor, BasicBlock, Body, ClearCrossCrate, Constant, ConstantKind,
-        Local, LocalInfo, Location, TerminatorKind,
+        visit::Visitor as MVisitor, Body, ClearCrossCrate, Constant, ConstantKind, Local,
+        LocalInfo, Location, TerminatorKind,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -375,15 +375,15 @@ impl<'tcx> Analyzer<'tcx> {
                         }
                     }
                 }
-                // for next_location in next_locations {
-                //     if !self.loop_heads.contains(&next_location) {
-                //         continue;
-                //     }
-                //     let len = states.get(&next_location).unwrap().keys().len();
-                //     if len > 10 {
-                //         restart = true;
-                //     }
-                // }
+                for next_location in next_locations {
+                    if !self.loop_heads.contains(&next_location) {
+                        continue;
+                    }
+                    let len = states.get(&next_location).unwrap().keys().len();
+                    if len > 10 {
+                        restart = true;
+                    }
+                }
                 if restart {
                     break;
                 }
@@ -656,31 +656,17 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
 }
 
 fn get_loop_heads(body: &Body<'_>) -> BTreeSet<Location> {
-    fn aux(
-        bb: BasicBlock,
-        path: &mut Vec<BasicBlock>,
-        heads: &mut BTreeSet<Location>,
-        cfg: &BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
-    ) {
-        if path.contains(&bb) {
-            heads.insert(bb.start_location());
-        } else {
-            path.push(bb);
-            for succ in cfg.get(&bb).unwrap() {
-                aux(*succ, path, heads, cfg);
-            }
-            path.pop();
-        }
-    }
-
-    let cfg: BTreeMap<_, BTreeSet<_>> = body
-        .basic_blocks
+    let dominators = body.basic_blocks.dominators();
+    body.basic_blocks
         .indices()
-        .map(|bb| (bb, body.basic_blocks.successors(bb).collect()))
-        .collect();
-    let mut heads = BTreeSet::new();
-    aux(BasicBlock::from_usize(0), &mut vec![], &mut heads, &cfg);
-    heads
+        .flat_map(|bb| {
+            let mut doms: Vec<_> = dominators.dominators(bb).collect();
+            let succs: BTreeSet<_> = body.basic_blocks.successors(bb).collect();
+            doms.retain(|dom| succs.contains(dom));
+            doms
+        })
+        .map(|bb| bb.start_location())
+        .collect()
 }
 
 fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<Vec<usize>> {
