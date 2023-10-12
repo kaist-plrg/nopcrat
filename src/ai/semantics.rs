@@ -324,12 +324,19 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsValue::alloc(i)
             } else if RETURN_FIRST_FUNCTIONS.contains(fn_name) {
                 args[0].clone()
+            } else if fn_name == "signal" {
+                args[1].clone()
             } else {
                 todo!("{:?}", callee)
             }
         } else {
-            match name.as_str() {
-                "::slice::{impl#0}::as_mut_ptr" | "::slice::{impl#0}::as_ptr" => {
+            let mut segs: Vec<_> = name.split("::").collect();
+            let segs0 = segs.pop().unwrap_or_default();
+            let segs1 = segs.pop().unwrap_or_default();
+            let segs2 = segs.pop().unwrap_or_default();
+            let segs3 = segs.pop().unwrap_or_default();
+            match (segs3, segs2, segs1, segs0) {
+                ("", "slice", _, "as_mut_ptr" | "as_ptr") => {
                     let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                         AbsPtr::alphas(
                             ptrs.iter()
@@ -346,7 +353,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     };
                     AbsValue::ptr(ptr)
                 }
-                "::ptr::mut_ptr::{impl#0}::offset" | "::ptr::const_ptr::{impl#0}::offset" => {
+                ("ptr", "mut_ptr" | "const_ptr", _, "offset") => {
                     let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                         AbsPtr::alphas(
                             ptrs.iter()
@@ -365,7 +372,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     };
                     AbsValue::ptr(ptr)
                 }
-                "::ptr::mut_ptr::{impl#0}::is_null" | "::ptr::const_ptr::{impl#0}::is_null" => {
+                ("ptr", "mut_ptr" | "const_ptr", _, "is_null") => {
                     let b = if let Some(ptrs) = args[0].ptrv.gamma() {
                         AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
                     } else {
@@ -373,15 +380,19 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     };
                     AbsValue::boolean(b)
                 }
-                "::ptr::mut_ptr::{impl#0}::offset_from"
-                | "::ptr::const_ptr::{impl#0}::offset_from" => AbsValue::top_int(),
-                "::ptr::write_volatile" => {
+                ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
+                ("", "", "ptr", "write_volatile") => {
                     self.indirect_assign(&args[0].ptrv, &args[1], &[], &mut state);
                     let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                     writes.extend(writes2);
                     AbsValue::top()
                 }
-                "::option::{impl#0}::is_some" => {
+                ("", "clone", "Clone", "clone") => {
+                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
+                    reads.extend(reads2);
+                    v
+                }
+                ("", "option", _, "is_some") => {
                     let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
                     reads.extend(reads2);
                     match v.optionv {
@@ -391,17 +402,19 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         AbsOption::Bot => AbsValue::bot(),
                     }
                 }
-                "::option::{impl#0}::unwrap" => match &args[0].optionv {
+                ("", "option", _, "unwrap") => match &args[0].optionv {
                     AbsOption::Top => AbsValue::top(),
                     AbsOption::Some(v) => v.clone(),
                     _ => AbsValue::bot(),
                 },
-                "::mem::size_of" => AbsValue::top_uint(),
-                "::panicking::begin_panic" => AbsValue::bot(),
-                _ if name.ends_with("::wrapping_add") => args[0].add(&args[1]),
-                _ if name.ends_with("::wrapping_sub") => args[0].sub(&args[1]),
-                _ if name.ends_with("::wrapping_mul") => args[0].mul(&args[1]),
-                _ if name.ends_with("::wrapping_div") => args[0].div(&args[1]),
+                ("", "", "mem", "size_of") => AbsValue::top_uint(),
+                ("", "", "panicking", "begin_panic") => AbsValue::bot(),
+                ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
+                (_, _, _, "wrapping_add") => args[0].add(&args[1]),
+                (_, _, _, "wrapping_sub") => args[0].sub(&args[1]),
+                (_, _, _, "wrapping_mul") => args[0].mul(&args[1]),
+                (_, _, _, "wrapping_div") => args[0].div(&args[1]),
+                (_, "ffi", _, "arg" | "as_va_list") => AbsValue::top(),
                 _ => todo!("{}", name),
             }
         };
@@ -1038,6 +1051,7 @@ lazy_static! {
         "getcwd",
         "getgroups",
         "getopt_long",
+        "gettimeofday",
         "fgets",
         "fread",
         "longjmp",
@@ -1054,6 +1068,7 @@ lazy_static! {
         "strcpy",
         "strncpy",
         "strtol",
+        "wait3",
     ]
     .into_iter()
     .collect();
