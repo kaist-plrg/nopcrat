@@ -6,8 +6,8 @@ use rustc_const_eval::interpret::{AllocRange, ConstValue, GlobalAlloc, Scalar};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{
-        AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Mutability,
-        Operand, Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Location, Mutability, Operand,
+        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
         TerminatorKind, UnOp,
     },
     ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind, TypeAndMut},
@@ -43,7 +43,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> (Vec<AbsState>, Vec<Location>) {
         tracing::info!("\n{:?}", terminator);
         match &terminator.kind {
-            TerminatorKind::Goto { target } => (vec![state.clone()], vec![block_entry(*target)]),
+            TerminatorKind::Goto { target } => (vec![state.clone()], vec![target.start_location()]),
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
@@ -52,13 +52,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     v.boolv
                         .gamma()
                         .into_iter()
-                        .map(|b| block_entry(targets.target_for_value(b as _)))
+                        .map(|b| targets.target_for_value(b as _).start_location())
                         .collect()
                 } else {
                     targets
                         .all_targets()
                         .iter()
-                        .map(|target| block_entry(*target))
+                        .map(|target| target.start_location())
                         .collect()
                 };
                 (vec![new_state], locations)
@@ -68,7 +68,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::Return => (vec![], vec![]),
             TerminatorKind::Unreachable => (vec![], vec![]),
             TerminatorKind::Drop { target, .. } => {
-                (vec![state.clone()], vec![block_entry(*target)])
+                (vec![state.clone()], vec![target.start_location()])
             }
             TerminatorKind::Call {
                 func,
@@ -117,7 +117,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 } else {
                     target
                         .as_ref()
-                        .map(|target| vec![block_entry(*target)])
+                        .map(|target| vec![target.start_location()])
                         .unwrap_or(vec![])
                 };
                 (new_states, locations)
@@ -126,13 +126,19 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
-                (vec![new_state], vec![block_entry(*target)])
+                (vec![new_state], vec![target.start_location()])
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseEdge { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseUnwind { .. } => unreachable!("{:?}", terminator.kind),
-            TerminatorKind::InlineAsm { .. } => unreachable!("{:?}", terminator.kind),
+            TerminatorKind::InlineAsm { destination, .. } => {
+                let mut locations = vec![];
+                if let Some(dst) = destination {
+                    locations.push(dst.start_location());
+                }
+                (vec![state.clone()], locations)
+            }
         }
     }
 
@@ -502,11 +508,22 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "", "mem", "size_of") => AbsValue::top_uint(),
             ("", "", "panicking", "begin_panic") => AbsValue::bot(),
             ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
-            (_, _, _, "wrapping_add") => args[0].add(&args[1]),
-            (_, _, _, "wrapping_sub") => args[0].sub(&args[1]),
-            (_, _, _, "wrapping_mul") => args[0].mul(&args[1]),
-            (_, _, _, "wrapping_div") => args[0].div(&args[1]),
+            ("", "num", _, "wrapping_add") => args[0].add(&args[1]),
+            ("", "num", _, "wrapping_sub") => args[0].sub(&args[1]),
+            ("", "num", _, "wrapping_mul") => args[0].mul(&args[1]),
+            ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
+            ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
+            (_, "f64", _, "is_finite") => AbsValue::top_bool(),
             (_, "ffi", _, "arg" | "as_va_list") => AbsValue::top(),
+            ("", "", "AsmCastTrait", "cast_in") => AbsValue::top(),
+            ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
+            ("", "unix", _, "memcpy") => {
+                let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
+                reads.extend(reads2);
+                let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
+                writes.extend(writes2);
+                args[0].clone()
+            }
             _ => todo!("{}", name),
         }
     }
@@ -1119,12 +1136,5 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsList::Bot => AbsValue::bot(),
             },
         }
-    }
-}
-
-fn block_entry(block: BasicBlock) -> Location {
-    Location {
-        block,
-        statement_index: 0,
     }
 }

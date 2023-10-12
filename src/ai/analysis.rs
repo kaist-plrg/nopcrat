@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     path::Path,
 };
@@ -153,6 +153,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
             let literal_ty_map = get_alloc_ty_map(body, tcx);
             let dominating_map = get_dominating_map(body);
             let loop_heads = get_loop_heads(body);
+            let rpo_map = get_rpo_map(body);
             let info = FuncInfo {
                 inputs,
                 static_tys,
@@ -160,6 +161,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
                 literal_ty_map,
                 dominating_map,
                 loop_heads,
+                rpo_map,
             };
             (*def_id, info)
         })
@@ -230,6 +232,7 @@ struct FuncInfo<'tcx> {
     literal_ty_map: BTreeMap<AllocId, Ty<'tcx>>,
     dominating_map: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     loop_heads: BTreeSet<Location>,
+    rpo_map: BTreeMap<BasicBlock, usize>,
 }
 
 pub struct Analyzer<'a, 'tcx> {
@@ -277,7 +280,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &mut self,
         body: &Body<'tcx>,
     ) -> (BTreeMap<Location, BTreeMap<RwSets, AbsState>>, AbsState) {
-        let mut work_list: WorkList;
+        let mut work_list: WorkList<'_>;
         let mut states: BTreeMap<Location, BTreeMap<RwSets, AbsState>>;
 
         let mut start_state = AbsState::bot(body.local_decls.len());
@@ -313,7 +316,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let mut merging_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
         loop {
-            work_list = WorkList::default();
+            work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
             states = BTreeMap::new();
@@ -371,7 +374,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 assert!(max < joined.heap.len(), "{:?}", joined);
                             }
 
-                            work_list.retain(|l| l.location != *location);
+                            work_list.remove_location(*location);
                             let next_label = Label {
                                 location: *location,
                                 rw: joined.rw.clone(),
@@ -417,7 +420,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         continue;
                     }
                     let len = states.get(&next_location).unwrap().keys().len();
-                    if len > 10 {
+                    if len > 3 {
                         merging_blocks
                             .extend(self.info.dominating_map.get(&next_location.block).unwrap());
                         restart = true;
@@ -574,22 +577,49 @@ pub struct Label {
     pub rw: RwSets,
 }
 
-#[derive(Default, Debug)]
-struct WorkList(VecDeque<Label>);
+#[derive(Debug)]
+struct WorkList<'a> {
+    rpo_map: &'a BTreeMap<BasicBlock, usize>,
+    labels: BTreeMap<(usize, usize), Vec<Label>>,
+}
 
-impl WorkList {
-    fn pop(&mut self) -> Option<Label> {
-        self.0.pop_front()
-    }
-
-    fn push(&mut self, label: Label) {
-        if !self.0.contains(&label) {
-            self.0.push_back(label)
+impl<'a> WorkList<'a> {
+    fn new(rpo_map: &'a BTreeMap<BasicBlock, usize>) -> Self {
+        Self {
+            rpo_map,
+            labels: BTreeMap::new(),
         }
     }
 
-    fn retain<F: FnMut(&Label) -> bool>(&mut self, f: F) {
-        self.0.retain(f)
+    fn pop(&mut self) -> Option<Label> {
+        let mut entry = self.labels.first_entry()?;
+        let labels = entry.get_mut();
+        let label = labels.pop().unwrap();
+        if labels.is_empty() {
+            entry.remove();
+        }
+        Some(label)
+    }
+
+    fn push(&mut self, label: Label) {
+        let block_idx = self.rpo_map.get(&label.location.block).unwrap();
+        let labels = self
+            .labels
+            .entry((*block_idx, label.location.statement_index))
+            .or_default();
+        if !labels.contains(&label) {
+            labels.push(label)
+        }
+    }
+
+    fn remove_location(&mut self, location: Location) {
+        let block_idx = self.rpo_map.get(&location.block).unwrap();
+        self.labels.remove(&(*block_idx, location.statement_index));
+    }
+
+    #[allow(unused)]
+    fn len(&self) -> usize {
+        self.labels.values().map(|v| v.len()).sum()
     }
 }
 
@@ -702,6 +732,15 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
     None
 }
 
+fn get_rpo_map(body: &Body<'_>) -> BTreeMap<BasicBlock, usize> {
+    body.basic_blocks
+        .reverse_postorder()
+        .iter()
+        .enumerate()
+        .map(|(i, bb)| (*bb, i))
+        .collect()
+}
+
 fn get_dominating_map(body: &Body<'_>) -> BTreeMap<BasicBlock, BTreeSet<BasicBlock>> {
     let dominators = body.basic_blocks.dominators();
     let map = body
@@ -748,4 +787,12 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
             })
             .collect()
     }
+}
+
+#[allow(unused)]
+fn body_size(body: &Body<'_>) -> usize {
+    body.basic_blocks
+        .iter()
+        .map(|bbd| bbd.statements.len() + bbd.terminator.is_some() as usize)
+        .sum()
 }
