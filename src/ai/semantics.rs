@@ -23,7 +23,11 @@ use super::{
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
-        tracing::info!("\n{:?}", stmt);
+        tracing::info!(
+            "\n{}\n{:?}",
+            self.span_to_string(stmt.source_info.span),
+            stmt
+        );
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             let (new_v, reads) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
@@ -41,7 +45,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         state: &AbsState,
         label: &Label,
     ) -> (Vec<AbsState>, Vec<Location>) {
-        tracing::info!("\n{:?}", terminator);
+        tracing::info!(
+            "\n{}\n{:?}",
+            self.span_to_string(terminator.source_info.span),
+            terminator
+        );
         match &terminator.kind {
             TerminatorKind::Goto { target } => (vec![state.clone()], vec![target.start_location()]),
             TerminatorKind::SwitchInt { discr, targets } => {
@@ -475,7 +483,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 writes.extend(writes2);
                 AbsValue::top()
             }
-            ("", "clone", "Clone", "clone") => {
+            ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") => {
                 let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
                 reads.extend(reads2);
                 v
@@ -514,8 +522,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
             (_, "f64", _, "is_finite") => AbsValue::top_bool(),
-            (_, "ffi", _, "arg" | "as_va_list") => AbsValue::top(),
-            ("", "", "AsmCastTrait", "cast_in") => AbsValue::top(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
                 let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
@@ -523,6 +529,37 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
                 args[0].clone()
+            }
+            (_, "ffi", _, "arg" | "as_va_list")
+            | ("", "", "AsmCastTrait", "cast_in")
+            | ("", "f128_t", _, "new")
+            | ("", "convert", "From", "from")
+            | (
+                "ops",
+                "arith",
+                "Add" | "BitAnd" | "BitOr" | "BitXor" | "Div" | "Mul" | "Neg" | "Not" | "Rem"
+                | "Shl" | "Shr" | "Sub",
+                _,
+            ) => AbsValue::top(),
+            (
+                "ops",
+                "arith",
+                "AddAssign" | "BitAndAssign" | "BitOrAssign" | "BitXorAssign" | "DivAssign"
+                | "MulAssign" | "RemAssign" | "ShlAssign" | "ShrAssign" | "SubAssign",
+                _,
+            )
+            | ("", "cast", "ToPrimitive", "to_i64") => {
+                let reads0 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
+                reads.extend(reads0);
+                AbsValue::top()
+            }
+            ("", "cmp", "PartialOrd", "lt" | "le" | "gt" | "ge")
+            | ("", "cmp", "PartialEq", "eq" | "ne") => {
+                let reads0 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
+                let reads1 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
+                reads.extend(reads0);
+                reads.extend(reads1);
+                AbsValue::top_bool()
             }
             _ => todo!("{}", name),
         }
@@ -573,11 +610,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             Rvalue::Cast(kind, operand, ty) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match kind {
-                    CastKind::PointerExposeAddress => todo!("{:?}", rvalue),
+                    CastKind::PointerExposeAddress => {
+                        self.top_value_of_ty(ty, None, &mut BTreeSet::new())
+                    }
                     CastKind::PointerFromExposedAddress => {
                         let zero: BTreeSet<u128> = [0].into_iter().collect();
-                        assert_eq!(v.uintv.gamma().unwrap(), &zero);
-                        AbsValue::null()
+                        if v.uintv.gamma().unwrap() == &zero {
+                            AbsValue::null()
+                        } else {
+                            AbsValue::top_ptr()
+                        }
                     }
                     CastKind::PointerCoercion(coercion) => match coercion {
                         PointerCoercion::ReifyFnPointer => v,
@@ -767,7 +809,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         match constant.literal {
             ConstantKind::Ty(_) => unreachable!("{:?}", constant),
             ConstantKind::Unevaluated(constant, ty) => {
-                if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
+                if ty.is_ref() {
+                    AbsValue::top()
+                } else if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
                     self.transfer_const_value(&v, &ty)
                 } else {
                     self.top_value_of_ty(&ty, None, &mut BTreeSet::new())
@@ -852,7 +896,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     unreachable!("{:?}", msg)
                 }
             }
-            ConstValue::ByRef { .. } => unreachable!("{:?}", v),
+            ConstValue::ByRef { .. } => AbsValue::top(),
         }
     }
 
