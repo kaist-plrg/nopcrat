@@ -530,10 +530,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 writes.extend(writes2);
                 args[0].clone()
             }
+            ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
             (_, "ffi", _, "arg" | "as_va_list")
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
             | ("", "convert", "From", "from")
+            | ("", "", "vec", "from_elem")
             | (
                 "ops",
                 "arith",
@@ -615,7 +617,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                     CastKind::PointerFromExposedAddress => {
                         let zero: BTreeSet<u128> = [0].into_iter().collect();
-                        if v.uintv.gamma().unwrap() == &zero {
+                        if v.uintv.gamma().map(|s| s == &zero).unwrap_or(false) {
                             AbsValue::null()
                         } else {
                             AbsValue::top_ptr()
