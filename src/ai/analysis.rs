@@ -20,7 +20,7 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
-use rustc_span::def_id::DefId;
+use rustc_span::{def_id::DefId, Span};
 
 use super::domains::*;
 use crate::{rustc_data_structures::graph::WithSuccessors as _, *};
@@ -444,6 +444,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
         self.tcx.def_path(def_id).to_string_no_crate_verbose()
+    }
+
+    pub fn span_to_string(&self, span: Span) -> String {
+        self.tcx.sess.source_map().span_to_snippet(span).unwrap()
     }
 }
 

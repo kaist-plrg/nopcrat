@@ -542,3 +542,50 @@ fn test_volatile_write() {
     assert_eq!(result[0].rw.writes.as_vec()[0].0, vec![2]);
     assert_eq!(result[0].rw.reads.len(), 0);
 }
+
+#[test]
+fn test_bitfields() {
+    let code = "
+        extern crate libc;
+        #[macro_use]
+        extern crate c2rust_bitfields;
+        #[derive(BitfieldStruct)]
+        struct S {
+            #[bitfield(name = \"x\", ty = \"libc::c_uint\", bits = \"0..=0\")]
+            a: [u8; 1],
+        }
+        unsafe fn f(s: *mut S) -> libc::c_uint {
+            (*s).x()
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert!(ret(&result[0]).uintv.is_top());
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1, 0]);
+}
+
+#[test]
+fn test_bitfields_set() {
+    let code = "
+        extern crate libc;
+        #[macro_use]
+        extern crate c2rust_bitfields;
+        #[derive(BitfieldStruct)]
+        struct S {
+            #[bitfield(name = \"x\", ty = \"libc::c_uint\", bits = \"0..=0\")]
+            a: [u8; 1],
+        }
+        unsafe fn f(s: *mut S) {
+            (*s).set_x(0)
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+
+    assert_eq!(result[0].rw.writes.len(), 0);
+    assert_eq!(result[0].rw.reads.len(), 1);
+    assert_eq!(result[0].rw.reads.as_vec()[0].0, vec![1, 0]);
+}

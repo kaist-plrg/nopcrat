@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
-use lazy_static::lazy_static;
 use rustc_abi::{FieldIdx, Size, VariantIdx};
 use rustc_const_eval::interpret::{AllocRange, ConstValue, GlobalAlloc, Scalar};
+use rustc_hir as hir;
 use rustc_middle::{
     mir::{
         AggregateKind, BasicBlock, BinOp, CastKind, Constant, ConstantKind, Location, Mutability,
@@ -15,7 +15,10 @@ use rustc_middle::{
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
-use super::{analysis::Label, domains::*};
+use super::{
+    analysis::{FunctionSummary, Label},
+    domains::*,
+};
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
@@ -146,283 +149,366 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                if summary.return_states.is_empty() {
-                    return vec![];
-                }
-
-                let mut ptr_maps = BTreeMap::new();
-                let mut allocs = BTreeSet::new();
-                for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
-                    for (param_ptr, arg_ptr) in param.compare_pointers(arg) {
-                        let alloc = param_ptr.heap_addr();
-                        let _ = ptr_maps.try_insert(alloc, arg_ptr.clone());
-                        allocs.insert(alloc);
-                    }
-                }
-                while let Some(alloc) = allocs.pop_first() {
-                    let arg_ptr = ptr_maps.get(&alloc).unwrap();
-                    let (arg, _) = self.read_ptr(arg_ptr, &[], &state);
-                    let param = summary.init_state.heap.get(alloc);
-                    for (param_ptr, arg_ptr) in param.compare_pointers(&arg) {
-                        let alloc = param_ptr.heap_addr();
-                        if ptr_maps.try_insert(alloc, arg_ptr.clone()).is_ok() {
-                            allocs.insert(alloc);
-                        }
-                    }
-                }
-
-                let mut states = vec![];
-                for return_state in &summary.return_states {
-                    let mut state = state.clone();
-                    let mut ptr_maps = ptr_maps.clone();
-                    let ret_v = return_state.local.get(0);
-                    let mut allocs: BTreeSet<_> = ptr_maps
-                        .keys()
-                        .map(|p| return_state.heap.get(*p))
-                        .chain(std::iter::once(ret_v))
-                        .flat_map(|v| v.allocs())
-                        .collect();
-                    let label_alloc_map = self
-                        .label_user_fn_alloc_map
-                        .entry((label.clone(), return_state.rw.clone()))
-                        .or_default();
-                    while let Some(alloc) = allocs.pop_first() {
-                        ptr_maps.entry(alloc).or_insert_with(|| {
-                            let alloc_v = return_state.heap.get(alloc);
-                            allocs.extend(alloc_v.allocs());
-                            let i = if let Some(i) = label_alloc_map.get(&alloc) {
-                                if *i < state.heap.len() {
-                                    let old_v = state.heap.get_mut(*i);
-                                    *old_v = old_v.join(alloc_v);
-                                    *i
-                                } else {
-                                    state.heap.push(alloc_v.clone())
-                                }
-                            } else {
-                                state.heap.push(alloc_v.clone())
-                            };
-                            label_alloc_map.insert(alloc, i);
-                            AbsPtr::alloc(i)
-                        });
-                    }
-                    for (p, a) in &ptr_maps {
-                        let v = return_state.heap.get(*p).subst(&ptr_maps);
-                        self.indirect_assign(a, &v, &[], &mut state);
-                    }
-                    let ret_v = ret_v.subst(&ptr_maps);
-                    let (mut state, writes) = self.assign(dst, ret_v, &state);
-                    let callee_reads: Vec<_> = return_state
-                        .rw
-                        .reads
-                        .iter()
-                        .filter_map(|read| {
-                            let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
-                                ptrs
-                            } else {
-                                return None;
-                            };
-                            Some(ptrs.iter().filter_map(|ptr| {
-                                let (mut path, _) =
-                                    AbsPath::from_place(ptr, &self.alloc_param_map)?;
-                                path.0.extend(read.0[1..].to_owned());
-                                Some(path)
-                            }))
-                        })
-                        .flatten()
-                        .collect();
-                    let callee_writes: Vec<_> = return_state
-                        .rw
-                        .writes
-                        .iter()
-                        .filter_map(|write| {
-                            let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
-                                if ptrs.len() == 1 {
-                                    ptrs.first().unwrap()
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                return None;
-                            };
-                            let (mut path, array_access) =
-                                AbsPath::from_place(ptr, &self.alloc_param_map)?;
-                            if array_access {
-                                return None;
-                            }
-                            path.0.extend(write.0[1..].to_owned());
-                            Some(path)
-                        })
-                        .collect();
-                    state.add_reads(reads.clone().into_iter());
-                    state.add_reads(callee_reads.into_iter());
-                    state.add_writes(callee_writes.into_iter());
-                    state.add_writes(writes.into_iter());
-                    states.push(state)
-                }
-                return states;
-            }
-
-            let sig = self.tcx.fn_sig(callee).skip_binder();
-            let inputs = sig.inputs().skip_binder();
-            let output = sig.output().skip_binder();
-
-            assert!(name.contains("{extern#0}"));
-            let fn_name = name.split("::").last().unwrap();
-            let (read_args, write_args) = if inputs.iter().all(|ty| ty.is_primitive())
-                || fn_name == "free"
-                || fn_name == "realloc"
-                || fn_name == "regfree"
-            {
-                (vec![], vec![])
+                return self.transfer_intra_call(&summary.clone(), args, dst, state, reads, label);
+            } else if name.contains("{extern#0}") {
+                self.transfer_c_call(callee, args, &mut state, &mut reads, &mut writes, label)
+            } else if name.contains("{impl#") {
+                self.transfer_method_call(callee, args, &mut reads)
             } else {
-                let (const_ptrs, mut_ptrs): (Vec<_>, Vec<_>) = inputs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, ty)| {
-                        if let TyKind::RawPtr(TypeAndMut { ty, mutbl }) = ty.kind() {
-                            if let TyKind::Adt(adt, _) = ty.kind() {
-                                if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
-                                    return None;
-                                }
-                            }
-                            return Some((i, mutbl));
-                        }
-                        None
-                    })
-                    .partition(|(_, mutbl)| matches!(mutbl, Mutability::Not));
-                let const_ptrs: Vec<_> = const_ptrs.into_iter().map(|(i, _)| i).collect();
-                let mut_ptrs: Vec<_> = mut_ptrs.into_iter().map(|(i, _)| i).collect();
-                if mut_ptrs.is_empty() || WRITE_FUNCTIONS.contains(fn_name) {
-                    (const_ptrs, mut_ptrs)
-                } else {
-                    todo!("{:?}", callee)
-                }
-            };
-            for arg in read_args {
-                let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
-                reads.extend(reads2);
-            }
-            for arg in write_args {
-                let writes2 = self.get_write_paths_of_ptr(&args[arg].ptrv, &[]);
-                writes.extend(writes2);
-            }
-
-            if output.is_primitive() || output.is_unit() || output.is_never() {
-                self.top_value_of_ty(&output, None, &mut BTreeSet::new())
-            } else if ALLOC_FUNCTIONS.contains(fn_name) {
-                let i = if let Some(i) = self.label_alloc_map.get(label) {
-                    if *i < state.heap.len() {
-                        *state.heap.get_mut(*i) = AbsValue::top();
-                        *i
-                    } else {
-                        state.heap.push(AbsValue::top())
-                    }
-                } else {
-                    state.heap.push(AbsValue::top())
-                };
-                self.label_alloc_map.insert(label.clone(), i);
-                AbsValue::alloc(i)
-            } else if RETURN_FIRST_FUNCTIONS.contains(fn_name) {
-                args[0].clone()
-            } else if fn_name == "signal" {
-                args[1].clone()
-            } else {
-                todo!("{:?}", callee)
+                unreachable!("{}", name)
             }
         } else {
-            let mut segs: Vec<_> = name.split("::").collect();
-            let segs0 = segs.pop().unwrap_or_default();
-            let segs1 = segs.pop().unwrap_or_default();
-            let segs2 = segs.pop().unwrap_or_default();
-            let segs3 = segs.pop().unwrap_or_default();
-            match (segs3, segs2, segs1, segs0) {
-                ("", "slice", _, "as_mut_ptr" | "as_ptr") => {
-                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                        AbsPtr::alphas(
-                            ptrs.iter()
-                                .cloned()
-                                .map(|mut ptr| {
-                                    let zero = AbsUint::alpha(0);
-                                    ptr.projection.push(AbsProjElem::Index(zero));
-                                    ptr
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        AbsPtr::top()
-                    };
-                    AbsValue::ptr(ptr)
-                }
-                ("ptr", "mut_ptr" | "const_ptr", _, "offset") => {
-                    let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
-                        AbsPtr::alphas(
-                            ptrs.iter()
-                                .cloned()
-                                .map(|mut ptr| {
-                                    let last = ptr.projection.last_mut();
-                                    if let Some(AbsProjElem::Index(i)) = last {
-                                        *i = i.to_i64().add(&args[1].intv).to_u64();
-                                    }
-                                    ptr
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        AbsPtr::top()
-                    };
-                    AbsValue::ptr(ptr)
-                }
-                ("ptr", "mut_ptr" | "const_ptr", _, "is_null") => {
-                    let b = if let Some(ptrs) = args[0].ptrv.gamma() {
-                        AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
-                    } else {
-                        AbsBool::Top
-                    };
-                    AbsValue::boolean(b)
-                }
-                ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
-                ("", "", "ptr", "write_volatile") => {
-                    self.indirect_assign(&args[0].ptrv, &args[1], &[], &mut state);
-                    let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
-                    writes.extend(writes2);
-                    AbsValue::top()
-                }
-                ("", "clone", "Clone", "clone") => {
-                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
-                    reads.extend(reads2);
-                    v
-                }
-                ("", "option", _, "is_some") => {
-                    let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], &state);
-                    reads.extend(reads2);
-                    match v.optionv {
-                        AbsOption::Top => AbsValue::top_bool(),
-                        AbsOption::Some(_) => AbsValue::bool_true(),
-                        AbsOption::None => AbsValue::bool_false(),
-                        AbsOption::Bot => AbsValue::bot(),
-                    }
-                }
-                ("", "option", _, "unwrap") => match &args[0].optionv {
-                    AbsOption::Top => AbsValue::top(),
-                    AbsOption::Some(v) => v.clone(),
-                    _ => AbsValue::bot(),
-                },
-                ("", "", "mem", "size_of") => AbsValue::top_uint(),
-                ("", "", "panicking", "begin_panic") => AbsValue::bot(),
-                ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
-                (_, _, _, "wrapping_add") => args[0].add(&args[1]),
-                (_, _, _, "wrapping_sub") => args[0].sub(&args[1]),
-                (_, _, _, "wrapping_mul") => args[0].mul(&args[1]),
-                (_, _, _, "wrapping_div") => args[0].div(&args[1]),
-                (_, "ffi", _, "arg" | "as_va_list") => AbsValue::top(),
-                _ => todo!("{}", name),
-            }
+            self.transfer_rust_call(callee, args, &mut state, &mut reads, &mut writes)
         };
         let (mut new_state, writes_ret) = self.assign(dst, v, &state);
         new_state.add_reads(reads.into_iter());
         new_state.add_writes(writes.into_iter());
         new_state.add_writes(writes_ret.into_iter());
         vec![new_state]
+    }
+
+    fn transfer_intra_call(
+        &mut self,
+        summary: &FunctionSummary,
+        args: &[AbsValue],
+        dst: &Place<'tcx>,
+        state: AbsState,
+        reads: Vec<AbsPath>,
+        label: &Label,
+    ) -> Vec<AbsState> {
+        if summary.return_states.is_empty() {
+            return vec![];
+        }
+
+        let mut ptr_maps = BTreeMap::new();
+        let mut allocs = BTreeSet::new();
+        for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
+            for (param_ptr, arg_ptr) in param.compare_pointers(arg) {
+                let alloc = param_ptr.heap_addr();
+                let _ = ptr_maps.try_insert(alloc, arg_ptr.clone());
+                allocs.insert(alloc);
+            }
+        }
+        while let Some(alloc) = allocs.pop_first() {
+            let arg_ptr = ptr_maps.get(&alloc).unwrap();
+            let (arg, _) = self.read_ptr(arg_ptr, &[], &state);
+            let param = summary.init_state.heap.get(alloc);
+            for (param_ptr, arg_ptr) in param.compare_pointers(&arg) {
+                let alloc = param_ptr.heap_addr();
+                if ptr_maps.try_insert(alloc, arg_ptr.clone()).is_ok() {
+                    allocs.insert(alloc);
+                }
+            }
+        }
+
+        let mut states = vec![];
+        for return_state in &summary.return_states {
+            let mut state = state.clone();
+            let mut ptr_maps = ptr_maps.clone();
+            let ret_v = return_state.local.get(0);
+            let mut allocs: BTreeSet<_> = ptr_maps
+                .keys()
+                .map(|p| return_state.heap.get(*p))
+                .chain(std::iter::once(ret_v))
+                .flat_map(|v| v.allocs())
+                .collect();
+            let label_alloc_map = self
+                .label_user_fn_alloc_map
+                .entry((label.clone(), return_state.rw.clone()))
+                .or_default();
+            while let Some(alloc) = allocs.pop_first() {
+                ptr_maps.entry(alloc).or_insert_with(|| {
+                    let alloc_v = return_state.heap.get(alloc);
+                    allocs.extend(alloc_v.allocs());
+                    let i = if let Some(i) = label_alloc_map.get(&alloc) {
+                        if *i < state.heap.len() {
+                            let old_v = state.heap.get_mut(*i);
+                            *old_v = old_v.join(alloc_v);
+                            *i
+                        } else {
+                            state.heap.push(alloc_v.clone())
+                        }
+                    } else {
+                        state.heap.push(alloc_v.clone())
+                    };
+                    label_alloc_map.insert(alloc, i);
+                    AbsPtr::alloc(i)
+                });
+            }
+            for (p, a) in &ptr_maps {
+                let v = return_state.heap.get(*p).subst(&ptr_maps);
+                self.indirect_assign(a, &v, &[], &mut state);
+            }
+            let ret_v = ret_v.subst(&ptr_maps);
+            let (mut state, writes) = self.assign(dst, ret_v, &state);
+            let callee_reads: Vec<_> = return_state
+                .rw
+                .reads
+                .iter()
+                .filter_map(|read| {
+                    let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
+                        ptrs
+                    } else {
+                        return None;
+                    };
+                    Some(ptrs.iter().filter_map(|ptr| {
+                        let (mut path, _) = AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                        path.0.extend(read.0[1..].to_owned());
+                        Some(path)
+                    }))
+                })
+                .flatten()
+                .collect();
+            let callee_writes: Vec<_> = return_state
+                .rw
+                .writes
+                .iter()
+                .filter_map(|write| {
+                    let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
+                        if ptrs.len() == 1 {
+                            ptrs.first().unwrap()
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    };
+                    let (mut path, array_access) = AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                    if array_access {
+                        return None;
+                    }
+                    path.0.extend(write.0[1..].to_owned());
+                    Some(path)
+                })
+                .collect();
+            state.add_reads(reads.clone().into_iter());
+            state.add_reads(callee_reads.into_iter());
+            state.add_writes(callee_writes.into_iter());
+            state.add_writes(writes.into_iter());
+            states.push(state)
+        }
+        states
+    }
+
+    fn transfer_method_call(
+        &self,
+        callee: DefId,
+        args: &[AbsValue],
+        reads: &mut Vec<AbsPath>,
+    ) -> AbsValue {
+        let node = self.tcx.hir().get_if_local(callee).unwrap();
+        if let hir::Node::ImplItem(item) = node {
+            let span_str = self.span_to_string(item.span);
+            assert_eq!(span_str, "BitfieldStruct", "{:?} {}", callee, span_str);
+            let reads2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
+            reads.extend(reads2);
+            if let hir::ImplItemKind::Fn(sig, _) = &item.kind {
+                match &sig.decl.output {
+                    hir::FnRetTy::Return(ty) => {
+                        if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = &ty.kind {
+                            if let hir::def::Res::Def(_, def_id) = path.res {
+                                let ty = self.def_id_to_string(def_id);
+                                let ty = ty.split("::").last().unwrap();
+                                let v = match ty {
+                                    "c_int" => AbsValue::top_int(),
+                                    "c_uint" => AbsValue::top_uint(),
+                                    _ => todo!("{}", ty),
+                                };
+                                return v;
+                            }
+                        }
+                    }
+                    hir::FnRetTy::DefaultReturn(_) => {
+                        let name = item.ident.name.to_ident_string();
+                        assert!(name.starts_with("set_"), "{:?}", callee);
+                        return AbsValue::bot();
+                    }
+                }
+            }
+        }
+        unreachable!("{:?}", callee)
+    }
+
+    fn transfer_c_call(
+        &mut self,
+        callee: DefId,
+        args: &[AbsValue],
+        state: &mut AbsState,
+        reads: &mut Vec<AbsPath>,
+        writes: &mut Vec<AbsPath>,
+        label: &Label,
+    ) -> AbsValue {
+        let sig = self.tcx.fn_sig(callee).skip_binder();
+        let inputs = sig.inputs().skip_binder();
+        let output = sig.output().skip_binder();
+
+        let name = self.def_id_to_string(callee);
+        let fn_name = name.split("::").last().unwrap();
+
+        let (read_args, write_args) = if inputs.iter().all(|ty| ty.is_primitive())
+            || fn_name == "free"
+            || fn_name == "realloc"
+            || fn_name == "regfree"
+            || fn_name == "dlclose"
+        {
+            (vec![], vec![])
+        } else if fn_name == "dlsym" {
+            (vec![0, 1], vec![])
+        } else {
+            let (const_ptrs, mut_ptrs): (Vec<_>, Vec<_>) = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, ty)| {
+                    if let TyKind::RawPtr(TypeAndMut { ty, mutbl }) = ty.kind() {
+                        if let TyKind::Adt(adt, _) = ty.kind() {
+                            if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
+                                return None;
+                            }
+                        }
+                        return Some((i, mutbl));
+                    }
+                    None
+                })
+                .partition(|(_, mutbl)| matches!(mutbl, Mutability::Not));
+            let const_ptrs: Vec<_> = const_ptrs.into_iter().map(|(i, _)| i).collect();
+            let mut_ptrs: Vec<_> = mut_ptrs.into_iter().map(|(i, _)| i).collect();
+            (const_ptrs, mut_ptrs)
+        };
+        for arg in read_args {
+            let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
+            reads.extend(reads2);
+        }
+        for arg in write_args {
+            let writes2 = self.get_write_paths_of_ptr(&args[arg].ptrv, &[]);
+            writes.extend(writes2);
+        }
+
+        if output.is_primitive() || output.is_unit() || output.is_never() {
+            self.top_value_of_ty(&output, None, &mut BTreeSet::new())
+        } else if output.is_unsafe_ptr() {
+            let i = if let Some(i) = self.label_alloc_map.get(label) {
+                if *i < state.heap.len() {
+                    *state.heap.get_mut(*i) = AbsValue::top();
+                    *i
+                } else {
+                    state.heap.push(AbsValue::top())
+                }
+            } else {
+                state.heap.push(AbsValue::top())
+            };
+            self.label_alloc_map.insert(label.clone(), i);
+            AbsValue::alloc(i)
+        } else {
+            AbsValue::top()
+        }
+    }
+
+    fn transfer_rust_call(
+        &self,
+        callee: DefId,
+        args: &[AbsValue],
+        state: &mut AbsState,
+        reads: &mut Vec<AbsPath>,
+        writes: &mut Vec<AbsPath>,
+    ) -> AbsValue {
+        let name = self.def_id_to_string(callee);
+        let mut segs: Vec<_> = name.split("::").collect();
+        let segs0 = segs.pop().unwrap_or_default();
+        let segs1 = segs.pop().unwrap_or_default();
+        let segs2 = segs.pop().unwrap_or_default();
+        let segs3 = segs.pop().unwrap_or_default();
+        match (segs3, segs2, segs1, segs0) {
+            ("", "slice", _, "as_mut_ptr" | "as_ptr") => {
+                let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                    AbsPtr::alphas(
+                        ptrs.iter()
+                            .cloned()
+                            .map(|mut ptr| {
+                                let zero = AbsUint::alpha(0);
+                                ptr.projection.push(AbsProjElem::Index(zero));
+                                ptr
+                            })
+                            .collect(),
+                    )
+                } else {
+                    AbsPtr::top()
+                };
+                AbsValue::ptr(ptr)
+            }
+            ("ptr", "mut_ptr" | "const_ptr", _, "offset") => {
+                let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
+                    AbsPtr::alphas(
+                        ptrs.iter()
+                            .cloned()
+                            .map(|mut ptr| {
+                                let last = ptr.projection.last_mut();
+                                if let Some(AbsProjElem::Index(i)) = last {
+                                    *i = i.to_i64().add(&args[1].intv).to_u64();
+                                }
+                                ptr
+                            })
+                            .collect(),
+                    )
+                } else {
+                    AbsPtr::top()
+                };
+                AbsValue::ptr(ptr)
+            }
+            ("ptr", "mut_ptr" | "const_ptr", _, "is_null") => {
+                let b = if let Some(ptrs) = args[0].ptrv.gamma() {
+                    AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
+                } else {
+                    AbsBool::Top
+                };
+                AbsValue::boolean(b)
+            }
+            ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
+            ("", "", "ptr", "write_volatile") => {
+                self.indirect_assign(&args[0].ptrv, &args[1], &[], state);
+                let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
+                writes.extend(writes2);
+                AbsValue::top()
+            }
+            ("", "clone", "Clone", "clone") => {
+                let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
+                reads.extend(reads2);
+                v
+            }
+            ("", "option", _, "is_some") => {
+                let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
+                reads.extend(reads2);
+                match v.optionv {
+                    AbsOption::Top => AbsValue::top_bool(),
+                    AbsOption::Some(_) => AbsValue::bool_true(),
+                    AbsOption::None => AbsValue::bool_false(),
+                    AbsOption::Bot => AbsValue::bot(),
+                }
+            }
+            ("", "option", _, "is_none") => {
+                let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
+                reads.extend(reads2);
+                match v.optionv {
+                    AbsOption::Top => AbsValue::top_bool(),
+                    AbsOption::Some(_) => AbsValue::bool_false(),
+                    AbsOption::None => AbsValue::bool_true(),
+                    AbsOption::Bot => AbsValue::bot(),
+                }
+            }
+            ("", "option", _, "unwrap") => match &args[0].optionv {
+                AbsOption::Top => AbsValue::top(),
+                AbsOption::Some(v) => v.clone(),
+                _ => AbsValue::bot(),
+            },
+            ("", "", "mem", "size_of") => AbsValue::top_uint(),
+            ("", "", "panicking", "begin_panic") => AbsValue::bot(),
+            ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
+            (_, _, _, "wrapping_add") => args[0].add(&args[1]),
+            (_, _, _, "wrapping_sub") => args[0].sub(&args[1]),
+            (_, _, _, "wrapping_mul") => args[0].mul(&args[1]),
+            (_, _, _, "wrapping_div") => args[0].div(&args[1]),
+            (_, "ffi", _, "arg" | "as_va_list") => AbsValue::top(),
+            _ => todo!("{}", name),
+        }
     }
 
     fn transfer_rvalue(&self, rvalue: &Rvalue<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
@@ -1041,56 +1127,4 @@ fn block_entry(block: BasicBlock) -> Location {
         block,
         statement_index: 0,
     }
-}
-
-lazy_static! {
-    static ref WRITE_FUNCTIONS: BTreeSet<&'static str> = [
-        "__fxstat",
-        "__xstat",
-        "_setjmp",
-        "getcwd",
-        "getgroups",
-        "getopt_long",
-        "gettimeofday",
-        "fgets",
-        "fread",
-        "longjmp",
-        "memcpy",
-        "regcomp",
-        "regerror",
-        "regexec",
-        "setvbuf",
-        "sigaction",
-        "sigaddset",
-        "sigemptyset",
-        "sigprocmask",
-        "strcat",
-        "strcpy",
-        "strncpy",
-        "strtol",
-        "wait3",
-    ]
-    .into_iter()
-    .collect();
-    static ref ALLOC_FUNCTIONS: BTreeSet<&'static str> = [
-        "__ctype_b_loc",
-        "__errno_location",
-        "fopen",
-        "malloc",
-        "realloc",
-        "getenv",
-        "getpwnam",
-        "getpwuid",
-        "popen",
-        "setlocale",
-        "strerror",
-        "tmpfile",
-    ]
-    .into_iter()
-    .collect();
-    static ref RETURN_FIRST_FUNCTIONS: BTreeSet<&'static str> = [
-        "fgets", "getcwd", "memchr", "memcpy", "strcat", "strchr", "strcpy", "strncpy", "strrchr",
-    ]
-    .into_iter()
-    .collect();
 }
