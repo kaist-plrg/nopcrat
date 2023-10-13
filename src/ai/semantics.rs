@@ -105,8 +105,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             label,
                         );
                         for state in states {
-                            let rw = state.rw.clone();
-                            new_states_map.entry(rw).or_default().push(state);
+                            let writes = state.writes.clone();
+                            new_states_map.entry(writes).or_default().push(state);
                         }
                     }
                     new_states_map
@@ -228,7 +228,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .collect();
             let label_alloc_map = self
                 .label_user_fn_alloc_map
-                .entry((label.clone(), return_state.rw.clone()))
+                .entry((label.clone(), return_state.writes.clone()))
                 .or_default();
             while let Some(alloc) = allocs.pop_first() {
                 ptr_maps.entry(alloc).or_insert_with(|| {
@@ -256,7 +256,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let ret_v = ret_v.subst(&ptr_maps);
             let (mut state, writes) = self.assign(dst, ret_v, &state);
             let callee_reads: Vec<_> = return_state
-                .rw
                 .reads
                 .iter()
                 .filter_map(|read| {
@@ -274,7 +273,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .flatten()
                 .collect();
             let callee_writes: Vec<_> = return_state
-                .rw
                 .writes
                 .iter()
                 .filter_map(|write| {

@@ -41,10 +41,10 @@ pub fn analyze_input(input: Input) {
             let reads: BTreeSet<_> = summary
                 .return_states
                 .iter()
-                .flat_map(|st| st.rw.reads.as_set())
+                .flat_map(|st| st.reads.as_set())
                 .map(|p| p.base())
                 .collect();
-            if summary.return_states.iter().any(|st| st.rw.writes.is_bot()) {
+            if summary.return_states.iter().any(|st| st.writes.is_bot()) {
                 continue;
             }
             let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..param_tys.len())
@@ -57,7 +57,7 @@ pub fn analyze_input(input: Input) {
                 .return_states
                 .iter()
                 .map(|st| {
-                    let writes = st.rw.writes.as_set();
+                    let writes = st.writes.as_set();
                     let mut per_base: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
                     for w in writes {
                         per_base.entry(w.base()).or_default().insert(w.0.clone());
@@ -244,7 +244,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub static_allocs: BTreeMap<DefId, usize>,
     pub literal_allocs: BTreeMap<AllocId, usize>,
     pub label_alloc_map: BTreeMap<Label, usize>,
-    pub label_user_fn_alloc_map: BTreeMap<(Label, RwSets), BTreeMap<usize, usize>>,
+    pub label_user_fn_alloc_map: BTreeMap<(Label, MustPathSet), BTreeMap<usize, usize>>,
 }
 
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
@@ -279,12 +279,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     pub fn analyze_body(
         &mut self,
         body: &Body<'tcx>,
-    ) -> (BTreeMap<Location, BTreeMap<RwSets, AbsState>>, AbsState) {
+    ) -> (
+        BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
+        AbsState,
+    ) {
         let mut work_list: WorkList<'_>;
-        let mut states: BTreeMap<Location, BTreeMap<RwSets, AbsState>>;
+        let mut states: BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>;
 
         let mut start_state = AbsState::bot(body.local_decls.len());
-        start_state.rw.writes = MustPathSet::top();
+        start_state.writes = MustPathSet::top();
 
         for i in 1..=self.info.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
@@ -310,7 +313,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let start_label = Label {
             location: Location::START,
-            rw: start_state.rw.clone(),
+            writes: start_state.writes.clone(),
         };
         let bot = AbsState::bot(body.local_decls.len());
 
@@ -323,13 +326,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             states
                 .entry(start_label.location)
                 .or_default()
-                .insert(start_label.rw.clone(), start_state.clone());
+                .insert(start_label.writes.clone(), start_state.clone());
 
             let mut restart = false;
             while let Some(label) = work_list.pop() {
                 let state = states
                     .get(&label.location)
-                    .and_then(|states| states.get(&label.rw))
+                    .and_then(|states| states.get(&label.writes))
                     .unwrap_or(&bot);
                 tracing::info!("\n{:?}\n{:?}", label, state);
                 let Location {
@@ -377,19 +380,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             work_list.remove_location(*location);
                             let next_label = Label {
                                 location: *location,
-                                rw: joined.rw.clone(),
+                                writes: joined.writes.clone(),
                             };
                             work_list.push(next_label);
 
                             let mut new_map = BTreeMap::new();
-                            new_map.insert(joined.rw.clone(), joined);
+                            new_map.insert(joined.writes.clone(), joined);
                             states.insert(*location, new_map);
                         }
                     } else {
                         for new_next_state in &new_next_states {
                             let next_state = states
                                 .get(location)
-                                .and_then(|states| states.get(&new_next_state.rw))
+                                .and_then(|states| states.get(&new_next_state.writes))
                                 .unwrap_or(&bot);
                             let joined = next_state.join(new_next_state);
                             if !joined.ord(next_state) {
@@ -404,12 +407,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 }
                                 let next_label = Label {
                                     location: *location,
-                                    rw: new_next_state.rw.clone(),
+                                    writes: new_next_state.writes.clone(),
                                 };
                                 states
                                     .entry(*location)
                                     .or_default()
-                                    .insert(next_label.rw.clone(), joined);
+                                    .insert(next_label.writes.clone(), joined);
                                 work_list.push(next_label);
                             }
                         }
@@ -475,8 +478,8 @@ impl FunctionSummary {
         }
     }
 
-    fn return_state_map(&self) -> BTreeMap<&RwSets, &AbsState> {
-        self.return_states.iter().map(|s| (&s.rw, s)).collect()
+    fn return_state_map(&self) -> BTreeMap<&MustPathSet, &AbsState> {
+        self.return_states.iter().map(|s| (&s.writes, s)).collect()
     }
 
     fn join(&self, that: &Self) -> Self {
@@ -574,7 +577,7 @@ impl<'tcx> MVisitor<'tcx> for LiteralVisitor<'tcx> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Label {
     pub location: Location,
-    pub rw: RwSets,
+    pub writes: MustPathSet,
 }
 
 #[derive(Debug)]
@@ -649,7 +652,7 @@ impl TypeInfo {
 
 fn analysis_result_to_string(
     body: &Body<'_>,
-    states: &BTreeMap<Location, BTreeMap<RwSets, AbsState>>,
+    states: &BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut res = String::new();
     for block in body.basic_blocks.indices() {
