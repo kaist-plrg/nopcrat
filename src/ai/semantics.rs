@@ -169,7 +169,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             } else if name.contains("{impl#") {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
-                unreachable!("{}", name)
+                tracing::warn!("call to unknown function");
+                AbsValue::top()
             }
         } else {
             self.transfer_rust_call(callee, args, &mut state, &mut reads, &mut writes)
@@ -324,7 +325,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                                 let v = match ty {
                                     "c_int" => AbsValue::top_int(),
                                     "c_uint" => AbsValue::top_uint(),
-                                    _ => todo!("{}", ty),
+                                    _ => AbsValue::top(),
                                 };
                                 return v;
                             }
@@ -511,14 +512,35 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsOption::Some(v) => v.clone(),
                 _ => AbsValue::bot(),
             },
-            ("", "", "mem", "size_of") => AbsValue::top_uint(),
-            ("", "", "panicking", "begin_panic") => AbsValue::bot(),
-            ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
+            ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
+            ("", "", "panicking", "panic" | "begin_panic") => AbsValue::bot(),
+            ("", "vec", _, "leak")
+            | ("ops", "deref", "Deref", "deref")
+            | ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
+            ("", "num", _, "overflowing_add") => {
+                AbsValue::alpha_list(vec![args[0].add(&args[1]), AbsValue::top_bool()])
+            }
+            ("", "num", _, "overflowing_sub") => {
+                AbsValue::alpha_list(vec![args[0].sub(&args[1]), AbsValue::top_bool()])
+            }
+            ("", "num", _, "overflowing_mul") => {
+                AbsValue::alpha_list(vec![args[0].mul(&args[1]), AbsValue::top_bool()])
+            }
+            ("", "num", _, "overflowing_div") => {
+                AbsValue::alpha_list(vec![args[0].div(&args[1]), AbsValue::top_bool()])
+            }
+            ("", "num", _, "overflowing_rem") => {
+                AbsValue::alpha_list(vec![args[0].rem(&args[1]), AbsValue::top_bool()])
+            }
+            ("", "num", _, "overflowing_neg") => {
+                AbsValue::alpha_list(vec![args[0].neg(), AbsValue::top_bool()])
+            }
             ("", "num", _, "wrapping_add") => args[0].add(&args[1]),
             ("", "num", _, "wrapping_sub") => args[0].sub(&args[1]),
             ("", "num", _, "wrapping_mul") => args[0].mul(&args[1]),
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
+            ("", "num", _, "wrapping_neg") => args[0].neg(),
             (_, "f64", _, "is_finite") => AbsValue::top_bool(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
@@ -533,7 +555,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
             | ("", "convert", "From", "from")
+            | ("", "convert", "TryInto", "try_into")
+            | ("", "convert", "Into", "into")
             | ("", "", "vec", "from_elem")
+            | ("", "result", _, "unwrap")
             | (
                 "ops",
                 "arith",
@@ -561,6 +586,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads1);
                 AbsValue::top_bool()
             }
+            ("", "cast", "ToPrimitive", "to_u64") => AbsValue::top_uint(),
             _ => todo!("{}", name),
         }
     }
@@ -599,7 +625,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 };
                 (v, vec![])
             }
-            Rvalue::ThreadLocalRef(_) => unreachable!("{:?}", rvalue),
+            Rvalue::ThreadLocalRef(_) => (AbsValue::top_ptr(), vec![]),
             Rvalue::AddressOf(_, place) => {
                 assert_eq!(place.projection.len(), 1);
                 assert!(place.is_indirect_first_projection());
@@ -890,7 +916,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     .get_bytes_strip_provenance(&self.tcx, range)
                     .unwrap();
                 let msg = String::from_utf8(arr.to_vec()).unwrap();
-                if msg == "explicit panic" {
+                if msg == "explicit panic" || msg == "internal error: entered unreachable code" {
                     AbsValue::top()
                 } else {
                     unreachable!("{:?}", msg)
@@ -939,11 +965,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
-                AbsValue::alpha_list(
-                    (0..len)
-                        .map(|_| self.top_value_of_ty(ty, heap.as_deref_mut(), adts))
-                        .collect(),
-                )
+                if len <= 100 {
+                    AbsValue::alpha_list(
+                        (0..len)
+                            .map(|_| self.top_value_of_ty(ty, heap.as_deref_mut(), adts))
+                            .collect(),
+                    )
+                } else {
+                    AbsValue::top_list()
+                }
             }
             TyKind::Slice(_) => unreachable!("{:?}", ty),
             TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) => {
@@ -1152,7 +1182,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         match first {
             AbsProjElem::Field(field) => match &v.listv {
                 AbsList::Top => AbsValue::top(),
-                AbsList::List(l) => self.get_value(&l[*field], &projection[1..]),
+                AbsList::List(l) => {
+                    if let Some(v) = l.get(*field) {
+                        self.get_value(v, &projection[1..])
+                    } else {
+                        tracing::warn!("unknown field access");
+                        AbsValue::bot()
+                    }
+                }
                 AbsList::Bot => AbsValue::bot(),
             },
             AbsProjElem::Index(idx) => match &v.listv {

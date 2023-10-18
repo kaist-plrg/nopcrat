@@ -1454,12 +1454,29 @@ impl AbsInt {
         self.binary(other, |n1, n2| n1 * n2)
     }
 
+    fn binary_nz<F: Fn(i128, i128) -> i128>(&self, other: &Self, f: F) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                let mut set = BTreeSet::new();
+                for n1 in s1 {
+                    for n2 in s2 {
+                        if *n2 != 0 {
+                            set.insert(f(*n1, *n2));
+                        }
+                    }
+                }
+                Self::alphas(set)
+            }
+        }
+    }
+
     fn div(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 / n2)
+        self.binary_nz(other, |n1, n2| n1 / n2)
     }
 
     fn rem(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 % n2)
+        self.binary_nz(other, |n1, n2| n1 % n2)
     }
 
     fn bit_xor(&self, other: &Self) -> Self {
@@ -1729,12 +1746,29 @@ impl AbsUint {
         self.binary(other, |n1, n2| n1 * n2)
     }
 
+    fn binary_nz<F: Fn(u128, u128) -> u128>(&self, other: &Self, f: F) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                let mut set = BTreeSet::new();
+                for n1 in s1 {
+                    for n2 in s2 {
+                        if *n2 != 0 {
+                            set.insert(f(*n1, *n2));
+                        }
+                    }
+                }
+                Self::alphas(set)
+            }
+        }
+    }
+
     fn div(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 / n2)
+        self.binary_nz(other, |n1, n2| n1 / n2)
     }
 
     fn rem(&self, other: &Self) -> Self {
-        self.binary(other, |n1, n2| n1 % n2)
+        self.binary_nz(other, |n1, n2| n1 % n2)
     }
 
     fn bit_xor(&self, other: &Self) -> Self {

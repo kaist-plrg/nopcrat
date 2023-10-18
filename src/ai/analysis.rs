@@ -771,10 +771,15 @@ fn get_loop_heads(body: &Body<'_>) -> BTreeSet<Location> {
 fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<Vec<usize>> {
     if let Some(first) = path.first() {
         curr.push(*first);
-        if let TypeInfo::Struct(fields) = &tys[*first] {
-            expands_path(&path[1..], fields, curr)
+        if let Some(ty) = tys.get(*first) {
+            if let TypeInfo::Struct(fields) = ty {
+                expands_path(&path[1..], fields, curr)
+            } else {
+                vec![curr]
+            }
         } else {
-            vec![curr]
+            tracing::warn!("unknown field access");
+            vec![]
         }
     } else {
         tys.iter()

@@ -20,6 +20,7 @@ use rustc_session::{
     EarlyErrorHandler,
 };
 use rustc_span::{
+    edition::Edition,
     source_map::{FileName, SourceMap},
     RealFileName, Span,
 };
@@ -52,6 +53,7 @@ pub fn make_config(input: Input) -> Config {
             unstable_features: UnstableFeatures::Allow,
             crate_types: vec![CrateType::Rlib],
             debug_assertions: false,
+            edition: Edition::Edition2021,
             ..Options::default()
         },
         crate_cfg: FxHashSet::default(),
