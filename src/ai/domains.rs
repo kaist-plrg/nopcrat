@@ -7,6 +7,7 @@ use std::{
 use etrace::some_or;
 use lazy_static::lazy_static;
 use rustc_span::def_id::DefId;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct AbsState {
@@ -1266,7 +1267,7 @@ impl AbsVal {
 
 const MAX_SIZE: usize = 11;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AbsInt {
     Top,
     Set(BTreeSet<i128>),
@@ -1562,7 +1563,7 @@ impl AbsInt {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AbsUint {
     Top,
     Set(BTreeSet<u128>),
@@ -2090,7 +2091,7 @@ impl AbsFloat {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub enum AbsBool {
     Top,
     True,

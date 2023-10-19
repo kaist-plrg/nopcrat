@@ -21,76 +21,89 @@ use rustc_middle::{
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, Span};
+use serde::{Deserialize, Serialize};
 
 use super::domains::*;
 use crate::{rustc_data_structures::graph::WithSuccessors as _, *};
 
-pub fn analyze_path(path: &Path) {
-    analyze_input(compile_util::path_to_input(path));
+pub fn analyze_path(path: &Path) -> BTreeMap<String, Vec<OutputParam>> {
+    analyze_input(compile_util::path_to_input(path))
 }
 
-pub fn analyze_code(code: &str) {
-    analyze_input(compile_util::str_to_input(code));
+pub fn analyze_code(code: &str) -> BTreeMap<String, Vec<OutputParam>> {
+    analyze_input(compile_util::str_to_input(code))
 }
 
-pub fn analyze_input(input: Input) {
+pub fn analyze_input(input: Input) -> BTreeMap<String, Vec<OutputParam>> {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
         let results = analyze(tcx);
-        for (def_id, (summary, param_tys)) in results {
-            let reads: BTreeSet<_> = summary
-                .return_states
-                .iter()
-                .flat_map(|st| st.reads.as_set())
-                .map(|p| p.base())
-                .collect();
-            if summary.return_states.iter().any(|st| st.writes.is_bot()) {
-                continue;
-            }
-            let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..param_tys.len())
-                .map(|i| {
-                    let expanded = expands_path(&[i], &param_tys, vec![]).into_iter().collect();
-                    (i, expanded)
-                })
-                .collect();
-            let ret_writes: Vec<_> = summary
-                .return_states
-                .iter()
-                .map(|st| {
-                    let writes = st.writes.as_set();
-                    let mut per_base: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-                    for w in writes {
-                        per_base.entry(w.base()).or_default().insert(w.0.clone());
-                    }
-                    let writes: BTreeSet<_> = per_base
-                        .into_iter()
-                        .filter_map(|(i, paths)| {
-                            if reads.contains(&i) || expanded_map.get(&i).unwrap() != &paths {
-                                None
-                            } else {
-                                Some(i)
-                            }
-                        })
-                        .collect();
-                    (st.local.get(0).clone(), writes)
-                })
-                .collect();
-            let writes: BTreeSet<_> = ret_writes
-                .iter()
-                .flat_map(|(_, writes)| writes)
-                .cloned()
-                .collect();
-            if writes.is_empty() {
-                continue;
-            }
-            println!("{}:", tcx.def_path_str(def_id));
-            for w in writes {
-                let must = ret_writes.iter().all(|(_, writes)| writes.contains(&w));
-                println!("  {:?}{}", w, if must { " (must)" } else { " (may)" });
-                if !must {
+        collect_output_params(results, tcx)
+    })
+    .unwrap()
+}
+
+pub fn collect_output_params(
+    results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)>,
+    tcx: TyCtxt<'_>,
+) -> BTreeMap<String, Vec<OutputParam>> {
+    let mut func_param_map = BTreeMap::new();
+    for (def_id, (summary, param_tys)) in results {
+        let reads: BTreeSet<_> = summary
+            .return_states
+            .iter()
+            .flat_map(|st| st.reads.as_set())
+            .map(|p| p.base())
+            .collect();
+        if summary.return_states.iter().any(|st| st.writes.is_bot()) {
+            continue;
+        }
+        let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..param_tys.len())
+            .map(|i| {
+                let expanded = expands_path(&[i], &param_tys, vec![]).into_iter().collect();
+                (i, expanded)
+            })
+            .collect();
+        let ret_writes: Vec<_> = summary
+            .return_states
+            .iter()
+            .map(|st| {
+                let writes = st.writes.as_set();
+                let mut per_base: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+                for w in writes {
+                    per_base.entry(w.base()).or_default().insert(w.0.clone());
+                }
+                let writes: BTreeSet<_> = per_base
+                    .into_iter()
+                    .filter_map(|(i, paths)| {
+                        if reads.contains(&i) || expanded_map.get(&i).unwrap() != &paths {
+                            None
+                        } else {
+                            Some(i)
+                        }
+                    })
+                    .collect();
+                (st.local.get(0).clone(), writes)
+            })
+            .collect();
+        let writes: BTreeSet<_> = ret_writes
+            .iter()
+            .flat_map(|(_, writes)| writes)
+            .cloned()
+            .collect();
+        if writes.is_empty() {
+            continue;
+        }
+        let body = tcx.optimized_mir(def_id);
+        let ret_ty = &body.local_decls[Local::from_usize(0)].ty;
+        let params = writes
+            .into_iter()
+            .map(|index| {
+                let must = ret_writes.iter().all(|(_, writes)| writes.contains(&index));
+                let return_values = if !must {
                     let (wst, nwst): (Vec<_>, Vec<_>) = ret_writes
                         .iter()
-                        .partition(|(_, writes)| writes.contains(&w));
+                        .partition(|(_, writes)| writes.contains(&index));
                     let w = wst
                         .into_iter()
                         .map(|(v, _)| v)
@@ -103,11 +116,25 @@ pub fn analyze_input(input: Input) {
                         .cloned()
                         .reduce(|a, b| a.join(&b))
                         .unwrap();
-                    println!("  {:?} / {:?}", w, nw);
+                    match ret_ty.kind() {
+                        TyKind::Int(_) => ReturnValues::Int(w.intv.clone(), nw.intv.clone()),
+                        TyKind::Uint(_) => ReturnValues::Uint(w.uintv.clone(), nw.uintv.clone()),
+                        TyKind::Bool => ReturnValues::Bool(w.boolv, nw.boolv),
+                        _ => ReturnValues::None,
+                    }
+                } else {
+                    ReturnValues::None
+                };
+                OutputParam {
+                    index,
+                    must,
+                    return_values,
                 }
-            }
-        }
-    });
+            })
+            .collect();
+        func_param_map.insert(tcx.def_path_str(def_id), params);
+    }
+    func_param_map
 }
 
 pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)> {
@@ -222,6 +249,21 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
             )
         })
         .collect()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputParam {
+    pub index: usize,
+    pub must: bool,
+    pub return_values: ReturnValues,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReturnValues {
+    None,
+    Int(AbsInt, AbsInt),
+    Uint(AbsUint, AbsUint),
+    Bool(AbsBool, AbsBool),
 }
 
 #[derive(Debug, Clone)]
