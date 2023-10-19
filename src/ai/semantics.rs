@@ -512,7 +512,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsOption::Some(v) => v.clone(),
                 _ => AbsValue::bot(),
             },
-            ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
+            ("", "cast", "ToPrimitive", "to_u64")
+            | ("", "num", _, "count_ones" | "trailing_zeros" | "leading_zeros")
+            | ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
             ("", "", "panicking", "panic" | "begin_panic") => AbsValue::bot(),
             ("", "vec", _, "leak")
             | ("ops", "deref", "Deref", "deref")
@@ -541,7 +543,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
             ("", "num", _, "wrapping_neg") => args[0].neg(),
-            (_, "f64", _, "is_finite") => AbsValue::top_bool(),
+            (_, "f64", _, "is_finite" | "is_nan") => AbsValue::top_bool(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
                 let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);
@@ -586,7 +588,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads1);
                 AbsValue::top_bool()
             }
-            ("", "cast", "ToPrimitive", "to_u64") => AbsValue::top_uint(),
             _ => todo!("{}", name),
         }
     }
