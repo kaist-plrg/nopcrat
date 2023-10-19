@@ -26,18 +26,10 @@ use rustc_span::{
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
-pub fn run_compiler<R: Send, F: FnOnce(&SourceMap, TyCtxt<'_>) -> R + Send>(
-    config: Config,
-    f: F,
-) -> Option<R> {
+pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
-            compiler.enter(|queries| {
-                queries.global_ctxt().ok()?.enter(|tcx| {
-                    let source_map = compiler.session().source_map();
-                    Some(f(source_map, tcx))
-                })
-            })
+            compiler.enter(|queries| queries.global_ctxt().ok()?.enter(|tcx| Some(f(tcx))))
         })
     })
     .ok()?
@@ -93,7 +85,7 @@ pub fn str_to_input(code: &str) -> Input {
 }
 
 pub fn path_to_input(path: &Path) -> Input {
-    Input::File(PathBuf::from(path))
+    Input::File(path.to_path_buf())
 }
 
 pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
@@ -172,7 +164,6 @@ impl Translate for CountingEmitter {
 impl Emitter for CountingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
         if matches!(diag.level(), Level::Error { .. }) {
-            println!("{:?}", diag);
             *self.0.lock().unwrap() += 1;
         }
     }
@@ -205,8 +196,9 @@ impl Emitter for SilentEmitter {
 fn find_deps() -> Options {
     let mut args = vec!["a.rs".to_string()];
 
-    let dep = "deps_crate/target/debug/deps";
-    if let Ok(dir) = std::fs::read_dir(dep) {
+    let dir = std::env::var("DIR").unwrap_or_else(|_| ".".to_string());
+    let dep = format!("{}/deps_crate/target/debug/deps", dir);
+    if let Ok(dir) = std::fs::read_dir(&dep) {
         args.push("-L".to_string());
         args.push(format!("dependency={}", dep));
 

@@ -35,7 +35,7 @@ pub fn analyze_code(code: &str) {
 
 pub fn analyze_input(input: Input) {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| {
+    compile_util::run_compiler(config, |tcx| {
         let results = analyze(tcx);
         for (def_id, (summary, param_tys)) in results {
             let reads: BTreeSet<_> = summary

@@ -18,7 +18,7 @@ mod uint;
 fn analyze(code: &str) -> Vec<AbsState> {
     let input = compile_util::str_to_input(code);
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| {
+    compile_util::run_compiler(config, |tcx| {
         analysis::analyze(tcx)
             .into_iter()
             .find(|(def_id, _)| {

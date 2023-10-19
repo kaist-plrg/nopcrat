@@ -34,7 +34,8 @@ pub fn run_code(code: &str) {
 
 fn analyze(input: Input) {
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |source_map, tcx| {
+    compile_util::run_compiler(config, |tcx| {
+        let source_map = tcx.sess.source_map();
         let hir = tcx.hir();
         for id in hir.items() {
             let item = hir.item(id);
@@ -114,7 +115,7 @@ fn analyze(input: Input) {
 pub fn find_mutable_globals(path: &Path) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| {
+    compile_util::run_compiler(config, |tcx| {
         let hir = tcx.hir();
         let mut read_onlys = BTreeSet::new();
         let mut writes = BTreeSet::new();
@@ -177,7 +178,7 @@ impl<'tcx> Visitor<'tcx> for GlobalWriteVisitor<'tcx, '_> {
 pub fn find_ptr_param_use(path: &Path) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
-    compile_util::run_compiler(config, |_, tcx| {
+    compile_util::run_compiler(config, |tcx| {
         let hir = tcx.hir();
         let mut visitor = KindVisitor::default();
         let mut tys = BTreeSet::new();

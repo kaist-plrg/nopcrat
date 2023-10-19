@@ -13,5 +13,6 @@ get_path() {
 SCRIPT_PATH=$(get_path $0)
 SCRIPT_DIR=$(cd $(dirname $SCRIPT_PATH) && pwd)
 SCRIPT_NAME=$(basename $SCRIPT_PATH)
-SYS_ROOT=$(cd $SCRIPT_DIR && rustc --print sysroot)
-LD_LIBRARY_PATH=$SYS_ROOT/lib $SCRIPT_DIR/target/release/$SCRIPT_NAME $@
+SYSROOT=$(cd $SCRIPT_DIR && rustc --print sysroot)
+DIR=$SCRIPT_DIR SYSROOT=$SYSROOT LD_LIBRARY_PATH=$SYSROOT/lib \
+  $SCRIPT_DIR/target/release/$SCRIPT_NAME $@
