@@ -4,7 +4,9 @@ use std::{
 };
 
 use etrace::some_or;
-use rustc_hir::{intravisit::Visitor as HVisitor, Expr, ExprKind, FnRetTy, ItemKind, PatKind};
+use rustc_hir::{
+    def::Res, intravisit::Visitor as HVisitor, Expr, ExprKind, FnRetTy, ItemKind, PatKind, QPath,
+};
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{BytePos, Span};
 use rustfix::Suggestion;
@@ -20,7 +22,7 @@ pub fn transform_path(path: &Path, params: &BTreeMap<String, Vec<OutputParam>>) 
 
 fn transform(
     tcx: TyCtxt<'_>,
-    params: &BTreeMap<String, Vec<OutputParam>>,
+    param_map: &BTreeMap<String, Vec<OutputParam>>,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
@@ -33,7 +35,41 @@ fn transform(
             let def_id = id.owner_id.to_def_id();
             let name = tcx.def_path_str(def_id);
             let body = hir.body(*body_id);
-            if let Some(params) = params.get(&name) {
+
+            let mut visitor = BodyVisitor::new(tcx);
+            visitor.visit_body(body);
+
+            for call in visitor.calls {
+                let Call { span, callee, args } = call;
+                if let Some(params) = param_map.get(&callee) {
+                    for param in params {
+                        let span = args[param.index - 1];
+                        let span = if param.index == args.len() {
+                            if let Some(comma_span) = source_map.span_look_ahead(span, ",", Some(1))
+                            {
+                                span.with_hi(comma_span.hi())
+                            } else {
+                                span
+                            }
+                        } else {
+                            source_map.span_extend_to_next_char(span, ',', true)
+                        };
+                        let snippet = compile_util::span_to_snippet(span, source_map);
+                        let suggestion = compile_util::make_suggestion(snippet, "");
+                        v.push(suggestion);
+                    }
+
+                    let snippet = compile_util::span_to_snippet(span.shrink_to_lo(), source_map);
+                    let suggestion = compile_util::make_suggestion(snippet, "{ let (a, b) = ");
+                    v.push(suggestion);
+
+                    let snippet = compile_util::span_to_snippet(span.shrink_to_hi(), source_map);
+                    let suggestion = compile_util::make_suggestion(snippet, "; a }");
+                    v.push(suggestion);
+                }
+            }
+
+            if let Some(params) = param_map.get(&name) {
                 let body_params: BTreeMap<_, _> = body
                     .params
                     .iter()
@@ -116,8 +152,6 @@ fn transform(
                 let suggestion = compile_util::make_suggestion(snippet, &local_vars);
                 v.push(suggestion);
 
-                let mut visitor = RetVisitor::new(tcx);
-                visitor.visit_body(body);
                 for (span, ret_v) in visitor.returns {
                     let mut values = vec![];
                     if let Some(ret_v) = ret_v {
@@ -139,21 +173,29 @@ fn transform(
     suggestions
 }
 
-struct RetVisitor<'tcx> {
+struct BodyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     returns: Vec<(Span, Option<String>)>,
+    calls: Vec<Call>,
 }
 
-impl<'tcx> RetVisitor<'tcx> {
+struct Call {
+    span: Span,
+    callee: String,
+    args: Vec<Span>,
+}
+
+impl<'tcx> BodyVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
             returns: vec![],
+            calls: vec![],
         }
     }
 }
 
-impl<'tcx> HVisitor<'tcx> for RetVisitor<'tcx> {
+impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
@@ -161,12 +203,25 @@ impl<'tcx> HVisitor<'tcx> for RetVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if let ExprKind::Ret(e) = &expr.kind {
-            let span = expr.span;
-            let ret_v = e
-                .as_ref()
-                .map(|e| self.tcx.sess.source_map().span_to_snippet(e.span).unwrap());
-            self.returns.push((span, ret_v));
+        match &expr.kind {
+            ExprKind::Ret(e) => {
+                let span = expr.span;
+                let ret_v = e
+                    .as_ref()
+                    .map(|e| self.tcx.sess.source_map().span_to_snippet(e.span).unwrap());
+                self.returns.push((span, ret_v));
+            }
+            ExprKind::Call(callee, args) => {
+                let span = expr.span;
+                if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind {
+                    if let Res::Def(_, def_id) = path.res {
+                        let callee = self.tcx.def_path_str(def_id);
+                        let args = args.iter().map(|arg| arg.span).collect();
+                        self.calls.push(Call { span, callee, args });
+                    }
+                }
+            }
+            _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
