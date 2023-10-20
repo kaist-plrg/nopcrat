@@ -16,6 +16,8 @@ struct Args {
     load_analysis_result: Option<PathBuf>,
     #[arg(short, long)]
     output: Option<PathBuf>,
+    #[arg(short, long)]
+    analysis_only: bool,
     input: PathBuf,
 }
 
@@ -66,6 +68,10 @@ fn main() {
     if let Some(dump_file) = args.dump_analysis_result {
         let dump_file = File::create(dump_file).unwrap();
         serde_json::to_writer_pretty(dump_file, &analysis_result).unwrap();
+    }
+
+    if args.analysis_only {
+        return;
     }
 
     transform::transform_path(path, &analysis_result);

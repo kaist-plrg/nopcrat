@@ -19,9 +19,9 @@ pub struct AbsState {
 
 impl AbsState {
     #[inline]
-    pub fn bot(len: usize) -> Self {
+    pub fn bot() -> Self {
         Self {
-            local: AbsLocal::bot(len),
+            local: AbsLocal::bot(),
             heap: AbsHeap::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
@@ -142,41 +142,50 @@ impl std::fmt::Debug for AbsLocal {
 
 impl AbsLocal {
     #[inline]
-    fn bot(len: usize) -> Self {
-        Self(vec![AbsValue::bot(); len])
+    fn bot() -> Self {
+        Self(vec![])
     }
 
     fn join(&self, other: &Self) -> Self {
-        assert_eq!(self.0.len(), other.0.len());
         Self(
-            self.0
-                .iter()
-                .zip(other.0.iter())
-                .map(|(x, y)| x.join(y))
+            (0..self.0.len().max(other.0.len()))
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(v1), Some(v2)) => v1.join(v2),
+                    (Some(v), None) | (None, Some(v)) => v.clone(),
+                    _ => unreachable!(),
+                })
                 .collect(),
         )
     }
 
     fn ord(&self, other: &Self) -> bool {
-        assert_eq!(self.0.len(), other.0.len());
-        self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    pub fn len(&self) -> usize {
-        self.0.len()
+        (0..self.0.len().max(other.0.len())).all(|i| {
+            let v1 = self.0.get(i).unwrap_or(&V_BOT);
+            let v2 = other.0.get(i).unwrap_or(&V_BOT);
+            v1.ord(v2)
+        })
     }
 
     pub fn get(&self, i: usize) -> &AbsValue {
-        &self.0[i]
+        self.0.get(i).unwrap_or(&V_BOT)
     }
 
     pub fn get_mut(&mut self, i: usize) -> &mut AbsValue {
+        while self.0.len() <= i {
+            self.0.push(AbsValue::bot());
+        }
         &mut self.0[i]
     }
 
     pub fn set(&mut self, i: usize, v: AbsValue) {
-        self.0[i] = v;
+        while self.0.len() < i {
+            self.0.push(AbsValue::bot());
+        }
+        if self.0.len() == i {
+            self.0.push(v);
+        } else {
+            self.0[i] = v;
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &AbsValue> {

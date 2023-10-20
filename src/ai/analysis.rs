@@ -208,8 +208,7 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
             let mut input_summaries = summaries.clone();
             if recursive {
                 for def_id in def_ids {
-                    let len = tcx.optimized_mir(*def_id).local_decls.len();
-                    let _ = input_summaries.try_insert(*def_id, FunctionSummary::bot(len));
+                    let _ = input_summaries.try_insert(*def_id, FunctionSummary::bot());
                 }
             }
 
@@ -328,7 +327,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut work_list: WorkList<'_>;
         let mut states: BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>;
 
-        let mut start_state = AbsState::bot(body.local_decls.len());
+        let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
 
         for i in 1..=self.info.inputs {
@@ -357,7 +356,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             location: Location::START,
             writes: start_state.writes.clone(),
         };
-        let bot = AbsState::bot(body.local_decls.len());
+        let bot = AbsState::bot();
 
         let mut merging_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
         loop {
@@ -513,9 +512,9 @@ impl FunctionSummary {
         }
     }
 
-    fn bot(len: usize) -> Self {
+    fn bot() -> Self {
         Self {
-            init_state: AbsState::bot(len),
+            init_state: AbsState::bot(),
             return_states: vec![],
         }
     }
