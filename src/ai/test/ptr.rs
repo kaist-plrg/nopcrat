@@ -14,19 +14,6 @@ fn test_param() {
 }
 
 #[test]
-fn test_param_double_indrection() {
-    let code = "
-        unsafe fn f(b: bool, p: *mut *mut i32) -> i32 {
-            **p = if b { 0 } else { 1 };
-            **p
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
-}
-
-#[test]
 fn test_local_write() {
     let code = "
         unsafe fn f(b: bool) -> i32 {
@@ -443,103 +430,6 @@ fn test_param_array_struct_ref2() {
 }
 
 #[test]
-fn test_param_struct_ptr() {
-    let code = "
-        struct S { x: *i32, y: *i32 }
-        unsafe fn f(b: bool, p: *mut S) -> i32 {
-            let q = (*p).x;
-            let r = (*p).y;
-            *q = if b { 0 } else { 1 };
-            *r = if b { 0 } else { 2 };
-            *(*p).x + *(*p).y
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1, 2, 3]);
-}
-
-#[test]
-fn test_param_struct_ptr2() {
-    let code = "
-        struct S { x: *T, y: *T }
-        struct T { x: *i32, y: *i32 }
-        unsafe fn f(b: bool, p: *mut S) -> i32 {
-            *(*(*p).x).x = if b { 0 } else { 1 };
-            *(*(*p).x).y = if b { 0 } else { 2 };
-            *(*(*p).y).x = if b { 0 } else { 3 };
-            *(*(*p).y).y = if b { 0 } else { 4 };
-            *(*(*p).x).x + *(*(*p).x).y + *(*(*p).y).x + *(*(*p).y).y
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), (0..=10).collect::<Vec<_>>());
-}
-
-#[test]
-fn test_param_array_ptr() {
-    let code = "
-        unsafe fn f(b: bool, p: *mut [*mut i32; 2]) -> i32 {
-            let q = (*p)[0];
-            let r = (*p)[1];
-            *q = if b { 0 } else { 1 };
-            *r = if b { 0 } else { 2 };
-            *(*p)[0] + *(*p)[1]
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1, 2, 3]);
-}
-
-#[test]
-fn test_param_array_ptr2() {
-    let code = "
-        unsafe fn f(b: bool, p: *mut [*mut [*mut i32; 2]; 2]) -> i32 {
-            *(*(*p)[0])[0] = if b { 0 } else { 1 };
-            *(*(*p)[0])[1] = if b { 0 } else { 2 };
-            *(*(*p)[1])[0] = if b { 0 } else { 3 };
-            *(*(*p)[1])[1] = if b { 0 } else { 4 };
-            *(*(*p)[0])[0] + *(*(*p)[0])[1] + *(*(*p)[1])[0] + *(*(*p)[1])[1]
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), (0..=10).collect::<Vec<_>>());
-}
-
-#[test]
-fn test_param_struct_recursive() {
-    let code = "
-        struct S { x: *mut S, y: *mut i32 }
-        unsafe fn f(b: bool, p: *mut S) -> i32 {
-            *(*p).y = if b { 0 } else { 1 };
-            *(*p).y
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
-}
-
-#[test]
-fn test_param_struct_recursive2() {
-    let code = "
-        struct S { x: *mut T, y: *mut i32 }
-        struct T { x: *mut S, y: *mut i32 }
-        unsafe fn f(b: bool, p: *mut S) -> i32 {
-            *(*p).y = if b { 0 } else { 1 };
-            *(*(*p).x).y = if b { 0 } else { 2 };
-            *(*p).y + *(*(*p).x).y
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1, 2, 3]);
-}
-
-#[test]
 fn test_null() {
     let code = "
         unsafe fn f(b: bool) -> i32 {
@@ -601,7 +491,7 @@ fn test_malloc() {
     ";
     let result = analyze(code);
     assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![0, 1]);
+    assert!(ret(&result[0]).is_top());
 }
 
 #[test]
@@ -615,27 +505,6 @@ fn test_literal() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
     assert!(ret(&result[0]).uintv.is_top());
-}
-
-#[test]
-fn test_while_malloc() {
-    let code = "
-        extern crate libc;
-        extern \"C\" {
-            fn malloc(_: libc::c_ulong) -> *mut libc::c_void;
-        }
-        unsafe fn f(b: bool) {
-            let mut i = 0;
-            let mut p: *mut i32 = &mut i;
-            while i < 10 {
-                i += 1;
-                p = malloc(4) as *mut i32;
-            }
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].heap.len(), 1);
 }
 
 #[test]

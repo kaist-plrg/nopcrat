@@ -262,19 +262,3 @@ fn test_const() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![0]);
 }
-
-#[test]
-fn test_static() {
-    let code = "
-        static mut X: i32 = 0;
-        static mut Y: i32 = 0;
-        fn f() -> i32 {
-            X = 1;
-            Y = 2;
-            X + Y
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-    assert_eq!(as_int(ret(&result[0])), vec![3]);
-}

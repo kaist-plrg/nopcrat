@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use etrace::some_or;
 use lazy_static::lazy_static;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct AbsState {
     pub local: AbsLocal,
-    pub heap: AbsHeap,
+    pub args: AbsArgs,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
 }
@@ -22,7 +21,7 @@ impl AbsState {
     pub fn bot() -> Self {
         Self {
             local: AbsLocal::bot(),
-            heap: AbsHeap::bot(),
+            args: AbsArgs::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
         }
@@ -31,7 +30,7 @@ impl AbsState {
     pub fn join(&self, other: &Self) -> Self {
         Self {
             local: self.local.join(&other.local),
-            heap: self.heap.join(&other.heap),
+            args: self.args.join(&other.args),
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
         }
@@ -39,7 +38,7 @@ impl AbsState {
 
     pub fn ord(&self, other: &Self) -> bool {
         self.local.ord(&other.local)
-            && self.heap.ord(&other.heap)
+            && self.args.ord(&other.args)
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
     }
@@ -47,7 +46,8 @@ impl AbsState {
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
         match base {
             AbsBase::Local(i) => self.local.0.get(i),
-            AbsBase::Heap(i) => self.heap.0.get(i),
+            AbsBase::Arg(i) => self.args.0.get(i),
+            AbsBase::Heap => Some(&V_TOP),
             AbsBase::Null => None,
         }
     }
@@ -55,7 +55,8 @@ impl AbsState {
     pub fn get_mut(&mut self, base: AbsBase) -> Option<&mut AbsValue> {
         match base {
             AbsBase::Local(i) => self.local.0.get_mut(i),
-            AbsBase::Heap(i) => self.heap.0.get_mut(i),
+            AbsBase::Arg(i) => self.args.0.get_mut(i),
+            AbsBase::Heap => panic!(),
             AbsBase::Null => None,
         }
     }
@@ -78,15 +79,15 @@ impl AbsState {
 }
 
 #[derive(Clone)]
-pub struct AbsHeap(Vec<AbsValue>);
+pub struct AbsArgs(Vec<AbsValue>);
 
-impl std::fmt::Debug for AbsHeap {
+impl std::fmt::Debug for AbsArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.0)
     }
 }
 
-impl AbsHeap {
+impl AbsArgs {
     #[inline]
     fn bot() -> Self {
         Self(vec![])
@@ -206,6 +207,7 @@ lazy_static! {
     static ref V_TOP_FN: AbsValue = AbsValue::new(AbsVal::top_fn());
     static ref V_TRUE: AbsValue = AbsValue::new(AbsVal::alpha_bool(true));
     static ref V_FALSE: AbsValue = AbsValue::new(AbsVal::alpha_bool(false));
+    static ref V_HEAP: AbsValue = AbsValue::new(AbsVal::heap());
     static ref V_NULL: AbsValue = AbsValue::new(AbsVal::null());
     static ref V_NONE: AbsValue = AbsValue::new(AbsVal::none());
 }
@@ -292,6 +294,11 @@ impl AbsValue {
     #[inline]
     pub fn bool_false() -> Self {
         V_FALSE.clone()
+    }
+
+    #[inline]
+    pub fn heap() -> Self {
+        V_HEAP.clone()
     }
 
     #[inline]
@@ -420,8 +427,8 @@ impl AbsValue {
         Self::new(AbsVal::some(v))
     }
 
-    pub fn alloc(i: usize) -> Self {
-        Self::ptr(AbsPtr::alloc(i))
+    pub fn arg(i: usize) -> Self {
+        Self::ptr(AbsPtr::arg(i))
     }
 
     #[inline]
@@ -834,6 +841,11 @@ impl AbsVal {
     }
 
     #[inline]
+    fn heap() -> Self {
+        Self::ptr(AbsPtr::heap())
+    }
+
+    #[inline]
     fn null() -> Self {
         Self::ptr(AbsPtr::null())
     }
@@ -1239,38 +1251,12 @@ impl AbsVal {
     }
 
     #[inline]
-    pub fn heap_addr(&self) -> usize {
-        self.ptrv.heap_addr()
-    }
-
-    pub fn compare_pointers<'a, 'b>(&'a self, other: &'b Self) -> Vec<(&'a AbsPtr, &'b AbsPtr)> {
-        let mut res = vec![];
-        if !self.ptrv.is_bot() && !self.ptrv.is_top() {
-            res.push((&self.ptrv, &other.ptrv));
-        }
-        if let (AbsList::List(l1), AbsList::List(l2)) = (&self.listv, &other.listv) {
-            for (v1, v2) in l1.iter().zip(l2.iter()) {
-                res.extend(v1.compare_pointers(v2));
-            }
-        }
-        res
-    }
-
-    #[inline]
     fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
         Self {
             ptrv: self.ptrv.subst(map),
             listv: self.listv.subst(map),
             ..self.clone()
         }
-    }
-
-    pub fn allocs(&self) -> BTreeSet<usize> {
-        self.ptrv
-            .allocs()
-            .union(&self.listv.allocs())
-            .cloned()
-            .collect()
     }
 }
 
@@ -2325,14 +2311,6 @@ impl AbsList {
             Self::Bot => Self::Bot,
         }
     }
-
-    fn allocs(&self) -> BTreeSet<usize> {
-        if let Self::List(l) = self {
-            l.iter().flat_map(|v| v.allocs()).collect()
-        } else {
-            BTreeSet::new()
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2352,6 +2330,15 @@ impl std::fmt::Debug for AbsPlace {
 }
 
 impl AbsPlace {
+    #[inline]
+    fn heap() -> Self {
+        Self {
+            base: AbsBase::Heap,
+            projection: Vec::new(),
+        }
+    }
+
+    #[inline]
     fn null() -> Self {
         Self {
             base: AbsBase::Null,
@@ -2359,9 +2346,9 @@ impl AbsPlace {
         }
     }
 
-    fn alloc(i: usize) -> Self {
+    fn arg(i: usize) -> Self {
         Self {
-            base: AbsBase::Heap(i),
+            base: AbsBase::Arg(i),
             projection: Vec::new(),
         }
     }
@@ -2375,7 +2362,8 @@ impl AbsPlace {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsBase {
     Local(usize),
-    Heap(usize),
+    Arg(usize),
+    Heap,
     Null,
 }
 
@@ -2383,7 +2371,8 @@ impl std::fmt::Debug for AbsBase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(i) => write!(f, "_{}", i),
-            Self::Heap(i) => write!(f, "A{}", i),
+            Self::Arg(i) => write!(f, "A{}", i),
+            Self::Heap => write!(f, "H"),
             Self::Null => write!(f, "null"),
         }
     }
@@ -2499,23 +2488,30 @@ impl AbsPtr {
         }
     }
 
+    #[inline]
+    fn heap() -> Self {
+        Self::alpha(AbsPlace::heap())
+    }
+
+    #[inline]
     fn null() -> Self {
         Self::alpha(AbsPlace::null())
     }
 
-    pub fn alloc(i: usize) -> Self {
-        Self::alpha(AbsPlace::alloc(i))
+    #[inline]
+    pub fn arg(i: usize) -> Self {
+        Self::alpha(AbsPlace::arg(i))
     }
 
-    pub fn heap_addr(&self) -> usize {
-        let places = self.gamma().unwrap();
-        assert_eq!(places.len(), 1);
-        let place = places.first().unwrap();
-        if let AbsBase::Heap(alloc) = place.base {
-            alloc
-        } else {
-            panic!()
+    pub fn get_arg(&self) -> Option<usize> {
+        if let Self::Set(ptrs) = self {
+            if ptrs.len() == 1 {
+                if let AbsBase::Arg(i) = &ptrs.first().unwrap().base {
+                    return Some(*i);
+                }
+            }
         }
+        None
     }
 
     fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
@@ -2524,7 +2520,8 @@ impl AbsPtr {
                 .map(|place| {
                     let alloc = match &place.base {
                         AbsBase::Local(_) => return Self::bot(),
-                        AbsBase::Heap(alloc) => alloc,
+                        AbsBase::Arg(i) => i,
+                        AbsBase::Heap => return Self::heap(),
                         AbsBase::Null => return Self::null(),
                     };
                     let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
@@ -2546,20 +2543,6 @@ impl AbsPtr {
                 .unwrap_or(AbsPtr::bot())
         } else {
             AbsPtr::Top
-        }
-    }
-
-    fn allocs(&self) -> BTreeSet<usize> {
-        if let Self::Set(ptrs) = self {
-            ptrs.iter()
-                .filter_map(|place| match &place.base {
-                    AbsBase::Local(_) => None,
-                    AbsBase::Heap(alloc) => Some(*alloc),
-                    AbsBase::Null => None,
-                })
-                .collect()
-        } else {
-            BTreeSet::new()
         }
     }
 }
@@ -2739,17 +2722,14 @@ impl AbsPath {
         self.0[0]
     }
 
-    pub fn from_place(
-        place: &AbsPlace,
-        alloc_param_map: &BTreeMap<usize, usize>,
-    ) -> Option<(Self, bool)> {
-        let alloc = if let AbsBase::Heap(alloc) = place.base {
-            alloc
+    pub fn from_place(place: &AbsPlace, ptr_params: &[usize]) -> Option<(Self, bool)> {
+        let arg = if let AbsBase::Arg(arg) = place.base {
+            arg
         } else {
             return None;
         };
-        let param = some_or!(alloc_param_map.get(&alloc), return None);
-        let mut projections = vec![*param];
+        let param = ptr_params[arg];
+        let mut projections = vec![param];
         let mut array_access = false;
         for proj in place.projection.iter() {
             match proj {

@@ -17,7 +17,7 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
     #[arg(short, long)]
-    analysis_only: bool,
+    transform: bool,
     input: PathBuf,
 }
 
@@ -70,7 +70,7 @@ fn main() {
         serde_json::to_writer_pretty(dump_file, &analysis_result).unwrap();
     }
 
-    if args.analysis_only {
+    if !args.transform {
         return;
     }
 

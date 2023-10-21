@@ -15,10 +15,7 @@ use rustc_middle::{
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
-use super::{
-    analysis::{FunctionSummary, Label},
-    domains::*,
-};
+use super::{analysis::FunctionSummary, domains::*};
 
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
@@ -43,7 +40,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         terminator: &Terminator<'tcx>,
         state: &AbsState,
-        label: &Label,
     ) -> (Vec<AbsState>, Vec<Location>) {
         tracing::info!(
             "\n{}\n{:?}",
@@ -102,7 +98,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             destination,
                             state.clone(),
                             reads.clone(),
-                            label,
                         );
                         for state in states {
                             let writes = state.writes.clone();
@@ -157,15 +152,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         dst: &Place<'tcx>,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
-        label: &Label,
     ) -> Vec<AbsState> {
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                return self.transfer_intra_call(&summary.clone(), args, dst, state, reads, label);
+                return self.transfer_intra_call(&summary.clone(), args, dst, state, reads);
             } else if name.contains("{extern#0}") {
-                self.transfer_c_call(callee, args, &mut state, &mut reads, &mut writes, label)
+                self.transfer_c_call(callee, args, &mut reads, &mut writes)
             } else if name.contains("{impl#") {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
@@ -189,69 +183,24 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         dst: &Place<'tcx>,
         state: AbsState,
         reads: Vec<AbsPath>,
-        label: &Label,
     ) -> Vec<AbsState> {
         if summary.return_states.is_empty() {
             return vec![];
         }
 
         let mut ptr_maps = BTreeMap::new();
-        let mut allocs = BTreeSet::new();
         for (param, arg) in summary.init_state.local.iter().skip(1).zip(args.iter()) {
-            for (param_ptr, arg_ptr) in param.compare_pointers(arg) {
-                let alloc = param_ptr.heap_addr();
-                let _ = ptr_maps.try_insert(alloc, arg_ptr.clone());
-                allocs.insert(alloc);
-            }
-        }
-        while let Some(alloc) = allocs.pop_first() {
-            let arg_ptr = ptr_maps.get(&alloc).unwrap();
-            let (arg, _) = self.read_ptr(arg_ptr, &[], &state);
-            let param = summary.init_state.heap.get(alloc);
-            for (param_ptr, arg_ptr) in param.compare_pointers(&arg) {
-                let alloc = param_ptr.heap_addr();
-                if ptr_maps.try_insert(alloc, arg_ptr.clone()).is_ok() {
-                    allocs.insert(alloc);
-                }
+            if let Some(idx) = param.ptrv.get_arg() {
+                ptr_maps.insert(idx, arg.ptrv.clone());
             }
         }
 
         let mut states = vec![];
-        for return_state in &summary.return_states {
+        for return_state in summary.return_states.values() {
             let mut state = state.clone();
-            let mut ptr_maps = ptr_maps.clone();
             let ret_v = return_state.local.get(0);
-            let mut allocs: BTreeSet<_> = ptr_maps
-                .keys()
-                .map(|p| return_state.heap.get(*p))
-                .chain(std::iter::once(ret_v))
-                .flat_map(|v| v.allocs())
-                .collect();
-            let label_alloc_map = self
-                .label_user_fn_alloc_map
-                .entry((label.clone(), return_state.writes.clone()))
-                .or_default();
-            while let Some(alloc) = allocs.pop_first() {
-                ptr_maps.entry(alloc).or_insert_with(|| {
-                    let alloc_v = return_state.heap.get(alloc);
-                    allocs.extend(alloc_v.allocs());
-                    let i = if let Some(i) = label_alloc_map.get(&alloc) {
-                        if *i < state.heap.len() {
-                            let old_v = state.heap.get_mut(*i);
-                            *old_v = old_v.join(alloc_v);
-                            *i
-                        } else {
-                            state.heap.push(alloc_v.clone())
-                        }
-                    } else {
-                        state.heap.push(alloc_v.clone())
-                    };
-                    label_alloc_map.insert(alloc, i);
-                    AbsPtr::alloc(i)
-                });
-            }
             for (p, a) in &ptr_maps {
-                let v = return_state.heap.get(*p).subst(&ptr_maps);
+                let v = return_state.args.get(*p).subst(&ptr_maps);
                 self.indirect_assign(a, &v, &[], &mut state);
             }
             let ret_v = ret_v.subst(&ptr_maps);
@@ -266,7 +215,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         return None;
                     };
                     Some(ptrs.iter().filter_map(|ptr| {
-                        let (mut path, _) = AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                        let (mut path, _) = AbsPath::from_place(ptr, &self.ptr_params)?;
                         path.0.extend(read.0[1..].to_owned());
                         Some(path)
                     }))
@@ -286,7 +235,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     } else {
                         return None;
                     };
-                    let (mut path, array_access) = AbsPath::from_place(ptr, &self.alloc_param_map)?;
+                    let (mut path, array_access) = AbsPath::from_place(ptr, &self.ptr_params)?;
                     if array_access {
                         return None;
                     }
@@ -346,10 +295,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         callee: DefId,
         args: &[AbsValue],
-        state: &mut AbsState,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
-        label: &Label,
     ) -> AbsValue {
         let sig = self.tcx.fn_sig(callee).skip_binder();
         let inputs = sig.inputs().skip_binder();
@@ -397,20 +344,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
-            self.top_value_of_ty(&output, None, &mut BTreeSet::new())
+            self.top_value_of_ty(&output)
         } else if output.is_unsafe_ptr() {
-            let i = if let Some(i) = self.label_alloc_map.get(label) {
-                if *i < state.heap.len() {
-                    *state.heap.get_mut(*i) = AbsValue::top();
-                    *i
-                } else {
-                    state.heap.push(AbsValue::top())
-                }
-            } else {
-                state.heap.push(AbsValue::top())
-            };
-            self.label_alloc_map.insert(label.clone(), i);
-            AbsValue::alloc(i)
+            AbsValue::heap()
         } else {
             AbsValue::top()
         }
@@ -637,9 +573,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             Rvalue::Cast(kind, operand, ty) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match kind {
-                    CastKind::PointerExposeAddress => {
-                        self.top_value_of_ty(ty, None, &mut BTreeSet::new())
-                    }
+                    CastKind::PointerExposeAddress => self.top_value_of_ty(ty),
                     CastKind::PointerFromExposedAddress => {
                         let zero: BTreeSet<u128> = [0].into_iter().collect();
                         if v.uintv.gamma().map(|s| s == &zero).unwrap_or(false) {
@@ -841,7 +775,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 } else if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
                     self.transfer_const_value(&v, &ty)
                 } else {
-                    self.top_value_of_ty(&ty, None, &mut BTreeSet::new())
+                    self.top_value_of_ty(&ty)
                 }
             }
             ConstantKind::Val(v, ty) => self.transfer_const_value(&v, &ty),
@@ -890,14 +824,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     match alloc {
                         GlobalAlloc::Function(_) => unreachable!("{:?}", alloc),
                         GlobalAlloc::VTable(_, _) => unreachable!("{:?}", alloc),
-                        GlobalAlloc::Static(def_id) => {
-                            let i = self.static_allocs.get(&def_id).unwrap();
-                            AbsValue::alloc(*i)
-                        }
-                        GlobalAlloc::Memory(_) => {
-                            let i = self.literal_allocs.get(&ptr.provenance).unwrap();
-                            AbsValue::alloc(*i)
-                        }
+                        GlobalAlloc::Static(_) | GlobalAlloc::Memory(_) => AbsValue::heap(),
                     }
                 }
             },
@@ -927,12 +854,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
     }
 
-    pub fn top_value_of_ty(
-        &self,
-        ty: &Ty<'tcx>,
-        mut heap: Option<&mut AbsHeap>,
-        adts: &mut BTreeSet<DefId>,
-    ) -> AbsValue {
+    pub fn top_value_of_ty(&self, ty: &Ty<'tcx>) -> AbsValue {
         match ty.kind() {
             TyKind::Bool => AbsValue::top_bool(),
             TyKind::Char => unreachable!("{:?}", ty),
@@ -948,7 +870,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             .iter()
                             .map(|field| {
                                 let ty = field.ty(self.tcx, arg);
-                                self.top_value_of_ty(&ty, heap.as_deref_mut(), adts)
+                                self.top_value_of_ty(&ty)
                             })
                             .collect(),
                     )
@@ -967,35 +889,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Array(ty, len) => {
                 let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
                 if len <= 100 {
-                    AbsValue::alpha_list(
-                        (0..len)
-                            .map(|_| self.top_value_of_ty(ty, heap.as_deref_mut(), adts))
-                            .collect(),
-                    )
+                    AbsValue::alpha_list((0..len).map(|_| self.top_value_of_ty(ty)).collect())
                 } else {
                     AbsValue::top_list()
                 }
             }
             TyKind::Slice(_) => unreachable!("{:?}", ty),
-            TyKind::RawPtr(TypeAndMut { ty, .. }) | TyKind::Ref(_, ty, _) => {
-                let def_id = if let Some(adt) = ty.ty_adt_def() {
-                    let def_id = adt.did();
-                    if adts.insert(def_id) {
-                        Some(def_id)
-                    } else {
-                        return AbsValue::top_ptr();
-                    }
-                } else {
-                    None
-                };
-                let v = self.top_value_of_ty(ty, heap.as_deref_mut(), adts);
-                if let Some(def_id) = def_id {
-                    adts.remove(&def_id);
-                }
-                let heap = heap.unwrap();
-                let i = heap.push(v);
-                AbsValue::alloc(i)
-            }
+            TyKind::RawPtr(TypeAndMut { .. }) | TyKind::Ref(_, _, _) => AbsValue::heap(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
             TyKind::FnPtr(_) => todo!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
@@ -1004,11 +904,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::GeneratorWitness(_) => unreachable!("{:?}", ty),
             TyKind::GeneratorWitnessMIR(_, _) => unreachable!("{:?}", ty),
             TyKind::Never => AbsValue::bot(),
-            TyKind::Tuple(tys) => AbsValue::alpha_list(
-                tys.iter()
-                    .map(|ty| self.top_value_of_ty(&ty, heap.as_deref_mut(), adts))
-                    .collect(),
-            ),
+            TyKind::Tuple(tys) => {
+                AbsValue::alpha_list(tys.iter().map(|ty| self.top_value_of_ty(&ty)).collect())
+            }
             TyKind::Alias(_, _) => unreachable!("{:?}", ty),
             TyKind::Param(_) => unreachable!("{:?}", ty),
             TyKind::Bound(_, _) => unreachable!("{:?}", ty),
@@ -1080,6 +978,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         if let AbsPtr::Set(ptrs) = ptr {
             let weak = ptrs.len() > 1;
             for ptr in ptrs {
+                if ptr.base == AbsBase::Heap {
+                    continue;
+                }
                 let old_v = some_or!(state.get_mut(ptr.base), continue);
                 let mut ptr_projection = ptr.projection.clone();
                 ptr_projection.extend(projection.to_owned());
@@ -1095,7 +996,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if ptrs.len() == 1 {
                 let mut ptr = ptrs.first().unwrap().clone();
                 ptr.projection.extend(projection.to_owned());
-                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.alloc_param_map) {
+                if let Some((path, false)) = AbsPath::from_place(&ptr, &self.ptr_params) {
                     return self.expands_path(&path);
                 }
             }
@@ -1169,7 +1070,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .cloned()
                 .filter_map(|mut ptr| {
                     ptr.projection.extend(projection.to_owned());
-                    AbsPath::from_place(&ptr, &self.alloc_param_map).map(|(path, _)| path)
+                    AbsPath::from_place(&ptr, &self.ptr_params).map(|(path, _)| path)
                 })
                 .flat_map(|path| self.expands_path(&path))
                 .collect()
