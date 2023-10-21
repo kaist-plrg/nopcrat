@@ -65,6 +65,8 @@ fn main() {
             println!("  {:?}", param);
         }
     }
+    println!("{}", analysis_result.len());
+
     if let Some(dump_file) = args.dump_analysis_result {
         let dump_file = File::create(dump_file).unwrap();
         serde_json::to_writer_pretty(dump_file, &analysis_result).unwrap();

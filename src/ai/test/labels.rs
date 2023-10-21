@@ -396,43 +396,6 @@ fn test_div() {
 }
 
 #[test]
-fn test_realloc() {
-    let code = "
-        extern crate libc;
-        extern \"C\" {
-            fn realloc(_: *mut libc::c_void, _: libc::c_ulong) -> *mut libc::c_void;
-        }
-        unsafe fn f(p: *mut i32) {
-            realloc(p as *mut libc::c_void, 4);
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-
-    assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].reads.len(), 0);
-}
-
-#[test]
-fn test_getgroups() {
-    let code = "
-        extern crate libc;
-        extern \"C\" {
-            fn getgroups(__size: libc::c_int, __list: *mut __gid_t) -> libc::c_int;
-        }
-        unsafe fn f(n: i32, p: *mut i32) {
-            getgroups(n, p as *mut _);
-        }
-    ";
-    let result = analyze(code);
-    assert_eq!(result.len(), 1);
-
-    assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].writes.as_vec()[0].0, vec![2]);
-    assert_eq!(result[0].reads.len(), 0);
-}
-
-#[test]
 fn test_unknown_read() {
     let code = "
         extern \"C\" {

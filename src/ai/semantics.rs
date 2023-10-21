@@ -6,9 +6,9 @@ use rustc_const_eval::interpret::{AllocRange, ConstValue, GlobalAlloc, Scalar};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Location, Mutability, Operand,
-        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
-        TerminatorKind, UnOp,
+        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Location, Operand, Place,
+        PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        UnOp,
     },
     ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind, TypeAndMut},
 };
@@ -159,7 +159,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if let Some(summary) = self.summaries.get(&callee) {
                 return self.transfer_intra_call(&summary.clone(), args, dst, state, reads);
             } else if name.contains("{extern#0}") {
-                self.transfer_c_call(callee, args, &mut reads, &mut writes)
+                self.transfer_c_call(callee, args, &mut reads)
             } else if name.contains("{impl#") {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
@@ -296,51 +296,29 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         callee: DefId,
         args: &[AbsValue],
         reads: &mut Vec<AbsPath>,
-        writes: &mut Vec<AbsPath>,
     ) -> AbsValue {
         let sig = self.tcx.fn_sig(callee).skip_binder();
         let inputs = sig.inputs().skip_binder();
         let output = sig.output().skip_binder();
 
-        let name = self.def_id_to_string(callee);
-        let fn_name = name.split("::").last().unwrap();
-
-        let (read_args, write_args) = if inputs.iter().all(|ty| ty.is_primitive())
-            || fn_name == "free"
-            || fn_name == "realloc"
-            || fn_name == "regfree"
-            || fn_name == "dlclose"
-        {
-            (vec![], vec![])
-        } else if fn_name == "dlsym" {
-            (vec![0, 1], vec![])
-        } else {
-            let (const_ptrs, mut_ptrs): (Vec<_>, Vec<_>) = inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(i, ty)| {
-                    if let TyKind::RawPtr(TypeAndMut { ty, mutbl }) = ty.kind() {
-                        if let TyKind::Adt(adt, _) = ty.kind() {
-                            if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
-                                return None;
-                            }
+        let ptr_args: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ty)| {
+                if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+                    if let TyKind::Adt(adt, _) = ty.kind() {
+                        if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
+                            return None;
                         }
-                        return Some((i, mutbl));
                     }
-                    None
-                })
-                .partition(|(_, mutbl)| matches!(mutbl, Mutability::Not));
-            let const_ptrs: Vec<_> = const_ptrs.into_iter().map(|(i, _)| i).collect();
-            let mut_ptrs: Vec<_> = mut_ptrs.into_iter().map(|(i, _)| i).collect();
-            (const_ptrs, mut_ptrs)
-        };
-        for arg in read_args {
+                    return Some(i);
+                }
+                None
+            })
+            .collect();
+        for arg in ptr_args {
             let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
             reads.extend(reads2);
-        }
-        for arg in write_args {
-            let writes2 = self.get_write_paths_of_ptr(&args[arg].ptrv, &[]);
-            writes.extend(writes2);
         }
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
