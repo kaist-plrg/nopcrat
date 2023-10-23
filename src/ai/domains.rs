@@ -36,6 +36,15 @@ impl AbsState {
         }
     }
 
+    pub fn widen(&self, other: &Self) -> Self {
+        Self {
+            local: self.local.widen(&other.local),
+            args: self.args.widen(&other.args),
+            reads: self.reads.widen(&other.reads),
+            writes: self.writes.widen(&other.writes),
+        }
+    }
+
     pub fn ord(&self, other: &Self) -> bool {
         self.local.ord(&other.local)
             && self.args.ord(&other.args)
@@ -105,6 +114,18 @@ impl AbsArgs {
         )
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        Self(
+            (0..self.0.len().max(other.0.len()))
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(v1), Some(v2)) => v1.widen(v2),
+                    (Some(v), None) | (None, Some(v)) => v.clone(),
+                    _ => unreachable!(),
+                })
+                .collect(),
+        )
+    }
+
     fn ord(&self, other: &Self) -> bool {
         self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
     }
@@ -152,6 +173,18 @@ impl AbsLocal {
             (0..self.0.len().max(other.0.len()))
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(v1), Some(v2)) => v1.join(v2),
+                    (Some(v), None) | (None, Some(v)) => v.clone(),
+                    _ => unreachable!(),
+                })
+                .collect(),
+        )
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        Self(
+            (0..self.0.len().max(other.0.len()))
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(v1), Some(v2)) => v1.widen(v2),
                     (Some(v), None) | (None, Some(v)) => v.clone(),
                     _ => unreachable!(),
                 })
@@ -587,6 +620,55 @@ impl AbsValue {
             let ptrv = self.ptrv.join(&other.ptrv);
             let optionv = self.optionv.join(&other.optionv);
             let fnv = self.fnv.join(&other.fnv);
+            let is_bots = (
+                intv.is_bot(),
+                uintv.is_bot(),
+                floatv.is_bot(),
+                boolv.is_bot(),
+                listv.is_bot(),
+                ptrv.is_bot(),
+                optionv.is_bot(),
+                fnv.is_bot(),
+            );
+            match is_bots {
+                (_, true, true, true, true, true, true, true) => Self::int(intv),
+                (true, _, true, true, true, true, true, true) => Self::uint(uintv),
+                (true, true, _, true, true, true, true, true) => Self::float(floatv),
+                (true, true, true, _, true, true, true, true) => Self::boolean(boolv),
+                (true, true, true, true, _, true, true, true) => Self::list(listv),
+                (true, true, true, true, true, _, true, true) => Self::ptr(ptrv),
+                (true, true, true, true, true, true, _, true) => Self::option(optionv),
+                (true, true, true, true, true, true, true, _) => Self::func(fnv),
+                _ => Self::new(AbsVal {
+                    intv,
+                    uintv,
+                    floatv,
+                    boolv,
+                    listv,
+                    ptrv,
+                    optionv,
+                    fnv,
+                }),
+            }
+        }
+    }
+
+    pub fn widen(&self, other: &Self) -> Self {
+        if self.is_top() || other.is_top() {
+            Self::top()
+        } else if Arc::ptr_eq(&self.0, &other.0) || other.is_bot() {
+            self.clone()
+        } else if self.is_bot() {
+            other.clone()
+        } else {
+            let intv = self.intv.widen(&other.intv);
+            let uintv = self.uintv.widen(&other.uintv);
+            let floatv = self.floatv.widen(&other.floatv);
+            let boolv = self.boolv.widen(&other.boolv);
+            let listv = self.listv.widen(&other.listv);
+            let ptrv = self.ptrv.widen(&other.ptrv);
+            let optionv = self.optionv.widen(&other.optionv);
+            let fnv = self.fnv.widen(&other.fnv);
             let is_bots = (
                 intv.is_bot(),
                 uintv.is_bot(),
@@ -1342,6 +1424,21 @@ impl AbsInt {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
+        }
+    }
+
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
@@ -1635,6 +1732,21 @@ impl AbsUint {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
+        }
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
         }
     }
 
@@ -1934,6 +2046,21 @@ impl AbsFloat {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
+        }
+    }
+
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
@@ -2164,6 +2291,10 @@ impl AbsBool {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        self.join(other)
+    }
+
     fn ord(&self, other: &Self) -> bool {
         matches!(
             (self, other),
@@ -2280,6 +2411,19 @@ impl AbsList {
                 l1.iter()
                     .zip(l2.iter())
                     .map(|(v1, v2)| v1.join(v2))
+                    .collect(),
+            ),
+            _ => Self::Top,
+        }
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Bot, v) | (v, Self::Bot) => v.clone(),
+            (Self::List(l1), Self::List(l2)) if l1.len() == l2.len() => Self::List(
+                l1.iter()
+                    .zip(l2.iter())
+                    .map(|(v1, v2)| v1.widen(v2))
                     .collect(),
             ),
             _ => Self::Top,
@@ -2473,6 +2617,21 @@ impl AbsPtr {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
+        }
+    }
+
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) => true,
@@ -2596,6 +2755,15 @@ impl AbsOption {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Bot, v) | (v, Self::Bot) => v.clone(),
+            (Self::None, Self::None) => Self::None,
+            (Self::Some(v1), Self::Some(v2)) => Self::Some(v1.widen(v2)),
+            _ => Self::Top,
+        }
+    }
+
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (_, Self::Top) | (Self::Bot, _) | (Self::None, Self::None) => true,
@@ -2687,6 +2855,21 @@ impl AbsFn {
         match (self, other) {
             (Self::Top, _) | (_, Self::Top) => Self::Top,
             (Self::Set(s1), Self::Set(s2)) => Self::alphas(s1.union(s2).cloned().collect()),
+        }
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Set(s1), Self::Set(s2)) => {
+                if s2.is_subset(s1) {
+                    self.clone()
+                } else if s1.is_empty() {
+                    other.clone()
+                } else {
+                    Self::Top
+                }
+            }
         }
     }
 
@@ -2782,6 +2965,10 @@ impl MustPathSet {
         }
     }
 
+    fn widen(&self, other: &Self) -> Self {
+        self.join(other)
+    }
+
     fn ord(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::All, _) => true,
@@ -2871,6 +3058,11 @@ impl MayPathSet {
 
     fn join(&self, other: &Self) -> Self {
         Self(self.0.union(&other.0).cloned().collect())
+    }
+
+    #[inline]
+    fn widen(&self, other: &Self) -> Self {
+        self.join(other)
     }
 
     #[inline]

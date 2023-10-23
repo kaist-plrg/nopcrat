@@ -206,7 +206,12 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
                 tracing::info!("{:?}", def_id);
                 let mut analyzer = Analyzer::new(tcx, &info_map[def_id], input_summaries.clone());
                 let body = tcx.optimized_mir(*def_id);
-                println!("{:?} {}", def_id, body.basic_blocks.len());
+                println!(
+                    "{:?} {} {}",
+                    def_id,
+                    body.basic_blocks.len(),
+                    body.local_decls.len()
+                );
                 let summary = analyzer.make_summary(body);
 
                 let summary = if let Some(old) = input_summaries.get(def_id) {
@@ -334,6 +339,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .or_default()
             .insert(start_label.writes.clone(), start_state.clone());
 
+        let loop_heads: BTreeSet<Location> = self
+            .info
+            .loop_blocks
+            .keys()
+            .map(|bb| bb.start_location())
+            .collect();
         let mut merge_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
         for bbs in self.info.loop_blocks.values() {
             merge_blocks.extend(bbs);
@@ -371,8 +382,16 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         &bot
                     };
                     let mut joined = next_state.clone();
-                    for new_next_state in &new_next_states {
-                        joined = joined.join(new_next_state);
+                    if let Some(st) = new_next_states.first() {
+                        let mut new_next_state = st.clone();
+                        for st in new_next_states.iter().skip(1) {
+                            new_next_state = new_next_state.join(st);
+                        }
+                        if loop_heads.contains(location) {
+                            joined = joined.widen(&new_next_state);
+                        } else {
+                            joined = joined.join(&new_next_state);
+                        }
                     }
                     if !joined.ord(next_state) {
                         work_list.remove_location(*location);
@@ -392,7 +411,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             .get(location)
                             .and_then(|states| states.get(&new_next_state.writes))
                             .unwrap_or(&bot);
-                        let joined = next_state.join(new_next_state);
+                        let joined = if loop_heads.contains(location) {
+                            next_state.widen(new_next_state)
+                        } else {
+                            next_state.join(new_next_state)
+                        };
                         if !joined.ord(next_state) {
                             let next_label = Label {
                                 location: *location,

@@ -262,3 +262,19 @@ fn test_const() {
     assert_eq!(result.len(), 1);
     assert_eq!(as_int(ret(&result[0])), vec![0]);
 }
+
+#[test]
+fn test_while() {
+    let code = "
+        fn f() -> i32 {
+            let mut x = 0;
+            while x < 2 {
+                x = x + 1;
+            }
+            x
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert!(ret(&result[0]).intv.is_top());
+}
