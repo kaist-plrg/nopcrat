@@ -99,7 +99,7 @@ fn transform(
                     .iter()
                     .map(|param| {
                         let index = param.index - 1;
-                        let (span, name) = body_params.get(&index).unwrap();
+                        let (span, name) = &body_params[&index];
                         let ty = source_map
                             .span_to_snippet(sig.decl.inputs[index].span)
                             .unwrap()

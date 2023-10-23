@@ -72,7 +72,7 @@ pub fn collect_output_params(
                 let writes: BTreeSet<_> = per_base
                     .into_iter()
                     .filter_map(|(i, paths)| {
-                        if reads.contains(&i) || expanded_map.get(&i).unwrap() != &paths {
+                        if reads.contains(&i) || expanded_map[&i] != paths {
                             None
                         } else {
                             Some(i)
@@ -169,17 +169,15 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
     let mut info_map: BTreeMap<_, _> = funcs
         .iter()
         .map(|def_id| {
-            let inputs = *inputs_map.get(def_id).unwrap();
+            let inputs = inputs_map[def_id];
             let body = tcx.optimized_mir(def_id);
             let param_tys = get_param_tys(body, inputs, tcx);
-            let dominating_map = get_dominating_map(body);
-            let loop_heads = get_loop_heads(body);
             let rpo_map = get_rpo_map(body);
+            let loop_blocks = get_loop_blocks(body, &rpo_map);
             let info = FuncInfo {
                 inputs,
                 param_tys,
-                dominating_map,
-                loop_heads,
+                loop_blocks,
                 rpo_map,
             };
             (*def_id, info)
@@ -188,10 +186,10 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
 
     let mut summaries = BTreeMap::new();
     for id in &po {
-        let def_ids = elems.get(id).unwrap();
+        let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
             let def_id = def_ids.first().unwrap();
-            call_graph.get(def_id).unwrap().contains(def_id)
+            call_graph[def_id].contains(def_id)
         } else {
             true
         };
@@ -205,11 +203,11 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
             }
 
             for def_id in def_ids {
-                println!("{:?}", def_id);
                 tracing::info!("{:?}", def_id);
-                let mut analyzer =
-                    Analyzer::new(tcx, info_map.get(def_id).unwrap(), input_summaries.clone());
-                let summary = analyzer.make_summary(tcx.optimized_mir(*def_id));
+                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], input_summaries.clone());
+                let body = tcx.optimized_mir(*def_id);
+                println!("{:?} {}", def_id, body.basic_blocks.len());
+                let summary = analyzer.make_summary(body);
 
                 let summary = if let Some(old) = input_summaries.get(def_id) {
                     summary.join(old)
@@ -221,8 +219,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
 
             if !recursive
                 || def_ids.iter().all(|def_id| {
-                    let old = input_summaries.get(def_id).unwrap();
-                    let new = summaries.get(def_id).unwrap();
+                    let old = &input_summaries[def_id];
+                    let new = &summaries[def_id];
                     new.ord(old)
                 })
             {
@@ -261,8 +259,7 @@ pub enum ReturnValues {
 struct FuncInfo {
     inputs: usize,
     param_tys: Vec<TypeInfo>,
-    dominating_map: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
-    loop_heads: BTreeSet<Location>,
+    loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     rpo_map: BTreeMap<BasicBlock, usize>,
 }
 
@@ -304,9 +301,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
         AbsState,
     ) {
-        let mut work_list: WorkList<'_>;
-        let mut states: BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>;
-
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
 
@@ -331,105 +325,87 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         };
         let bot = AbsState::bot();
 
-        let mut merging_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
-        loop {
-            work_list = WorkList::new(&self.info.rpo_map);
-            work_list.push(start_label.clone());
+        let mut work_list = WorkList::new(&self.info.rpo_map);
+        work_list.push(start_label.clone());
 
-            states = BTreeMap::new();
-            states
-                .entry(start_label.location)
-                .or_default()
-                .insert(start_label.writes.clone(), start_state.clone());
+        let mut states: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+        states
+            .entry(start_label.location)
+            .or_default()
+            .insert(start_label.writes.clone(), start_state.clone());
 
-            let mut restart = false;
-            while let Some(label) = work_list.pop() {
-                let state = states
-                    .get(&label.location)
-                    .and_then(|states| states.get(&label.writes))
-                    .unwrap_or(&bot);
-                tracing::info!("\n{:?}\n{:?}", label, state);
-                let Location {
+        let mut merge_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
+        for bbs in self.info.loop_blocks.values() {
+            merge_blocks.extend(bbs);
+        }
+        while let Some(label) = work_list.pop() {
+            let state = states
+                .get(&label.location)
+                .and_then(|states| states.get(&label.writes))
+                .unwrap_or(&bot);
+            tracing::info!("\n{:?}\n{:?}", label, state);
+            let Location {
+                block,
+                statement_index,
+            } = label.location;
+            let bbd = &body.basic_blocks[block];
+            let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
+                let stmt = &bbd.statements[statement_index];
+                let new_next_state = self.transfer_statement(stmt, state);
+                let next_location = Location {
                     block,
-                    statement_index,
-                } = label.location;
-                let bbd = &body.basic_blocks[block];
-                let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
-                    let stmt = &bbd.statements[statement_index];
-                    let new_next_state = self.transfer_statement(stmt, state);
-                    let next_location = Location {
-                        block,
-                        statement_index: statement_index + 1,
-                    };
-                    (vec![new_next_state], vec![next_location])
-                } else {
-                    let terminator = bbd.terminator.as_ref().unwrap();
-                    let (new_next_states, next_locations) =
-                        self.transfer_terminator(terminator, state);
-                    (new_next_states, next_locations)
+                    statement_index: statement_index + 1,
                 };
-                for location in &next_locations {
-                    if merging_blocks.contains(&location.block) {
-                        let next_state = if let Some(states) = states.get(location) {
-                            assert_eq!(states.len(), 1);
-                            states.first_key_value().unwrap().1
-                        } else {
-                            &bot
+                (vec![new_next_state], vec![next_location])
+            } else {
+                let terminator = bbd.terminator.as_ref().unwrap();
+                let (new_next_states, next_locations) = self.transfer_terminator(terminator, state);
+                (new_next_states, next_locations)
+            };
+            for location in &next_locations {
+                if merge_blocks.contains(&location.block) {
+                    let next_state = if let Some(states) = states.get(location) {
+                        assert_eq!(states.len(), 1);
+                        states.first_key_value().unwrap().1
+                    } else {
+                        &bot
+                    };
+                    let mut joined = next_state.clone();
+                    for new_next_state in &new_next_states {
+                        joined = joined.join(new_next_state);
+                    }
+                    if !joined.ord(next_state) {
+                        work_list.remove_location(*location);
+                        let next_label = Label {
+                            location: *location,
+                            writes: joined.writes.clone(),
                         };
-                        let mut joined = next_state.clone();
-                        for new_next_state in &new_next_states {
-                            joined = joined.join(new_next_state);
-                        }
+                        work_list.push(next_label);
+
+                        let mut new_map = BTreeMap::new();
+                        new_map.insert(joined.writes.clone(), joined);
+                        states.insert(*location, new_map);
+                    }
+                } else {
+                    for new_next_state in &new_next_states {
+                        let next_state = states
+                            .get(location)
+                            .and_then(|states| states.get(&new_next_state.writes))
+                            .unwrap_or(&bot);
+                        let joined = next_state.join(new_next_state);
                         if !joined.ord(next_state) {
-                            work_list.remove_location(*location);
                             let next_label = Label {
                                 location: *location,
-                                writes: joined.writes.clone(),
+                                writes: new_next_state.writes.clone(),
                             };
+                            states
+                                .entry(*location)
+                                .or_default()
+                                .insert(next_label.writes.clone(), joined);
                             work_list.push(next_label);
-
-                            let mut new_map = BTreeMap::new();
-                            new_map.insert(joined.writes.clone(), joined);
-                            states.insert(*location, new_map);
-                        }
-                    } else {
-                        for new_next_state in &new_next_states {
-                            let next_state = states
-                                .get(location)
-                                .and_then(|states| states.get(&new_next_state.writes))
-                                .unwrap_or(&bot);
-                            let joined = next_state.join(new_next_state);
-                            if !joined.ord(next_state) {
-                                let next_label = Label {
-                                    location: *location,
-                                    writes: new_next_state.writes.clone(),
-                                };
-                                states
-                                    .entry(*location)
-                                    .or_default()
-                                    .insert(next_label.writes.clone(), joined);
-                                work_list.push(next_label);
-                            }
                         }
                     }
                 }
-                for next_location in next_locations {
-                    if !self.info.loop_heads.contains(&next_location) {
-                        continue;
-                    }
-                    let len = states.get(&next_location).unwrap().keys().len();
-                    if len > 3 {
-                        merging_blocks
-                            .extend(self.info.dominating_map.get(&next_location.block).unwrap());
-                        restart = true;
-                    }
-                }
-                if restart {
-                    break;
-                }
-            }
-            if !restart {
-                break;
             }
         }
 
@@ -568,10 +544,10 @@ impl<'a> WorkList<'a> {
     }
 
     fn push(&mut self, label: Label) {
-        let block_idx = self.rpo_map.get(&label.location.block).unwrap();
+        let block_idx = self.rpo_map[&label.location.block];
         let labels = self
             .labels
-            .entry((*block_idx, label.location.statement_index))
+            .entry((block_idx, label.location.statement_index))
             .or_default();
         if !labels.contains(&label) {
             labels.push(label)
@@ -579,8 +555,8 @@ impl<'a> WorkList<'a> {
     }
 
     fn remove_location(&mut self, location: Location) {
-        let block_idx = self.rpo_map.get(&location.block).unwrap();
-        self.labels.remove(&(*block_idx, location.statement_index));
+        let block_idx = self.rpo_map[&location.block];
+        self.labels.remove(&(block_idx, location.statement_index));
     }
 
     #[allow(unused)]
@@ -690,19 +666,13 @@ fn get_rpo_map(body: &Body<'_>) -> BTreeMap<BasicBlock, usize> {
         .collect()
 }
 
-fn get_dominating_map(body: &Body<'_>) -> BTreeMap<BasicBlock, BTreeSet<BasicBlock>> {
+fn get_loop_blocks(
+    body: &Body<'_>,
+    rpo_map: &BTreeMap<BasicBlock, usize>,
+) -> BTreeMap<BasicBlock, BTreeSet<BasicBlock>> {
     let dominators = body.basic_blocks.dominators();
-    let map = body
+    let loop_heads: BTreeSet<_> = body
         .basic_blocks
-        .indices()
-        .map(|bb| (bb, dominators.dominators(bb).collect()))
-        .collect();
-    graph::inverse(&map)
-}
-
-fn get_loop_heads(body: &Body<'_>) -> BTreeSet<Location> {
-    let dominators = body.basic_blocks.dominators();
-    body.basic_blocks
         .indices()
         .flat_map(|bb| {
             let mut doms: Vec<_> = dominators.dominators(bb).collect();
@@ -710,7 +680,30 @@ fn get_loop_heads(body: &Body<'_>) -> BTreeSet<Location> {
             doms.retain(|dom| succs.contains(dom));
             doms
         })
-        .map(|bb| bb.start_location())
+        .collect();
+    let mut loop_heads: Vec<_> = loop_heads.into_iter().collect();
+    loop_heads.sort_by_key(|bb| rpo_map[bb]);
+
+    let succ_map: BTreeMap<_, BTreeSet<_>> = body
+        .basic_blocks
+        .indices()
+        .map(|bb| (bb, body.basic_blocks.successors(bb).collect()))
+        .collect();
+    let mut inv_map = graph::inverse(&succ_map);
+    loop_heads
+        .into_iter()
+        .map(|head| {
+            let reachables = graph::reachable_vertices(&inv_map, head);
+            for succs in inv_map.values_mut() {
+                succs.remove(&head);
+            }
+            let loop_blocks = body
+                .basic_blocks
+                .indices()
+                .filter(|bb| dominators.dominates(head, *bb) && reachables.contains(bb))
+                .collect();
+            (head, loop_blocks)
+        })
         .collect()
 }
 

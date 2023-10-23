@@ -19,7 +19,6 @@
 #![warn(trivial_casts)]
 #![warn(trivial_numeric_casts)]
 #![warn(unreachable_pub)]
-#![warn(unsafe_code)]
 #![warn(unsafe_op_in_unsafe_fn)]
 #![warn(unused_extern_crates)]
 #![warn(unused_import_braces)]
@@ -32,6 +31,7 @@
 #![feature(iter_intersperse)]
 #![feature(map_try_insert)]
 #![feature(box_patterns)]
+#![feature(box_into_inner)]
 
 extern crate rustc_abi;
 extern crate rustc_const_eval;

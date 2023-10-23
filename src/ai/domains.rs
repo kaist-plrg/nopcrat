@@ -2524,7 +2524,7 @@ impl AbsPtr {
                         AbsBase::Heap => return Self::heap(),
                         AbsBase::Null => return Self::null(),
                     };
-                    let ptrs = if let AbsPtr::Set(ptrs) = map.get(alloc).unwrap() {
+                    let ptrs = if let AbsPtr::Set(ptrs) = &map[alloc] {
                         ptrs
                     } else {
                         return AbsPtr::Top;
