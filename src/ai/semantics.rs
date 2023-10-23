@@ -475,6 +475,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | ("", "convert", "Into", "into")
             | ("", "", "vec", "from_elem")
             | ("", "result", _, "unwrap")
+            | ("", "num", _, "swap_bytes")
             | (
                 "ops",
                 "arith",

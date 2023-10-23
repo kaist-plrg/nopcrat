@@ -16,6 +16,8 @@ struct Args {
 
     #[arg(short, long)]
     max_loop_head_states: Option<usize>,
+    #[arg(long)]
+    no_widening: bool,
 
     #[arg(short, long)]
     transform: bool,
@@ -60,6 +62,7 @@ fn main() {
 
     let conf = ai::analysis::AnalysisConfig {
         max_loop_head_states: args.max_loop_head_states.unwrap_or(1),
+        widening: !args.no_widening,
     };
     let analysis_result = if let Some(dump_file) = args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();

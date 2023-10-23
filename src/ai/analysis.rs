@@ -25,12 +25,14 @@ use crate::{rustc_data_structures::graph::WithSuccessors as _, *};
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisConfig {
     pub max_loop_head_states: usize,
+    pub widening: bool,
 }
 
 impl Default for AnalysisConfig {
     fn default() -> Self {
         Self {
             max_loop_head_states: 1,
+            widening: true,
         }
     }
 }
@@ -213,17 +215,16 @@ pub fn analyze(
         };
 
         loop {
-            let mut input_summaries = summaries.clone();
             if recursive {
                 for def_id in def_ids {
-                    let _ = input_summaries.try_insert(*def_id, FunctionSummary::bot());
+                    let _ = summaries.try_insert(*def_id, FunctionSummary::bot());
                 }
             }
 
+            let mut need_rerun = false;
             for def_id in def_ids {
                 tracing::info!("{:?}", def_id);
-                let mut analyzer =
-                    Analyzer::new(tcx, &info_map[def_id], conf, input_summaries.clone());
+                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
                 let body = tcx.optimized_mir(*def_id);
                 println!(
                     "{:?} {} {}",
@@ -233,21 +234,18 @@ pub fn analyze(
                 );
                 let summary = analyzer.make_summary(body);
 
-                let summary = if let Some(old) = input_summaries.get(def_id) {
-                    summary.join(old)
+                let (summary, updated) = if let Some(old) = summaries.get(def_id) {
+                    let new_summary = summary.join(old);
+                    let updated = !new_summary.ord(old);
+                    (new_summary, updated)
                 } else {
-                    summary
+                    (summary, false)
                 };
                 summaries.insert(*def_id, summary);
+                need_rerun |= updated;
             }
 
-            if !recursive
-                || def_ids.iter().all(|def_id| {
-                    let old = &input_summaries[def_id];
-                    let new = &summaries[def_id];
-                    new.ord(old)
-                })
-            {
+            if !need_rerun {
                 break;
             }
         }
@@ -291,7 +289,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
     conf: &'a AnalysisConfig,
-    pub summaries: BTreeMap<DefId, FunctionSummary>,
+    pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
 }
 
@@ -300,7 +298,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         info: &'a FuncInfo,
         conf: &'a AnalysisConfig,
-        summaries: BTreeMap<DefId, FunctionSummary>,
+        summaries: &'a BTreeMap<DefId, FunctionSummary>,
     ) -> Self {
         Self {
             tcx,
@@ -413,7 +411,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             for st in new_next_states.iter().skip(1) {
                                 new_next_state = new_next_state.join(st);
                             }
-                            if loop_heads.contains(location) {
+                            if loop_heads.contains(location) && self.conf.widening {
                                 joined = joined.widen(&new_next_state);
                             } else {
                                 joined = joined.join(&new_next_state);
@@ -437,7 +435,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 .get(location)
                                 .and_then(|states| states.get(&new_next_state.writes))
                                 .unwrap_or(&bot);
-                            let joined = if loop_heads.contains(location) {
+                            let joined = if loop_heads.contains(location) && self.conf.widening {
                                 next_state.widen(new_next_state)
                             } else {
                                 next_state.join(new_next_state)
@@ -458,13 +456,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 }
                 let mut restart = false;
                 for next_location in next_locations {
-                    if !loop_heads.contains(&next_location) {
-                        continue;
-                    }
-                    let len = states[&next_location].keys().len();
-                    if len > self.conf.max_loop_head_states {
-                        merging_blocks.extend(&self.info.loop_blocks[&next_location.block]);
-                        restart = true;
+                    for blocks in self.info.loop_blocks.values() {
+                        if !blocks.contains(&next_location.block) {
+                            continue;
+                        }
+                        let len = states[&next_location].keys().len();
+                        if len > self.conf.max_loop_head_states {
+                            merging_blocks.extend(blocks);
+                            restart = true;
+                        }
                     }
                 }
                 if restart {
