@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use clap::Parser;
@@ -9,19 +10,25 @@ use nopcrat::*;
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long)]
-    log_file: Option<PathBuf>,
-    #[arg(short, long)]
     dump_analysis_result: Option<PathBuf>,
-    #[arg(long)]
-    load_analysis_result: Option<PathBuf>,
     #[arg(short, long)]
-    output: Option<PathBuf>,
+    use_analysis_result: Option<PathBuf>,
+
+    #[arg(short, long)]
+    max_loop_head_states: Option<usize>,
+
     #[arg(short, long)]
     transform: bool,
+
+    #[arg(short, long)]
+    log_file: Option<PathBuf>,
+    #[arg(short, long)]
+    output: Option<PathBuf>,
     input: PathBuf,
 }
 
 fn main() {
+    let _t = Timer::new();
     let mut args = Args::parse();
 
     if let Some(log) = args.log_file {
@@ -51,11 +58,14 @@ fn main() {
     }
     assert!(path.is_file());
 
-    let analysis_result = if let Some(dump_file) = args.load_analysis_result {
+    let conf = ai::analysis::AnalysisConfig {
+        max_loop_head_states: args.max_loop_head_states.unwrap_or(1),
+    };
+    let analysis_result = if let Some(dump_file) = args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();
         serde_json::from_reader(dump_file).unwrap()
     } else {
-        ai::analysis::analyze_path(path)
+        ai::analysis::analyze_path(path, &conf)
     };
     // let analysis_result = ai::analysis::analyze_code("");
 
@@ -101,5 +111,23 @@ fn copy_dir(src: &Path, dst: &Path, root: bool) {
             fs::create_dir(&dst_path).unwrap();
             copy_dir(&src_path, &dst_path, false);
         }
+    }
+}
+
+struct Timer {
+    start: Instant,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        println!("{}s", self.start.elapsed().as_secs_f64().ceil() as usize);
     }
 }

@@ -22,18 +22,33 @@ use serde::{Deserialize, Serialize};
 use super::domains::*;
 use crate::{rustc_data_structures::graph::WithSuccessors as _, *};
 
-pub fn analyze_path(path: &Path) -> BTreeMap<String, Vec<OutputParam>> {
-    analyze_input(compile_util::path_to_input(path))
+#[derive(Debug, Clone, Copy)]
+pub struct AnalysisConfig {
+    pub max_loop_head_states: usize,
 }
 
-pub fn analyze_code(code: &str) -> BTreeMap<String, Vec<OutputParam>> {
-    analyze_input(compile_util::str_to_input(code))
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            max_loop_head_states: 1,
+        }
+    }
 }
 
-pub fn analyze_input(input: Input) -> BTreeMap<String, Vec<OutputParam>> {
+pub type AnalysisResult = BTreeMap<String, Vec<OutputParam>>;
+
+pub fn analyze_path(path: &Path, conf: &AnalysisConfig) -> AnalysisResult {
+    analyze_input(compile_util::path_to_input(path), conf)
+}
+
+pub fn analyze_code(code: &str, conf: &AnalysisConfig) -> AnalysisResult {
+    analyze_input(compile_util::str_to_input(code), conf)
+}
+
+pub fn analyze_input(input: Input, conf: &AnalysisConfig) -> AnalysisResult {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
-        let results = analyze(tcx);
+        let results = analyze(tcx, conf);
         collect_output_params(results, tcx)
     })
     .unwrap()
@@ -133,7 +148,10 @@ pub fn collect_output_params(
     func_param_map
 }
 
-pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)> {
+pub fn analyze(
+    tcx: TyCtxt<'_>,
+    conf: &AnalysisConfig,
+) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)> {
     let hir = tcx.hir();
 
     let mut call_graph = BTreeMap::new();
@@ -204,7 +222,8 @@ pub fn analyze(tcx: TyCtxt<'_>) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInf
 
             for def_id in def_ids {
                 tracing::info!("{:?}", def_id);
-                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], input_summaries.clone());
+                let mut analyzer =
+                    Analyzer::new(tcx, &info_map[def_id], conf, input_summaries.clone());
                 let body = tcx.optimized_mir(*def_id);
                 println!(
                     "{:?} {} {}",
@@ -271,6 +290,7 @@ struct FuncInfo {
 pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
+    conf: &'a AnalysisConfig,
     pub summaries: BTreeMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
 }
@@ -279,11 +299,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn new(
         tcx: TyCtxt<'tcx>,
         info: &'a FuncInfo,
+        conf: &'a AnalysisConfig,
         summaries: BTreeMap<DefId, FunctionSummary>,
     ) -> Self {
         Self {
             tcx,
             info,
+            conf,
             summaries,
             ptr_params: vec![],
         }
@@ -330,107 +352,127 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         };
         let bot = AbsState::bot();
 
-        let mut work_list = WorkList::new(&self.info.rpo_map);
-        work_list.push(start_label.clone());
-
-        let mut states: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
-        states
-            .entry(start_label.location)
-            .or_default()
-            .insert(start_label.writes.clone(), start_state.clone());
-
         let loop_heads: BTreeSet<Location> = self
             .info
             .loop_blocks
             .keys()
             .map(|bb| bb.start_location())
             .collect();
-        let mut merge_blocks: BTreeSet<BasicBlock> = BTreeSet::new();
-        for bbs in self.info.loop_blocks.values() {
-            merge_blocks.extend(bbs);
-        }
-        while let Some(label) = work_list.pop() {
-            let state = states
-                .get(&label.location)
-                .and_then(|states| states.get(&label.writes))
-                .unwrap_or(&bot);
-            tracing::info!("\n{:?}\n{:?}", label, state);
-            let Location {
-                block,
-                statement_index,
-            } = label.location;
-            let bbd = &body.basic_blocks[block];
-            let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
-                let stmt = &bbd.statements[statement_index];
-                let new_next_state = self.transfer_statement(stmt, state);
-                let next_location = Location {
-                    block,
-                    statement_index: statement_index + 1,
-                };
-                (vec![new_next_state], vec![next_location])
-            } else {
-                let terminator = bbd.terminator.as_ref().unwrap();
-                let (new_next_states, next_locations) = self.transfer_terminator(terminator, state);
-                (new_next_states, next_locations)
-            };
-            for location in &next_locations {
-                if merge_blocks.contains(&location.block) {
-                    let next_state = if let Some(states) = states.get(location) {
-                        assert_eq!(states.len(), 1);
-                        states.first_key_value().unwrap().1
-                    } else {
-                        &bot
-                    };
-                    let mut joined = next_state.clone();
-                    if let Some(st) = new_next_states.first() {
-                        let mut new_next_state = st.clone();
-                        for st in new_next_states.iter().skip(1) {
-                            new_next_state = new_next_state.join(st);
-                        }
-                        if loop_heads.contains(location) {
-                            joined = joined.widen(&new_next_state);
-                        } else {
-                            joined = joined.join(&new_next_state);
-                        }
-                    }
-                    if !joined.ord(next_state) {
-                        work_list.remove_location(*location);
-                        let next_label = Label {
-                            location: *location,
-                            writes: joined.writes.clone(),
-                        };
-                        work_list.push(next_label);
+        let mut merging_blocks = if self.conf.max_loop_head_states <= 1 {
+            self.info.loop_blocks.values().flatten().cloned().collect()
+        } else {
+            BTreeSet::new()
+        };
 
-                        let mut new_map = BTreeMap::new();
-                        new_map.insert(joined.writes.clone(), joined);
-                        states.insert(*location, new_map);
-                    }
+        let states = 'analysis_loop: loop {
+            let mut work_list = WorkList::new(&self.info.rpo_map);
+            work_list.push(start_label.clone());
+
+            let mut states: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+            states
+                .entry(start_label.location)
+                .or_default()
+                .insert(start_label.writes.clone(), start_state.clone());
+
+            while let Some(label) = work_list.pop() {
+                let state = states
+                    .get(&label.location)
+                    .and_then(|states| states.get(&label.writes))
+                    .unwrap_or(&bot);
+                tracing::info!("\n{:?}\n{:?}", label, state);
+                let Location {
+                    block,
+                    statement_index,
+                } = label.location;
+                let bbd = &body.basic_blocks[block];
+                let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
+                    let stmt = &bbd.statements[statement_index];
+                    let new_next_state = self.transfer_statement(stmt, state);
+                    let next_location = Location {
+                        block,
+                        statement_index: statement_index + 1,
+                    };
+                    (vec![new_next_state], vec![next_location])
                 } else {
-                    for new_next_state in &new_next_states {
-                        let next_state = states
-                            .get(location)
-                            .and_then(|states| states.get(&new_next_state.writes))
-                            .unwrap_or(&bot);
-                        let joined = if loop_heads.contains(location) {
-                            next_state.widen(new_next_state)
+                    let terminator = bbd.terminator.as_ref().unwrap();
+                    let (new_next_states, next_locations) =
+                        self.transfer_terminator(terminator, state);
+                    (new_next_states, next_locations)
+                };
+                for location in &next_locations {
+                    if merging_blocks.contains(&location.block) {
+                        let next_state = if let Some(states) = states.get(location) {
+                            assert_eq!(states.len(), 1);
+                            states.first_key_value().unwrap().1
                         } else {
-                            next_state.join(new_next_state)
+                            &bot
                         };
+                        let mut joined = next_state.clone();
+                        if let Some(st) = new_next_states.first() {
+                            let mut new_next_state = st.clone();
+                            for st in new_next_states.iter().skip(1) {
+                                new_next_state = new_next_state.join(st);
+                            }
+                            if loop_heads.contains(location) {
+                                joined = joined.widen(&new_next_state);
+                            } else {
+                                joined = joined.join(&new_next_state);
+                            }
+                        }
                         if !joined.ord(next_state) {
+                            work_list.remove_location(*location);
                             let next_label = Label {
                                 location: *location,
-                                writes: new_next_state.writes.clone(),
+                                writes: joined.writes.clone(),
                             };
-                            states
-                                .entry(*location)
-                                .or_default()
-                                .insert(next_label.writes.clone(), joined);
                             work_list.push(next_label);
+
+                            let mut new_map = BTreeMap::new();
+                            new_map.insert(joined.writes.clone(), joined);
+                            states.insert(*location, new_map);
+                        }
+                    } else {
+                        for new_next_state in &new_next_states {
+                            let next_state = states
+                                .get(location)
+                                .and_then(|states| states.get(&new_next_state.writes))
+                                .unwrap_or(&bot);
+                            let joined = if loop_heads.contains(location) {
+                                next_state.widen(new_next_state)
+                            } else {
+                                next_state.join(new_next_state)
+                            };
+                            if !joined.ord(next_state) {
+                                let next_label = Label {
+                                    location: *location,
+                                    writes: new_next_state.writes.clone(),
+                                };
+                                states
+                                    .entry(*location)
+                                    .or_default()
+                                    .insert(next_label.writes.clone(), joined);
+                                work_list.push(next_label);
+                            }
                         }
                     }
                 }
+                let mut restart = false;
+                for next_location in next_locations {
+                    if !loop_heads.contains(&next_location) {
+                        continue;
+                    }
+                    let len = states[&next_location].keys().len();
+                    if len > self.conf.max_loop_head_states {
+                        merging_blocks.extend(&self.info.loop_blocks[&next_location.block]);
+                        restart = true;
+                    }
+                }
+                if restart {
+                    continue 'analysis_loop;
+                }
             }
-        }
+            break states;
+        };
 
         (states, init_state)
     }
