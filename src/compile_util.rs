@@ -104,7 +104,7 @@ pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &BTreeMap<P, Vec<Suggestio
     }
 }
 
-pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
+pub fn make_suggestion(snippet: Snippet, replacement: String) -> Suggestion {
     let replacement = Replacement {
         snippet: snippet.clone(),
         replacement: replacement.to_string(),

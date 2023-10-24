@@ -5,7 +5,8 @@ use std::{
 
 use etrace::some_or;
 use rustc_hir::{
-    def::Res, intravisit::Visitor as HVisitor, Expr, ExprKind, FnRetTy, ItemKind, PatKind, QPath,
+    def::Res, intravisit::Visitor as HVisitor, Expr, ExprKind, FnRetTy, HirId, ItemKind, PatKind,
+    QPath, UnOp,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{BytePos, Span};
@@ -52,39 +53,43 @@ fn transform(
                                 span
                             }
                         } else {
-                            source_map.span_extend_to_next_char(span, ',', true)
+                            span.with_hi(span.hi() + BytePos(1))
                         };
                         let snippet = compile_util::span_to_snippet(span, source_map);
-                        let suggestion = compile_util::make_suggestion(snippet, "");
+                        let suggestion = compile_util::make_suggestion(snippet, "".to_string());
                         v.push(suggestion);
                     }
 
                     let snippet = compile_util::span_to_snippet(span.shrink_to_lo(), source_map);
                     let vars = (0..=params.len()).map(|i| format!("rv___{}", i));
                     let binding = mk_string(vars, "{ let (", ", ", ") = ");
-                    let suggestion = compile_util::make_suggestion(snippet, &binding);
+                    let suggestion = compile_util::make_suggestion(snippet, binding);
                     v.push(suggestion);
 
                     let assigns = params.iter().enumerate().map(|(i, param)| {
                         let arg = args[param.index - 1];
                         let arg = source_map.span_to_snippet(arg).unwrap();
-                        format!("*({}) = rv___{};", arg, i + 1)
+                        if param.must {
+                            format!("*({}) = rv___{};", arg, i + 1)
+                        } else {
+                            format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i + 1, arg)
+                        }
                     });
                     let assign = mk_string(assigns, "; ", " ", " rv___0 }");
 
                     let snippet = compile_util::span_to_snippet(span.shrink_to_hi(), source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, &assign);
+                    let suggestion = compile_util::make_suggestion(snippet, assign);
                     v.push(suggestion);
                 }
             }
 
             if let Some(params) = param_map.get(&name) {
-                let body_params: BTreeMap<_, _> = body
+                let body_params: Vec<_> = body
                     .params
                     .iter()
                     .enumerate()
                     .map(|(i, param)| {
-                        if let PatKind::Binding(_, _, ident, _) = &param.pat.kind {
+                        if let PatKind::Binding(_, hir_id, ident, _) = &param.pat.kind {
                             let span = if i == body.params.len() - 1 {
                                 if let Some(comma_span) =
                                     source_map.span_look_ahead(param.span, ",", Some(1))
@@ -94,10 +99,10 @@ fn transform(
                                     param.span
                                 }
                             } else {
-                                source_map.span_extend_to_next_char(param.span, ',', true)
+                                param.span.with_hi(param.span.hi() + BytePos(1))
                             };
                             let name = ident.name.to_ident_string();
-                            (i, (span, name))
+                            (span, *hir_id, name)
                         } else {
                             unreachable!()
                         }
@@ -108,20 +113,20 @@ fn transform(
                     .iter()
                     .map(|param| {
                         let index = param.index - 1;
-                        let (span, name) = &body_params[&index];
+                        let (span, hir_id, name) = &body_params[index];
                         let ty = source_map
                             .span_to_snippet(sig.decl.inputs[index].span)
                             .unwrap()
                             .strip_prefix("*mut ")
                             .unwrap()
                             .to_string();
-                        (param, *span, name.as_str(), ty)
+                        (param, *span, *hir_id, name.as_str(), ty)
                     })
                     .collect();
 
-                for (_, span, _, _) in &params {
+                for (_, span, _, _, _) in &params {
                     let snippet = compile_util::span_to_snippet(*span, source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, "");
+                    let suggestion = compile_util::make_suggestion(snippet, "".to_string());
                     v.push(suggestion);
                 }
 
@@ -129,11 +134,17 @@ fn transform(
                     let span = ty.span;
                     let ty = source_map.span_to_snippet(span).unwrap();
                     let tys: String = std::iter::once(ty)
-                        .chain(params.iter().map(|(_, _, _, ty)| format!(", {}", ty)))
+                        .chain(params.iter().map(|(param, _, _, _, ty)| {
+                            if param.must {
+                                format!(", {}", ty)
+                            } else {
+                                format!(", Option<{}>", ty)
+                            }
+                        }))
                         .collect();
                     let ret_ty = format!("({})", tys);
                     let snippet = compile_util::span_to_snippet(span, source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, &ret_ty);
+                    let suggestion = compile_util::make_suggestion(snippet, ret_ty);
                     v.push(suggestion);
                 } else {
                     todo!();
@@ -141,7 +152,7 @@ fn transform(
 
                 let local_vars: String = params
                     .iter()
-                    .map(|(param, _, name, ty)| {
+                    .map(|(param, _, _, name, ty)| {
                         if param.must {
                             format!(
                                 "
@@ -150,7 +161,11 @@ fn transform(
                                 name, ty,
                             )
                         } else {
-                            todo!()
+                            format!(
+                                "
+    let mut {0}___v: Option<{1}> = None;",
+                                name, ty,
+                            )
                         }
                     })
                     .collect();
@@ -158,21 +173,59 @@ fn transform(
                 let pos = body.value.span.lo() + BytePos(1);
                 let span = body.value.span.with_lo(pos).with_hi(pos);
                 let snippet = compile_util::span_to_snippet(span, source_map);
-                let suggestion = compile_util::make_suggestion(snippet, &local_vars);
+                let suggestion = compile_util::make_suggestion(snippet, local_vars);
                 v.push(suggestion);
 
-                for (span, ret_v) in visitor.returns {
+                for ret in visitor.returns {
+                    let Return { span, value } = ret;
                     let mut values = vec![];
-                    if let Some(ret_v) = ret_v {
-                        values.push(ret_v);
+                    if let Some(value) = value {
+                        let value = source_map.span_to_snippet(value).unwrap();
+                        values.push(value);
                     }
-                    for (_, _, name, _) in &params {
+                    for (_, _, _, name, _) in &params {
                         values.push(format!("{}___v", name));
                     }
                     let values: String = values.join(", ");
                     let ret = format!("return ({})", values);
                     let snippet = compile_util::span_to_snippet(span, source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, &ret);
+                    let suggestion = compile_util::make_suggestion(snippet, ret);
+                    v.push(suggestion);
+                }
+
+                for assign in visitor.indirect_assigns {
+                    let IndirectAssign {
+                        lhs_span,
+                        lhs,
+                        rhs_span,
+                    } = assign;
+                    let (param, _, _, name, _) = some_or!(
+                        params.iter().find(|(_, _, hir_id, _, _)| *hir_id == lhs),
+                        continue
+                    );
+                    if param.must {
+                        continue;
+                    }
+
+                    let lhs = format!("{}___v", name);
+                    let snippet = compile_util::span_to_snippet(lhs_span, source_map);
+                    let suggestion = compile_util::make_suggestion(snippet, lhs);
+                    v.push(suggestion);
+
+                    let rhs = source_map.span_to_snippet(rhs_span).unwrap();
+                    let rhs = format!("Some({})", rhs);
+                    let snippet = compile_util::span_to_snippet(rhs_span, source_map);
+                    let suggestion = compile_util::make_suggestion(snippet, rhs);
+                    v.push(suggestion);
+                }
+
+                for check in visitor.null_checks {
+                    let NullCheck { span, hir_id } = check;
+                    if !params.iter().any(|(_, _, id, _, _)| *id == hir_id) {
+                        continue;
+                    }
+                    let snippet = compile_util::span_to_snippet(span, source_map);
+                    let suggestion = compile_util::make_suggestion(snippet, "false".to_string());
                     v.push(suggestion);
                 }
             }
@@ -184,14 +237,36 @@ fn transform(
 
 struct BodyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    returns: Vec<(Span, Option<String>)>,
+    returns: Vec<Return>,
     calls: Vec<Call>,
+    indirect_assigns: Vec<IndirectAssign>,
+    null_checks: Vec<NullCheck>,
 }
 
+#[derive(Debug)]
+struct Return {
+    span: Span,
+    value: Option<Span>,
+}
+
+#[derive(Debug)]
 struct Call {
     span: Span,
     callee: String,
     args: Vec<Span>,
+}
+
+#[derive(Debug)]
+struct IndirectAssign {
+    lhs_span: Span,
+    lhs: HirId,
+    rhs_span: Span,
+}
+
+#[derive(Debug)]
+struct NullCheck {
+    span: Span,
+    hir_id: HirId,
 }
 
 impl<'tcx> BodyVisitor<'tcx> {
@@ -200,6 +275,8 @@ impl<'tcx> BodyVisitor<'tcx> {
             tcx,
             returns: vec![],
             calls: vec![],
+            indirect_assigns: vec![],
+            null_checks: vec![],
         }
     }
 }
@@ -215,14 +292,12 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
         match &expr.kind {
             ExprKind::Ret(e) => {
                 let span = expr.span;
-                let ret_v = e
-                    .as_ref()
-                    .map(|e| self.tcx.sess.source_map().span_to_snippet(e.span).unwrap());
-                self.returns.push((span, ret_v));
+                let value = e.as_ref().map(|e| e.span);
+                self.returns.push(Return { span, value });
             }
             ExprKind::Call(callee, args) => {
                 let span = expr.span;
-                if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind {
+                if let Some(path) = expr_to_path(callee) {
                     if let Res::Def(_, def_id) = path.res {
                         let callee = self.tcx.def_path_str(def_id);
                         let args = args.iter().map(|arg| arg.span).collect();
@@ -230,9 +305,42 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
                     }
                 }
             }
+            ExprKind::Assign(lhs, rhs, _) => {
+                if let ExprKind::Unary(UnOp::Deref, ptr) = &lhs.kind {
+                    if let Some(path) = expr_to_path(ptr) {
+                        if let Res::Local(hir_id) = path.res {
+                            self.indirect_assigns.push(IndirectAssign {
+                                lhs_span: lhs.span,
+                                lhs: hir_id,
+                                rhs_span: rhs.span,
+                            });
+                        }
+                    }
+                }
+            }
+            ExprKind::MethodCall(seg, v, _, _) => {
+                if seg.ident.name.to_ident_string() == "is_null" {
+                    if let Some(path) = expr_to_path(v) {
+                        if let Res::Local(hir_id) = path.res {
+                            self.null_checks.push(NullCheck {
+                                span: expr.span,
+                                hir_id,
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+fn expr_to_path<'a, 'tcx>(expr: &'a Expr<'tcx>) -> Option<&'a rustc_hir::Path<'tcx>> {
+    if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind {
+        Some(*path)
+    } else {
+        None
     }
 }
 
