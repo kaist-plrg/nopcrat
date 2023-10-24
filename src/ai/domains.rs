@@ -5,6 +5,8 @@ use std::{
 };
 
 use lazy_static::lazy_static;
+use rustc_index::bit_set::BitSet;
+use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
 
@@ -224,6 +226,16 @@ impl AbsLocal {
 
     pub fn iter(&self) -> impl Iterator<Item = &AbsValue> {
         self.0.iter()
+    }
+
+    pub fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+        for l in dead_locals.iter() {
+            let i = l.as_usize();
+            if i >= self.0.len() {
+                break;
+            }
+            self.0[i] = AbsValue::bot();
+        }
     }
 }
 

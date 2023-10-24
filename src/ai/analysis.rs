@@ -11,6 +11,7 @@ use rustc_hir::{
     intravisit::Visitor as HVisitor,
     Expr, ExprKind, QPath,
 };
+use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{BasicBlock, BasicBlockData, Body, Local, Location, TerminatorKind},
@@ -21,7 +22,9 @@ use rustc_span::{def_id::DefId, Span};
 use serde::{Deserialize, Serialize};
 
 use super::domains::*;
-use crate::{rustc_data_structures::graph::WithSuccessors as _, *};
+use crate::{
+    rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisConfig {
@@ -196,11 +199,13 @@ pub fn analyze(
             let pre_rpo_map = get_rpo_map(body);
             let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
             let rpo_map = compute_rpo_map(body, &loop_blocks);
+            let dead_locals = get_dead_locals(body, tcx);
             let info = FuncInfo {
                 inputs,
                 param_tys,
                 loop_blocks,
                 rpo_map,
+                dead_locals,
             };
             (*def_id, info)
         })
@@ -285,6 +290,7 @@ struct FuncInfo {
     param_tys: Vec<TypeInfo>,
     loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     rpo_map: BTreeMap<BasicBlock, usize>,
+    dead_locals: Vec<BitSet<Local>>,
 }
 
 pub struct Analyzer<'a, 'tcx> {
@@ -400,6 +406,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     (new_next_states, next_locations)
                 };
                 for location in &next_locations {
+                    let dead_locals = &self.info.dead_locals[location.block.as_usize()];
                     if merging_blocks.contains(&location.block) {
                         let next_state = if let Some(states) = states.get(location) {
                             assert_eq!(states.len(), 1);
@@ -419,6 +426,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 joined = joined.join(&new_next_state);
                             }
                         }
+                        if location.statement_index == 0 {
+                            joined.local.clear_dead_locals(dead_locals);
+                        }
                         if !joined.ord(next_state) {
                             work_list.remove_location(*location);
                             let next_label = Label {
@@ -437,11 +447,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 .get(location)
                                 .and_then(|states| states.get(&new_next_state.writes))
                                 .unwrap_or(&bot);
-                            let joined = if loop_heads.contains(location) && self.conf.widening {
+                            let mut joined = if loop_heads.contains(location) && self.conf.widening
+                            {
                                 next_state.widen(new_next_state)
                             } else {
                                 next_state.join(new_next_state)
                             };
+                            if location.statement_index == 0 {
+                                joined.local.clear_dead_locals(dead_locals);
+                            }
                             if !joined.ord(next_state) {
                                 let next_label = Label {
                                     location: *location,
@@ -832,6 +846,27 @@ fn compute_rpo_map(
     rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
 }
 
+fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Local>> {
+    let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
+    borrowed_locals.insert(Local::from_usize(0));
+    let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
+        .into_engine(tcx, body)
+        .iterate_to_fixpoint()
+        .into_results_cursor(body);
+    body.basic_blocks
+        .indices()
+        .map(|bb| {
+            cursor.seek_to_block_start(bb);
+            let live_locals = cursor.get();
+            let mut borrowed_or_live_locals = borrowed_locals.clone();
+            borrowed_or_live_locals.union(live_locals);
+            let mut dead_locals = BitSet::new_filled(body.local_decls.len());
+            dead_locals.subtract(&borrowed_or_live_locals);
+            dead_locals
+        })
+        .collect()
+}
+
 fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<Vec<usize>> {
     if let Some(first) = path.first() {
         curr.push(*first);
@@ -867,4 +902,22 @@ fn body_size(body: &Body<'_>) -> usize {
         .iter()
         .map(|bbd| bbd.statements.len() + bbd.terminator.is_some() as usize)
         .sum()
+}
+
+#[allow(unused)]
+fn show_body(body: &Body<'_>, stmt: bool, term: bool) {
+    for bb in body.basic_blocks.indices() {
+        println!("{:?}", bb);
+        let bbd = &body.basic_blocks[bb];
+        if stmt {
+            for stmt in &bbd.statements {
+                println!("{:?}", stmt);
+            }
+        }
+        if term {
+            if let Some(term) = &bbd.terminator {
+                println!("{:?}", term.kind);
+            }
+        }
+    }
 }
