@@ -60,11 +60,20 @@ fn transform(
                     }
 
                     let snippet = compile_util::span_to_snippet(span.shrink_to_lo(), source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, "{ let (a, b) = ");
+                    let vars = (0..=params.len()).map(|i| format!("rv___{}", i));
+                    let binding = mk_string(vars, "{ let (", ", ", ") = ");
+                    let suggestion = compile_util::make_suggestion(snippet, &binding);
                     v.push(suggestion);
 
+                    let assigns = params.iter().enumerate().map(|(i, param)| {
+                        let arg = args[param.index - 1];
+                        let arg = source_map.span_to_snippet(arg).unwrap();
+                        format!("*({}) = rv___{};", arg, i + 1)
+                    });
+                    let assign = mk_string(assigns, "; ", " ", " rv___0 }");
+
                     let snippet = compile_util::span_to_snippet(span.shrink_to_hi(), source_map);
-                    let suggestion = compile_util::make_suggestion(snippet, "; a }");
+                    let suggestion = compile_util::make_suggestion(snippet, &assign);
                     v.push(suggestion);
                 }
             }
@@ -225,4 +234,21 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
+}
+
+fn mk_string<S: AsRef<str>, I: Iterator<Item = S>>(
+    iter: I,
+    start: &str,
+    sep: &str,
+    end: &str,
+) -> String {
+    let mut s = start.to_string();
+    for (i, item) in iter.enumerate() {
+        if i > 0 {
+            s.push_str(sep);
+        }
+        s.push_str(item.as_ref());
+    }
+    s.push_str(end);
+    s
 }
