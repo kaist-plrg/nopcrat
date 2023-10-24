@@ -15,6 +15,8 @@ struct Args {
     use_analysis_result: Option<PathBuf>,
 
     #[arg(short, long)]
+    verbose: bool,
+    #[arg(short, long)]
     max_loop_head_states: Option<usize>,
     #[arg(long)]
     no_widening: bool,
@@ -61,8 +63,9 @@ fn main() {
     assert!(path.is_file());
 
     let conf = ai::analysis::AnalysisConfig {
-        max_loop_head_states: args.max_loop_head_states.unwrap_or(1),
+        max_loop_head_states: args.max_loop_head_states.unwrap_or(usize::MAX),
         widening: !args.no_widening,
+        verbose: args.verbose,
     };
     let analysis_result = if let Some(dump_file) = args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();
@@ -72,10 +75,12 @@ fn main() {
     };
     // let analysis_result = ai::analysis::analyze_code("");
 
-    for (func, params) in &analysis_result {
-        println!("{}", func);
-        for param in params {
-            println!("  {:?}", param);
+    if args.verbose {
+        for (func, params) in &analysis_result {
+            println!("{}", func);
+            for param in params {
+                println!("  {:?}", param);
+            }
         }
     }
     println!("{}", analysis_result.len());
@@ -131,6 +136,6 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        println!("{}s", self.start.elapsed().as_secs_f64().ceil() as usize);
+        println!("{:.2}s", self.start.elapsed().as_secs_f64());
     }
 }

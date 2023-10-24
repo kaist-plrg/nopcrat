@@ -30,6 +30,7 @@ use crate::{
 pub struct AnalysisConfig {
     pub max_loop_head_states: usize,
     pub widening: bool,
+    pub verbose: bool,
 }
 
 impl Default for AnalysisConfig {
@@ -37,6 +38,7 @@ impl Default for AnalysisConfig {
         Self {
             max_loop_head_states: 1,
             widening: true,
+            verbose: false,
         }
     }
 }
@@ -233,12 +235,14 @@ pub fn analyze(
                 tracing::info!("{:?}", def_id);
                 let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
                 let body = tcx.optimized_mir(*def_id);
-                println!(
-                    "{:?} {} {}",
-                    def_id,
-                    body.basic_blocks.len(),
-                    body.local_decls.len()
-                );
+                if conf.verbose {
+                    println!(
+                        "{:?} {} {}",
+                        def_id,
+                        body.basic_blocks.len(),
+                        body.local_decls.len()
+                    );
+                }
                 let summary = analyzer.make_summary(body);
 
                 let (summary, updated) = if let Some(old) = summaries.get(def_id) {
