@@ -1,4 +1,5 @@
 use std::{
+    alloc::{Layout, System},
     fs::{self, File},
     path::{Path, PathBuf},
     time::Instant,
@@ -139,3 +140,23 @@ impl Drop for Timer {
         println!("{:.2}s", self.start.elapsed().as_secs_f64());
     }
 }
+
+struct OomAbortAllocator;
+
+unsafe impl std::alloc::GlobalAlloc for OomAbortAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = System.alloc(layout);
+        if ptr.is_null() {
+            eprintln!("Memory allocation failed");
+            std::process::exit(1);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+    }
+}
+
+#[global_allocator]
+static GLOBAL: OomAbortAllocator = OomAbortAllocator;
