@@ -4,6 +4,7 @@ use std::{
     path::Path,
 };
 
+use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
     def::{DefKind, Res},
@@ -12,7 +13,7 @@ use rustc_hir::{
 };
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, TerminatorKind},
+    mir::{BasicBlock, BasicBlockData, Body, Local, Location, TerminatorKind},
     ty::{Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -192,8 +193,9 @@ pub fn analyze(
             let inputs = inputs_map[def_id];
             let body = tcx.optimized_mir(def_id);
             let param_tys = get_param_tys(body, inputs, tcx);
-            let rpo_map = get_rpo_map(body);
-            let loop_blocks = get_loop_blocks(body, &rpo_map);
+            let pre_rpo_map = get_rpo_map(body);
+            let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
+            let rpo_map = compute_rpo_map(body, &loop_blocks);
             let info = FuncInfo {
                 inputs,
                 param_tys,
@@ -770,6 +772,64 @@ fn get_loop_blocks(
             (head, loop_blocks)
         })
         .collect()
+}
+
+fn compute_rpo_map(
+    body: &Body<'_>,
+    loop_blocks: &BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
+) -> BTreeMap<BasicBlock, usize> {
+    fn succs(bbd: &BasicBlockData<'_>) -> Vec<BasicBlock> {
+        let terminator = some_or!(bbd.terminator.as_ref(), return vec![]);
+        match &terminator.kind {
+            TerminatorKind::Goto { target }
+            | TerminatorKind::Drop { target, .. }
+            | TerminatorKind::Assert { target, .. } => vec![*target],
+            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
+            TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
+            | TerminatorKind::Return
+            | TerminatorKind::Unreachable => vec![],
+            TerminatorKind::Call { target, .. }
+            | TerminatorKind::InlineAsm {
+                destination: target,
+                ..
+            } => target.iter().copied().collect(),
+            _ => unreachable!("{:?}", terminator.kind),
+        }
+    }
+    fn traverse(
+        current: BasicBlock,
+        visited: &mut BTreeSet<BasicBlock>,
+        po: &mut Vec<BasicBlock>,
+        body: &Body<'_>,
+        loop_blocks: &BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
+    ) {
+        if visited.contains(&current) {
+            return;
+        }
+        visited.insert(current);
+        let loops: Vec<_> = loop_blocks
+            .values()
+            .filter(|blocks| blocks.contains(&current))
+            .collect();
+        let mut succs = succs(&body.basic_blocks[current]);
+        succs.sort_by_key(|succ| loops.iter().filter(|blocks| blocks.contains(succ)).count());
+        for succ in succs {
+            traverse(succ, visited, po, body, loop_blocks);
+        }
+        po.push(current);
+    }
+    let mut visited = BTreeSet::new();
+    let mut rpo = vec![];
+    traverse(
+        BasicBlock::from_usize(0),
+        &mut visited,
+        &mut rpo,
+        body,
+        loop_blocks,
+    );
+    rpo.reverse();
+    rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
 }
 
 fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<Vec<usize>> {
