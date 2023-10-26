@@ -145,7 +145,7 @@ pub fn collect_output_params(
                     ReturnValues::None
                 };
                 OutputParam {
-                    index,
+                    index: index - 1,
                     must,
                     return_values,
                 }
