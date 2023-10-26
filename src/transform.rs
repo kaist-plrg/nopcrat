@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -51,12 +51,9 @@ fn transform(
                 let name = ident.name.to_ident_string();
                 let ty = source_map
                     .span_to_snippet(sig.decl.inputs[*index].span)
-                    .unwrap()
-                    .strip_prefix("*mut ")
-                    .unwrap()
-                    .to_string();
+                    .unwrap();
+                let ty = ty.strip_prefix("*mut ").expect(&ty).to_string();
                 let param = Param {
-                    index: *index,
                     must: *must,
                     name,
                     ty,
@@ -71,16 +68,14 @@ fn transform(
             .cloned()
             .map(|param| (param.hir_id, param))
             .collect();
-        let (succ_value, first_return) = SuccValue::find(params);
-        let remaining_return: Vec<_> = index_map
-            .keys()
-            .copied()
-            .filter(|i| !first_return.contains(i))
-            .collect();
+        let mut remaining_return: Vec<_> = index_map.keys().copied().collect();
+        let first_return = SuccValue::find(params);
+        if let Some((_, first)) = &first_return {
+            remaining_return.retain(|i| i != first);
+        }
         let is_unit = matches!(sig.decl.output, FnRetTy::DefaultReturn(_));
         let func = Func {
             is_unit,
-            succ_value,
             first_return,
             remaining_return,
             index_map,
@@ -181,26 +176,26 @@ fn transform(
                 fix(span, "".to_string());
             }
 
-            let start = if func.is_unit { 1 } else { 0 };
-            let vars = (start..=func.index_map.len()).map(|i| format!("rv___{}", i));
-            let binding = mk_string(vars, "{ let (", ", ", ") = ");
+            let args: Vec<_> = args
+                .into_iter()
+                .map(|(span, is_null)| {
+                    let arg = source_map.span_to_snippet(span).unwrap();
+                    (arg, is_null)
+                })
+                .collect();
+
+            let mtch = func.call_match(&args);
+
+            let mut binding = func.call_binding();
+            if mtch.is_some() {
+                binding = "match ".to_string() + &binding;
+            }
             fix(span.shrink_to_lo(), binding);
 
-            let assigns = func.params().enumerate().map(|(i, param)| {
-                let (arg, is_null) = args[param.index];
-                let arg = source_map.span_to_snippet(arg).unwrap();
-                if !is_null {
-                    if param.must {
-                        format!("*({}) = rv___{};", arg, i + 1)
-                    } else {
-                        format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i + 1, arg)
-                    }
-                } else {
-                    "".to_string()
-                }
-            });
-            let res = if func.is_unit { " }" } else { " rv___0 }" };
-            let assign = mk_string(assigns, "; ", " ", res);
+            let mut assign = func.call_assign(&args);
+            if let Some(m) = &mtch {
+                assign += m;
+            }
             fix(span.shrink_to_hi(), assign);
         }
 
@@ -209,57 +204,16 @@ fn transform(
             fix(param.span, "".to_string());
         }
 
-        match sig.decl.output {
+        let (span, orig) = match sig.decl.output {
             FnRetTy::Return(ty) => {
                 let span = ty.span;
                 let ty = source_map.span_to_snippet(span).unwrap();
-                let tys = std::iter::once(ty).chain(func.params().map(|param| {
-                    if param.must {
-                        param.ty.to_string()
-                    } else {
-                        format!("Option<{}>", param.ty)
-                    }
-                }));
-                let ret_ty = mk_string(tys, "(", ", ", ")");
-                // let ret_ty = if func.first_return.is_empty() {
-                //     let tys = std::iter::once(ty).chain(func.params().map(|param| {
-                //         if param.must {
-                //             param.ty.to_string()
-                //         } else {
-                //             format!("Option<{}>", param.ty)
-                //         }
-                //     }));
-                //     mk_string(tys, "(", ", ", ")")
-                // } else {
-                //     let tys = func
-                //         .first_return
-                //         .iter()
-                //         .map(|i| func.index_map[i].ty.clone());
-                //     let opt = mk_string(tys, "Option<(", ", ", ")>");
-                //     let tys = std::iter::once(opt).chain(func.remaining_return.iter().map(|i| {
-                //         let param = &func.index_map[i];
-                //         if param.must {
-                //             param.ty.to_string()
-                //         } else {
-                //             format!("Option<{}>", param.ty)
-                //         }
-                //     }));
-                //     mk_string(tys, "(", ", ", ")")
-                // };
-                fix(span, ret_ty);
+                (span.with_lo(span.lo() - BytePos(3)), Some(ty))
             }
-            FnRetTy::DefaultReturn(span) => {
-                let tys = func.params().map(|param| {
-                    if param.must {
-                        param.ty.to_string()
-                    } else {
-                        format!("Option<{}>", param.ty)
-                    }
-                });
-                let ret_ty = mk_string(tys, "-> (", ", ", ")");
-                fix(span, ret_ty);
-            }
-        }
+            FnRetTy::DefaultReturn(span) => (span, None),
+        };
+        let ret_ty = func.return_type(orig);
+        fix(span, format!("-> {}", ret_ty));
 
         let local_vars: String = func
             .params()
@@ -287,30 +241,16 @@ fn transform(
 
         for ret in visitor.returns {
             let Return { span, value } = ret;
-            let mut values = vec![];
-            if let Some(value) = value {
-                let value = source_map.span_to_snippet(value).unwrap();
-                values.push(value);
-            }
-            for param in func.params() {
-                values.push(format!("{}___v", param.name));
-            }
-            let values: String = values.join(", ");
-            let ret = format!("return ({})", values);
-            fix(span, ret);
+            let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
+            let ret_v = func.return_value(orig);
+            fix(span, format!("return {}", ret_v));
         }
 
         if func.is_unit {
-            let mut values = vec![];
-            for param in func.params() {
-                values.push(format!("{}___v", param.name));
-            }
-            let values: String = values.join(", ");
-            let ret = format!("({})", values);
-
             let pos = body.value.span.hi() - BytePos(1);
             let span = body.value.span.with_lo(pos).with_hi(pos);
-            fix(span, ret);
+            let ret_v = func.return_value(None);
+            fix(span, ret_v);
         }
 
         for assign in visitor.indirect_assigns {
@@ -349,7 +289,6 @@ fn transform(
 
 #[derive(Debug, Clone)]
 struct Param {
-    index: usize,
     must: bool,
     span: Span,
     hir_id: HirId,
@@ -360,8 +299,7 @@ struct Param {
 #[allow(unused)]
 struct Func {
     is_unit: bool,
-    succ_value: SuccValue,
-    first_return: Vec<usize>,
+    first_return: Option<(SuccValue, usize)>,
     remaining_return: Vec<usize>,
     index_map: BTreeMap<usize, Param>,
     hir_id_map: BTreeMap<HirId, Param>,
@@ -370,6 +308,107 @@ struct Func {
 impl Func {
     fn params(&self) -> impl Iterator<Item = &Param> {
         self.index_map.values()
+    }
+
+    fn call_binding(&self) -> String {
+        let mut xs = vec![];
+        if !self.is_unit {
+            xs.push("rv___".to_string());
+        }
+        for i in &self.remaining_return {
+            xs.push(format!("rv___{}", i));
+        }
+        if xs.len() == 1 {
+            format!("{{ let {} = ", xs.pop().unwrap())
+        } else {
+            mk_string(xs.iter(), "{ let (", ", ", ") = ")
+        }
+    }
+
+    fn call_assign<S: AsRef<str>>(&self, args: &[(S, bool)]) -> String {
+        let mut assigns = vec![];
+        for i in &self.remaining_return {
+            let (arg, is_null) = &args[*i];
+            if !is_null {
+                let arg = arg.as_ref();
+                let param = &self.index_map[i];
+                let assign = if param.must {
+                    format!("*({}) = rv___{};", arg, i)
+                } else {
+                    format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i, arg)
+                };
+                assigns.push(assign);
+            }
+        }
+        mk_string(assigns.iter(), ";\n", "\n", "\nrv___ }")
+    }
+
+    fn call_match<S: AsRef<str>>(&self, args: &[(S, bool)]) -> Option<String> {
+        let (succ_value, first) = &self.first_return?;
+        let (arg, is_null) = &args[*first];
+        let arg = arg.as_ref();
+        let assign = if *is_null {
+            "".to_string()
+        } else {
+            format!("*({}) = v;", arg)
+        };
+        let v = match succ_value {
+            SuccValue::Int(v) => v.to_string(),
+            SuccValue::Uint(v) => v.to_string(),
+            SuccValue::Bool(v) => v.to_string(),
+        };
+        Some(format!(
+            " {{\nOk(v) => {{ {} {} }}\nErr(v) => v,\n}}",
+            assign, v
+        ))
+    }
+
+    fn return_type(&self, orig: Option<String>) -> String {
+        let mut tys = vec![];
+        if let Some((_, i)) = &self.first_return {
+            let orig = orig.unwrap();
+            let param = &self.index_map[i];
+            let ty = format!("Result<{}, {}>", param.ty, orig);
+            tys.push(ty);
+        } else if let Some(ty) = orig {
+            tys.push(ty);
+        }
+        for i in &self.remaining_return {
+            let param = &self.index_map[i];
+            let ty = if param.must {
+                param.ty.to_string()
+            } else {
+                format!("Option<{}>", param.ty)
+            };
+            tys.push(ty);
+        }
+        if tys.len() == 1 {
+            tys.pop().unwrap()
+        } else {
+            mk_string(tys.iter(), "(", ", ", ")")
+        }
+    }
+
+    fn return_value(&self, orig: Option<String>) -> String {
+        let mut values = vec![];
+        if let Some((_, i)) = &self.first_return {
+            let orig = orig.unwrap();
+            let param = &self.index_map[i];
+            let v = format!("{}___v.ok_or({})", param.name, orig);
+            values.push(v);
+        } else if let Some(v) = orig {
+            values.push(v);
+        }
+        for i in &self.remaining_return {
+            let param = &self.index_map[i];
+            let v = format!("{}___v", param.name);
+            values.push(v);
+        }
+        if values.len() == 1 {
+            values.pop().unwrap()
+        } else {
+            mk_string(values.iter(), "(", ", ", ")")
+        }
     }
 }
 
@@ -542,77 +581,64 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SuccValue {
-    None,
     Int(i128),
     Uint(u128),
     Bool(bool),
 }
 
 impl SuccValue {
-    fn new(rvs: &ReturnValues) -> Self {
+    fn from(rvs: &ReturnValues) -> Option<Self> {
         match rvs {
             ReturnValues::Int(succ, fail) => {
-                let succ = some_or!(succ.gamma(), return Self::None);
+                let succ = succ.gamma()?;
                 if succ.len() != 1 {
-                    return Self::None;
+                    return None;
                 }
-                let fail = some_or!(fail.gamma(), return Self::None);
+                let fail = fail.gamma()?;
                 if !succ.is_disjoint(fail) {
-                    return Self::None;
+                    return None;
                 }
-                Self::Int(*succ.first().unwrap())
+                Some(Self::Int(*succ.first().unwrap()))
             }
             ReturnValues::Uint(succ, fail) => {
-                let succ = some_or!(succ.gamma(), return Self::None);
+                let succ = succ.gamma()?;
                 if succ.len() != 1 {
-                    return Self::None;
+                    return None;
                 }
-                let fail = some_or!(fail.gamma(), return Self::None);
+                let fail = fail.gamma()?;
                 if !succ.is_disjoint(fail) {
-                    return Self::None;
+                    return None;
                 }
-                Self::Uint(*succ.first().unwrap())
+                Some(Self::Uint(*succ.first().unwrap()))
             }
             ReturnValues::Bool(succ, fail) => {
                 let succ = succ.gamma();
                 if succ.len() != 1 {
-                    return Self::None;
+                    return None;
                 }
                 let succ = succ.first().unwrap();
                 let fail = fail.gamma();
                 if fail.len() != 1 {
-                    return Self::None;
+                    return None;
                 }
                 let fail = fail.first().unwrap();
                 if succ == fail {
-                    return Self::None;
+                    return None;
                 }
-                Self::Bool(*succ)
+                Some(Self::Bool(*succ))
             }
-            _ => Self::None,
+            _ => None,
         }
     }
 
-    fn find(params: &[OutputParam]) -> (Self, Vec<usize>) {
-        let v: Vec<_> = params
-            .iter()
-            .filter_map(|param| {
-                if !param.must {
-                    Some((param.index, Self::new(&param.return_values)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut vs: BTreeSet<_> = v.iter().map(|(_, v)| *v).collect();
-        if vs.len() == 1 {
-            (
-                vs.pop_first().unwrap(),
-                v.into_iter().map(|(i, _)| i).collect(),
-            )
-        } else {
-            (Self::None, vec![])
-        }
+    fn find(params: &[OutputParam]) -> Option<(Self, usize)> {
+        params.iter().find_map(|param| {
+            if !param.must {
+                Some((Self::from(&param.return_values)?, param.index))
+            } else {
+                None
+            }
+        })
     }
 }
 
