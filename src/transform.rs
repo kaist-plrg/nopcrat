@@ -29,6 +29,9 @@ fn transform(
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
+    let mut visitor = FnPtrVisitor::new(tcx);
+    hir.visit_all_item_likes_in_crate(&mut visitor);
+
     let mut funcs = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
@@ -36,6 +39,9 @@ fn transform(
             continue;
         };
         let def_id = id.owner_id.to_def_id();
+        if visitor.fn_ptrs.contains(&def_id) {
+            continue;
+        }
         let name = tcx.def_path_str(def_id);
         let params = some_or!(param_map.get(&name), continue);
         let body = hir.body(body_id);
@@ -110,70 +116,70 @@ fn transform(
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
 
-        let mut call_spans = BTreeSet::new();
+        // let mut call_spans = BTreeSet::new();
 
-        for if_call in visitor.if_calls {
-            let IfCall {
-                if_span,
-                call,
-                n,
-                eq,
-                t_span,
-                f_span,
-            } = if_call;
-            let Call { span, callee, args } = call;
-            let func = some_or!(funcs.get(&callee), continue);
-            let t_succ = match func.succ_value {
-                SuccValue::Int(i) => (n as i128 == i) == eq,
-                SuccValue::Uint(i) => (n == i) == eq,
-                SuccValue::Bool(_) => todo!(),
-                SuccValue::None => continue,
-            };
-            call_spans.insert(span);
+        // for if_call in visitor.if_calls {
+        //     let IfCall {
+        //         if_span,
+        //         call,
+        //         n,
+        //         eq,
+        //         t_span,
+        //         f_span,
+        //     } = if_call;
+        //     let Call { span, callee, args } = call;
+        //     let func = some_or!(funcs.get(&callee), continue);
+        //     let t_succ = match func.succ_value {
+        //         SuccValue::Int(i) => (n as i128 == i) == eq,
+        //         SuccValue::Uint(i) => (n == i) == eq,
+        //         SuccValue::Bool(_) => todo!(),
+        //         SuccValue::None => continue,
+        //     };
+        //     call_spans.insert(span);
 
-            for index in func.index_map.keys() {
-                let span = to_comma(args[*index].0, source_map);
-                fix(span, "".to_string());
-            }
+        //     for index in func.index_map.keys() {
+        //         let span = to_comma(args[*index].0, source_map);
+        //         fix(span, "".to_string());
+        //     }
 
-            let if_span = if_span.shrink_to_lo().with_hi(span.lo());
-            fix(if_span, "match ".to_string());
+        //     let if_span = if_span.shrink_to_lo().with_hi(span.lo());
+        //     fix(if_span, "match ".to_string());
 
-            let bt_span = t_span.with_lo(span.hi()).with_hi(t_span.lo());
-            let pat = if t_succ {
-                " { Some(_) => "
-            } else {
-                " { None => "
-            };
-            fix(bt_span, pat.to_string());
+        //     let bt_span = t_span.with_lo(span.hi()).with_hi(t_span.lo());
+        //     let pat = if t_succ {
+        //         " { Some(_) => "
+        //     } else {
+        //         " { None => "
+        //     };
+        //     fix(bt_span, pat.to_string());
 
-            if let Some(f_span) = f_span {
-                let else_span = t_span.with_lo(t_span.hi()).with_hi(f_span.lo());
-                let pat = if t_succ {
-                    "\n    None => "
-                } else {
-                    "\n    Some(_) => "
-                };
-                fix(else_span, pat.to_string());
+        //     if let Some(f_span) = f_span {
+        //         let else_span = t_span.with_lo(t_span.hi()).with_hi(f_span.lo());
+        //         let pat = if t_succ {
+        //             "\n    None => "
+        //         } else {
+        //             "\n    Some(_) => "
+        //         };
+        //         fix(else_span, pat.to_string());
 
-                let end_span = f_span.with_lo(f_span.hi());
-                fix(end_span, "}".to_string());
-            } else {
-                let else_span = t_span.with_lo(t_span.hi());
-                let arm = if t_succ {
-                    "\n    None => {} }"
-                } else {
-                    "\n    Some(_) => {} }"
-                };
-                fix(else_span, arm.to_string());
-            }
-        }
+        //         let end_span = f_span.with_lo(f_span.hi());
+        //         fix(end_span, "}".to_string());
+        //     } else {
+        //         let else_span = t_span.with_lo(t_span.hi());
+        //         let arm = if t_succ {
+        //             "\n    None => {} }"
+        //         } else {
+        //             "\n    Some(_) => {} }"
+        //         };
+        //         fix(else_span, arm.to_string());
+        //     }
+        // }
 
         for call in visitor.calls {
             let Call { span, callee, args } = call;
-            if call_spans.contains(&span) {
-                continue;
-            }
+            // if call_spans.contains(&span) {
+            //     continue;
+            // }
             let func = some_or!(funcs.get(&callee), continue);
 
             for index in func.index_map.keys() {
@@ -181,7 +187,8 @@ fn transform(
                 fix(span, "".to_string());
             }
 
-            let vars = (0..=func.index_map.len()).map(|i| format!("rv___{}", i));
+            let start = if func.is_unit { 1 } else { 0 };
+            let vars = (start..=func.index_map.len()).map(|i| format!("rv___{}", i));
             let binding = mk_string(vars, "{ let (", ", ", ") = ");
             fix(span.shrink_to_lo(), binding);
 
@@ -198,7 +205,8 @@ fn transform(
                     "".to_string()
                 }
             });
-            let assign = mk_string(assigns, "; ", " ", " rv___0 }");
+            let res = if func.is_unit { " }" } else { " rv___0 }" };
+            let assign = mk_string(assigns, "; ", " ", res);
             fix(span.shrink_to_hi(), assign);
         }
 
@@ -207,10 +215,10 @@ fn transform(
             fix(param.span, "".to_string());
         }
 
-        if let FnRetTy::Return(ty) = sig.decl.output {
-            let span = ty.span;
-            let ty = source_map.span_to_snippet(span).unwrap();
-            let ret_ty = if func.first_return.is_empty() {
+        match sig.decl.output {
+            FnRetTy::Return(ty) => {
+                let span = ty.span;
+                let ty = source_map.span_to_snippet(span).unwrap();
                 let tys = std::iter::once(ty).chain(func.params().map(|param| {
                     if param.must {
                         param.ty.to_string()
@@ -218,26 +226,45 @@ fn transform(
                         format!("Option<{}>", param.ty)
                     }
                 }));
-                mk_string(tys, "(", ", ", ")")
-            } else {
-                let tys = func
-                    .first_return
-                    .iter()
-                    .map(|i| func.index_map[i].ty.clone());
-                let opt = mk_string(tys, "Option<(", ", ", ")>");
-                let tys = std::iter::once(opt).chain(func.remaining_return.iter().map(|i| {
-                    let param = &func.index_map[i];
+                let ret_ty = mk_string(tys, "(", ", ", ")");
+                // let ret_ty = if func.first_return.is_empty() {
+                //     let tys = std::iter::once(ty).chain(func.params().map(|param| {
+                //         if param.must {
+                //             param.ty.to_string()
+                //         } else {
+                //             format!("Option<{}>", param.ty)
+                //         }
+                //     }));
+                //     mk_string(tys, "(", ", ", ")")
+                // } else {
+                //     let tys = func
+                //         .first_return
+                //         .iter()
+                //         .map(|i| func.index_map[i].ty.clone());
+                //     let opt = mk_string(tys, "Option<(", ", ", ")>");
+                //     let tys = std::iter::once(opt).chain(func.remaining_return.iter().map(|i| {
+                //         let param = &func.index_map[i];
+                //         if param.must {
+                //             param.ty.to_string()
+                //         } else {
+                //             format!("Option<{}>", param.ty)
+                //         }
+                //     }));
+                //     mk_string(tys, "(", ", ", ")")
+                // };
+                fix(span, ret_ty);
+            }
+            FnRetTy::DefaultReturn(span) => {
+                let tys = func.params().map(|param| {
                     if param.must {
                         param.ty.to_string()
                     } else {
                         format!("Option<{}>", param.ty)
                     }
-                }));
-                mk_string(tys, "(", ", ", ")")
-            };
-            fix(span, ret_ty);
-        } else {
-            todo!();
+                });
+                let ret_ty = mk_string(tys, "-> (", ", ", ")");
+                fix(span, ret_ty);
+            }
         }
 
         let local_vars: String = func
@@ -279,6 +306,19 @@ fn transform(
             fix(span, ret);
         }
 
+        if func.is_unit {
+            let mut values = vec![];
+            for param in func.params() {
+                values.push(format!("{}___v", param.name));
+            }
+            let values: String = values.join(", ");
+            let ret = format!("({})", values);
+
+            let pos = body.value.span.hi() - BytePos(1);
+            let span = body.value.span.with_lo(pos).with_hi(pos);
+            fix(span, ret);
+        }
+
         for assign in visitor.indirect_assigns {
             let IndirectAssign {
                 lhs_span,
@@ -307,6 +347,9 @@ fn transform(
         }
     }
     suggestions.retain(|_, v| !v.is_empty());
+    for suggestions in suggestions.values_mut() {
+        suggestions.sort_by_key(|s| s.snippets[0].range.start);
+    }
     suggestions
 }
 
@@ -502,6 +545,49 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     }
 }
 
+struct FnPtrVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    callees: BTreeSet<Span>,
+    fn_ptrs: BTreeSet<DefId>,
+}
+
+impl<'tcx> FnPtrVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            callees: BTreeSet::new(),
+            fn_ptrs: BTreeSet::new(),
+        }
+    }
+}
+
+impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match expr.kind {
+            ExprKind::Call(callee, _) => {
+                self.callees.insert(callee.span);
+            }
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if !self.callees.contains(&expr.span) {
+                    if let Res::Def(def_kind, def_id) = path.res {
+                        if def_kind.is_fn_like() {
+                            self.fn_ptrs.insert(def_id);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SuccValue {
     None,
@@ -595,7 +681,7 @@ fn remove_cast_and_drop_temps<'a, 'tcx>(expr: &'a Expr<'tcx>) -> &'a Expr<'tcx> 
 }
 
 fn as_int_lit(expr: &Expr<'_>) -> Option<u128> {
-    if let ExprKind::Lit(lit) = expr.kind {
+    if let ExprKind::Lit(lit) = remove_cast_and_drop_temps(expr).kind {
         if let LitKind::Int(n, _) = lit.node {
             return Some(n);
         }
