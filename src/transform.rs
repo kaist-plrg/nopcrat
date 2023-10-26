@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_ast::LitKind;
 use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
-    PatKind, QPath, UnOp,
+    Node, PatKind, QPath, UnOp,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
@@ -105,70 +105,13 @@ fn transform(
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
 
-        // let mut call_spans = BTreeSet::new();
-
-        // for if_call in visitor.if_calls {
-        //     let IfCall {
-        //         if_span,
-        //         call,
-        //         n,
-        //         eq,
-        //         t_span,
-        //         f_span,
-        //     } = if_call;
-        //     let Call { span, callee, args } = call;
-        //     let func = some_or!(funcs.get(&callee), continue);
-        //     let t_succ = match func.succ_value {
-        //         SuccValue::Int(i) => (n as i128 == i) == eq,
-        //         SuccValue::Uint(i) => (n == i) == eq,
-        //         SuccValue::Bool(_) => todo!(),
-        //         SuccValue::None => continue,
-        //     };
-        //     call_spans.insert(span);
-
-        //     for index in func.index_map.keys() {
-        //         let span = to_comma(args[*index].0, source_map);
-        //         fix(span, "".to_string());
-        //     }
-
-        //     let if_span = if_span.shrink_to_lo().with_hi(span.lo());
-        //     fix(if_span, "match ".to_string());
-
-        //     let bt_span = t_span.with_lo(span.hi()).with_hi(t_span.lo());
-        //     let pat = if t_succ {
-        //         " { Some(_) => "
-        //     } else {
-        //         " { None => "
-        //     };
-        //     fix(bt_span, pat.to_string());
-
-        //     if let Some(f_span) = f_span {
-        //         let else_span = t_span.with_lo(t_span.hi()).with_hi(f_span.lo());
-        //         let pat = if t_succ {
-        //             "\n    None => "
-        //         } else {
-        //             "\n    Some(_) => "
-        //         };
-        //         fix(else_span, pat.to_string());
-
-        //         let end_span = f_span.with_lo(f_span.hi());
-        //         fix(end_span, "}".to_string());
-        //     } else {
-        //         let else_span = t_span.with_lo(t_span.hi());
-        //         let arm = if t_succ {
-        //             "\n    None => {} }"
-        //         } else {
-        //             "\n    Some(_) => {} }"
-        //         };
-        //         fix(else_span, arm.to_string());
-        //     }
-        // }
-
         for call in visitor.calls {
-            let Call { span, callee, args } = call;
-            // if call_spans.contains(&span) {
-            //     continue;
-            // }
+            let Call {
+                hir_id,
+                span,
+                callee,
+                args,
+            } = call;
             let func = some_or!(funcs.get(&callee), continue);
 
             for index in func.index_map.keys() {
@@ -184,7 +127,63 @@ fn transform(
                 })
                 .collect();
 
-            let mtch = func.call_match(&args);
+            let mtch = if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
+                if let Some(then) = func.cmp(call.op, call.target) {
+                    let if_span = call.if_span;
+                    let if_span = if_span.with_hi(span.lo());
+                    fix(if_span, "match ".to_string());
+
+                    let succ = "Ok(v) => ";
+                    let fail = "Err(_) => ";
+                    let (_, i) = func.first_return.as_ref().unwrap();
+                    let (arg, is_null) = &args[*i];
+                    let assign = if *is_null {
+                        "".to_string()
+                    } else {
+                        format!(" (*{}) = v;", arg)
+                    };
+
+                    let bt = if then { succ } else { fail };
+                    let bt_span = call.then_span.shrink_to_lo().with_lo(span.hi());
+                    fix(bt_span, format!(" {{\n{}", bt));
+
+                    if then {
+                        let pos = bt_span.hi() + BytePos(1);
+                        let ba_span = bt_span.with_hi(pos).with_lo(pos);
+                        fix(ba_span, assign.clone());
+                    }
+
+                    let be_span = call.then_span.shrink_to_hi();
+                    if let Some(else_span) = call.else_span {
+                        let be = if !then { succ } else { fail };
+                        let be_span = be_span.with_hi(else_span.lo());
+                        fix(be_span, format!("\n{}", be));
+
+                        if !then {
+                            let pos = be_span.lo() + BytePos(1);
+                            let ba_span = be_span.with_hi(pos).with_lo(pos);
+                            fix(ba_span, assign);
+                        }
+
+                        let pos = else_span.hi();
+                        let end_span = else_span.with_hi(pos).with_lo(pos);
+                        fix(end_span, "\n}".to_string());
+                    } else {
+                        let (be, assign) = if !then {
+                            (succ, assign)
+                        } else {
+                            (fail, "".to_string())
+                        };
+                        fix(be_span, format!("\n{} {{ {} }}\n}}", be, assign));
+                    }
+
+                    None
+                } else {
+                    func.call_match(&args)
+                }
+            } else {
+                func.call_match(&args)
+            };
 
             let mut binding = func.call_binding();
             if mtch.is_some() {
@@ -310,6 +309,25 @@ impl Func {
         self.index_map.values()
     }
 
+    fn cmp(&self, op: BinOpKind, target: u128) -> Option<bool> {
+        let (sv, _) = &self.first_return?;
+        let n = match *sv {
+            SuccValue::Int(n) => n,
+            SuccValue::Uint(n) => n as i128,
+            _ => return None,
+        };
+        let m = target as i128;
+        match op {
+            BinOpKind::Eq => Some(n == m),
+            BinOpKind::Ne => Some(n != m),
+            BinOpKind::Lt => Some(n < m),
+            BinOpKind::Le => Some(n <= m),
+            BinOpKind::Gt => Some(n > m),
+            BinOpKind::Ge => Some(n >= m),
+            _ => None,
+        }
+    }
+
     fn call_binding(&self) -> String {
         let mut xs = vec![];
         if !self.is_unit {
@@ -420,20 +438,10 @@ struct Return {
 
 #[derive(Debug)]
 struct Call {
+    hir_id: HirId,
     span: Span,
     callee: DefId,
     args: Vec<(Span, bool)>,
-}
-
-#[allow(unused)]
-#[derive(Debug)]
-struct IfCall {
-    if_span: Span,
-    call: Call,
-    n: u128,
-    eq: bool,
-    t_span: Span,
-    f_span: Option<Span>,
 }
 
 #[derive(Debug)]
@@ -453,7 +461,6 @@ struct BodyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     returns: Vec<Return>,
     calls: Vec<Call>,
-    if_calls: Vec<IfCall>,
     indirect_assigns: Vec<IndirectAssign>,
     null_checks: Vec<NullCheck>,
 }
@@ -464,31 +471,9 @@ impl<'tcx> BodyVisitor<'tcx> {
             tcx,
             returns: vec![],
             calls: vec![],
-            if_calls: vec![],
             indirect_assigns: vec![],
             null_checks: vec![],
         }
-    }
-
-    fn try_into_call(&self, expr: &Expr<'_>, callee: &Expr<'_>, args: &[Expr<'_>]) -> Option<Call> {
-        if let Some(path) = expr_to_path(callee) {
-            if let Res::Def(_, def_id) = path.res {
-                let span = expr.span;
-                let args = args
-                    .iter()
-                    .map(|arg| {
-                        let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
-                        (arg.span, is_null)
-                    })
-                    .collect();
-                return Some(Call {
-                    span,
-                    callee: def_id,
-                    args,
-                });
-            }
-        }
-        None
     }
 }
 
@@ -507,44 +492,22 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
                 self.returns.push(Return { span, value });
             }
             ExprKind::Call(callee, args) => {
-                if let Some(call) = self.try_into_call(expr, callee, args) {
-                    self.calls.push(call);
-                }
-            }
-            ExprKind::If(c, t, f) => {
-                if let ExprKind::Binary(op, lhs, rhs) = remove_cast_and_drop_temps(c).kind {
-                    let eq = match op.node {
-                        BinOpKind::Eq => Some(true),
-                        BinOpKind::Ne => Some(false),
-                        _ => None,
-                    };
-                    if let Some(eq) = eq {
-                        let t_span = t.span;
-                        let f_span = f.map(|f| f.span);
-                        let lhs = remove_cast_and_drop_temps(lhs);
-                        let rhs = remove_cast_and_drop_temps(rhs);
-                        let call_n = if let (ExprKind::Call(callee, args), Some(n)) =
-                            (lhs.kind, as_int_lit(rhs))
-                        {
-                            self.try_into_call(lhs, callee, args).map(|call| (call, n))
-                        } else if let (ExprKind::Call(callee, args), Some(n)) =
-                            (rhs.kind, as_int_lit(lhs))
-                        {
-                            self.try_into_call(rhs, callee, args).map(|call| (call, n))
-                        } else {
-                            None
+                if let Some(path) = expr_to_path(callee) {
+                    if let Res::Def(_, def_id) = path.res {
+                        let args = args
+                            .iter()
+                            .map(|arg| {
+                                let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
+                                (arg.span, is_null)
+                            })
+                            .collect();
+                        let call = Call {
+                            hir_id: expr.hir_id,
+                            span: expr.span,
+                            callee: def_id,
+                            args,
                         };
-                        if let Some((call, n)) = call_n {
-                            let if_span = expr.span;
-                            self.if_calls.push(IfCall {
-                                if_span,
-                                call,
-                                n,
-                                eq,
-                                t_span,
-                                f_span,
-                            });
-                        }
+                        self.calls.push(call);
                     }
                 }
             }
@@ -665,6 +628,49 @@ fn as_int_lit(expr: &Expr<'_>) -> Option<u128> {
         }
     }
     None
+}
+
+fn get_parent(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
+    let hir = tcx.hir();
+    let Node::Expr(e) = hir.find_parent(hir_id)? else {
+        return None;
+    };
+    match e.kind {
+        ExprKind::DropTemps(_) | ExprKind::Cast(_, _) => get_parent(e.hir_id, tcx),
+        _ => Some(e),
+    }
+}
+
+#[derive(Debug)]
+struct IfCmpCall {
+    if_span: Span,
+    target: u128,
+    op: BinOpKind,
+    then_span: Span,
+    else_span: Option<Span>,
+}
+
+fn get_if_cmp_call(hir_id: HirId, span: Span, tcx: TyCtxt<'_>) -> Option<IfCmpCall> {
+    let pexpr = get_parent(hir_id, tcx)?;
+    let ExprKind::Binary(op, lhs, rhs) = pexpr.kind else {
+        return None;
+    };
+    let ppexpr = get_parent(pexpr.hir_id, tcx)?;
+    let ExprKind::If(c, t, f) = ppexpr.kind else {
+        return None;
+    };
+    if !c.span.overlaps(pexpr.span) {
+        return None;
+    }
+    let target = if lhs.span.overlaps(span) { rhs } else { lhs };
+    let call = IfCmpCall {
+        if_span: ppexpr.span,
+        target: as_int_lit(target)?,
+        op: op.node,
+        then_span: t.span,
+        else_span: f.map(|f| f.span),
+    };
+    Some(call)
 }
 
 fn to_comma(span: Span, source_map: &SourceMap) -> Span {
