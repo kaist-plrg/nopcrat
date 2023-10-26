@@ -363,8 +363,8 @@ struct Param {
     ty: String,
 }
 
+#[allow(unused)]
 struct Func {
-    #[allow(unused)]
     is_unit: bool,
     succ_value: SuccValue,
     first_return: Vec<usize>,
@@ -392,6 +392,7 @@ struct Call {
     args: Vec<(Span, bool)>,
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 struct IfCall {
     if_span: Span,

@@ -15,7 +15,7 @@ use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{BasicBlock, BasicBlockData, Body, Local, Location, TerminatorKind},
-    ty::{Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, Span};
@@ -62,6 +62,13 @@ pub fn analyze_input(input: Input, conf: &AnalysisConfig) -> AnalysisResult {
     .unwrap()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Write {
+    All,
+    Partial,
+    None,
+}
+
 pub fn collect_output_params(
     results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)>,
     tcx: TyCtxt<'_>,
@@ -83,7 +90,7 @@ pub fn collect_output_params(
                 (i, expanded)
             })
             .collect();
-        let ret_writes: Vec<_> = summary
+        let writes: Vec<BTreeMap<_, _>> = summary
             .return_states
             .values()
             .map(|st| {
@@ -92,27 +99,45 @@ pub fn collect_output_params(
                 for w in writes {
                     per_base.entry(w.base()).or_default().insert(w.0.clone());
                 }
-                let writes: BTreeSet<_> = per_base
-                    .into_iter()
-                    .filter_map(|(i, paths)| {
-                        if reads.contains(&i) || expanded_map[&i] != paths {
-                            None
+                expanded_map
+                    .iter()
+                    .map(|(i, paths)| {
+                        let w = if let Some(ws) = per_base.get(i) {
+                            if ws == paths {
+                                Write::All
+                            } else {
+                                Write::Partial
+                            }
                         } else {
-                            Some(i)
-                        }
+                            Write::None
+                        };
+                        (*i, w)
                     })
-                    .collect();
-                (st.local.get(0).clone(), writes)
+                    .collect()
             })
             .collect();
-        let writes: BTreeSet<_> = ret_writes
-            .iter()
-            .flat_map(|(_, writes)| writes)
-            .cloned()
+        let writes: BTreeSet<_> = (1..param_tys.len())
+            .filter(|i| {
+                let ws: BTreeSet<_> = writes.iter().map(|map| map[&i]).collect();
+                !reads.contains(i)
+                    && param_tys[*i] != TypeInfo::Union
+                    && ws.contains(&Write::All)
+                    && !ws.contains(&Write::Partial)
+            })
             .collect();
         if writes.is_empty() {
             continue;
         }
+        let ret_writes: Vec<_> = summary
+            .return_states
+            .values()
+            .map(|st| {
+                let mut writes2: BTreeSet<_> =
+                    st.writes.as_set().iter().map(|w| w.base()).collect();
+                writes2.retain(|w| writes.contains(w));
+                (st.local.get(0).clone(), writes2)
+            })
+            .collect();
         let body = tcx.optimized_mir(def_id);
         let ret_ty = &body.local_decls[Local::from_usize(0)].ty;
         let params = writes
@@ -653,24 +678,29 @@ impl<'a> WorkList<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TypeInfo {
     Struct(Vec<TypeInfo>),
+    Union,
     NonStruct,
 }
 
 impl TypeInfo {
     fn from_ty<'tcx>(ty: &Ty<'tcx>, tcx: TyCtxt<'tcx>) -> Self {
         if let TyKind::Adt(adt_def, generic_args) = ty.kind() {
-            if adt_def.is_struct() {
-                let variant = adt_def.variant(VariantIdx::from_usize(0));
-                return Self::Struct(
-                    variant
+            match adt_def.adt_kind() {
+                AdtKind::Struct => {
+                    let variant = adt_def.variant(VariantIdx::from_usize(0));
+                    let tys = variant
                         .fields
                         .iter()
                         .map(|field| Self::from_ty(&field.ty(tcx, generic_args), tcx))
-                        .collect(),
-                );
+                        .collect();
+                    Self::Struct(tys)
+                }
+                AdtKind::Union => Self::Union,
+                AdtKind::Enum => Self::NonStruct,
             }
+        } else {
+            Self::NonStruct
         }
-        Self::NonStruct
     }
 }
 
