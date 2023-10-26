@@ -29,9 +29,6 @@ fn transform(
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
-    let mut visitor = FnPtrVisitor::new(tcx);
-    hir.visit_all_item_likes_in_crate(&mut visitor);
-
     let mut funcs = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
@@ -39,9 +36,6 @@ fn transform(
             continue;
         };
         let def_id = id.owner_id.to_def_id();
-        if visitor.fn_ptrs.contains(&def_id) {
-            continue;
-        }
         let name = tcx.def_path_str(def_id);
         let params = some_or!(param_map.get(&name), continue);
         let body = hir.body(body_id);
@@ -536,49 +530,6 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
                                 span: expr.span,
                                 hir_id,
                             });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        rustc_hir::intravisit::walk_expr(self, expr);
-    }
-}
-
-struct FnPtrVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    callees: BTreeSet<Span>,
-    fn_ptrs: BTreeSet<DefId>,
-}
-
-impl<'tcx> FnPtrVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            tcx,
-            callees: BTreeSet::new(),
-            fn_ptrs: BTreeSet::new(),
-        }
-    }
-}
-
-impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        match expr.kind {
-            ExprKind::Call(callee, _) => {
-                self.callees.insert(callee.span);
-            }
-            ExprKind::Path(QPath::Resolved(_, path)) => {
-                if !self.callees.contains(&expr.span) {
-                    if let Res::Def(def_kind, def_id) = path.res {
-                        if def_kind.is_fn_like() {
-                            self.fn_ptrs.insert(def_id);
                         }
                     }
                 }

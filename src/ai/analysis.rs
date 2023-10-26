@@ -8,8 +8,8 @@ use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
     def::{DefKind, Res},
-    intravisit::Visitor as HVisitor,
-    Expr, ExprKind, QPath,
+    intravisit::{FnKind, Visitor as HVisitor},
+    BodyId, Expr, ExprKind, FnDecl, HirId, PatKind, QPath,
 };
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
@@ -18,7 +18,10 @@ use rustc_middle::{
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::DefId, Span};
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    Span,
+};
 use serde::{Deserialize, Serialize};
 
 use super::domains::*;
@@ -73,8 +76,15 @@ pub fn collect_output_params(
     results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)>,
     tcx: TyCtxt<'_>,
 ) -> BTreeMap<String, Vec<OutputParam>> {
+    let mut visitor = CrateVisitor::new(tcx);
+    tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+
+    let empty = BTreeSet::new();
     let mut func_param_map = BTreeMap::new();
     for (def_id, (summary, param_tys)) in results {
+        if visitor.fn_ptrs.contains(&def_id) {
+            continue;
+        }
         let reads: BTreeSet<_> = summary
             .return_states
             .values()
@@ -116,10 +126,12 @@ pub fn collect_output_params(
                     .collect()
             })
             .collect();
+        let offsets = visitor.offsets.get(&def_id).unwrap_or(&empty);
         let writes: BTreeSet<_> = (1..param_tys.len())
             .filter(|i| {
                 let ws: BTreeSet<_> = writes.iter().map(|map| map[&i]).collect();
                 !reads.contains(i)
+                    && !offsets.contains(i)
                     && param_tys[*i] != TypeInfo::Union
                     && ws.contains(&Write::All)
                     && !ws.contains(&Write::Partial)
@@ -618,6 +630,83 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
                     self.callees.insert(def_id);
                 }
             }
+        }
+        rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+struct CrateVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    callees: BTreeSet<Span>,
+    fn_ptrs: BTreeSet<DefId>,
+    params: BTreeMap<HirId, (DefId, usize)>,
+    offsets: BTreeMap<DefId, BTreeSet<usize>>,
+}
+
+impl<'tcx> CrateVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            callees: BTreeSet::new(),
+            fn_ptrs: BTreeSet::new(),
+            params: BTreeMap::new(),
+            offsets: BTreeMap::new(),
+        }
+    }
+}
+
+impl<'tcx> HVisitor<'tcx> for CrateVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_fn(
+        &mut self,
+        fn_kind: FnKind<'tcx>,
+        decl: &'tcx FnDecl<'tcx>,
+        body_id: BodyId,
+        _: Span,
+        id: LocalDefId,
+    ) {
+        let def_id = id.to_def_id();
+        let body = self.tcx.hir().body(body_id);
+        for (i, param) in body.params.iter().enumerate() {
+            let PatKind::Binding(_, hir_id, _, _) = param.pat.kind else {
+                unreachable!()
+            };
+            self.params.insert(hir_id, (def_id, i + 1));
+        }
+        rustc_hir::intravisit::walk_fn(self, fn_kind, decl, body_id, id);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match expr.kind {
+            ExprKind::Call(callee, _) => {
+                self.callees.insert(callee.span);
+            }
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if !self.callees.contains(&expr.span) {
+                    if let Res::Def(def_kind, def_id) = path.res {
+                        if def_kind.is_fn_like() {
+                            self.fn_ptrs.insert(def_id);
+                        }
+                    }
+                }
+            }
+            ExprKind::MethodCall(seg, receiver, _, _) => {
+                if seg.ident.name.to_string() == "offset" {
+                    if let ExprKind::Path(QPath::Resolved(_, path)) = receiver.kind {
+                        if let Res::Local(hir_id) = path.res {
+                            if let Some((def_id, i)) = self.params.remove(&hir_id) {
+                                self.offsets.entry(def_id).or_default().insert(i);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
