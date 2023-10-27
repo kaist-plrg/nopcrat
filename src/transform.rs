@@ -280,6 +280,17 @@ fn transform(
             fix(rhs_span, rhs);
         }
 
+        for deref in visitor.derefs {
+            let Deref { span, hir_id } = deref;
+            let param = some_or!(func.hir_id_map.get(&hir_id), continue);
+            if param.must {
+                continue;
+            }
+
+            let v = format!("{}___v.unwrap()", param.name);
+            fix(span, v);
+        }
+
         for check in visitor.null_checks {
             let NullCheck { span, hir_id } = check;
             if !func.hir_id_map.contains_key(&hir_id) {
@@ -383,7 +394,8 @@ impl Func {
                 assigns.push(assign);
             }
         }
-        mk_string(assigns.iter(), ";\n", "\n", "\nrv___ }")
+        let end = if self.is_unit { " }" } else { "\nrv___ }" };
+        mk_string(assigns.iter(), ";\n", "\n", end)
     }
 
     fn call_match(&self, args: &[Arg], curr: Option<&Self>) -> Option<String> {
@@ -489,6 +501,12 @@ struct IndirectAssign {
 }
 
 #[derive(Debug)]
+struct Deref {
+    span: Span,
+    hir_id: HirId,
+}
+
+#[derive(Debug)]
 struct NullCheck {
     span: Span,
     hir_id: HirId,
@@ -499,6 +517,7 @@ struct BodyVisitor<'tcx> {
     returns: Vec<Return>,
     calls: Vec<Call>,
     indirect_assigns: Vec<IndirectAssign>,
+    derefs: Vec<Deref>,
     null_checks: Vec<NullCheck>,
 }
 
@@ -509,6 +528,7 @@ impl<'tcx> BodyVisitor<'tcx> {
             returns: vec![],
             calls: vec![],
             indirect_assigns: vec![],
+            derefs: vec![],
             null_checks: vec![],
         }
     }
@@ -570,6 +590,27 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
                                 lhs_span: lhs.span,
                                 lhs: hir_id,
                                 rhs_span: rhs.span,
+                            });
+                        }
+                    }
+                }
+            }
+            ExprKind::Unary(UnOp::Deref, ptr) => {
+                let exclude = if let Some(p) = get_parent(expr.hir_id, self.tcx) {
+                    match p.kind {
+                        ExprKind::Assign(lhs, _, _) => lhs.span.overlaps(expr.span),
+                        ExprKind::AddrOf(_, _, _) => true,
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !exclude {
+                    if let Some(path) = expr_to_path(ptr) {
+                        if let Res::Local(hir_id) = path.res {
+                            self.derefs.push(Deref {
+                                span: expr.span,
+                                hir_id,
                             });
                         }
                     }
