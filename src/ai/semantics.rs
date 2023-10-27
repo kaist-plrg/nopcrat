@@ -153,11 +153,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
     ) -> Vec<AbsState> {
+        let mut offsets = vec![];
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                return self.transfer_intra_call(&summary.clone(), args, dst, state, reads);
+                return self.transfer_intra_call(callee, &summary.clone(), args, dst, state, reads);
             } else if name.contains("{extern#0}") {
                 self.transfer_c_call(callee, args, &mut reads)
             } else if name.contains("{impl#") {
@@ -167,9 +168,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsValue::top()
             }
         } else {
-            self.transfer_rust_call(callee, args, &mut state, &mut reads, &mut writes)
+            self.transfer_rust_call(
+                callee,
+                args,
+                &mut state,
+                &mut offsets,
+                &mut reads,
+                &mut writes,
+            )
         };
         let (mut new_state, writes_ret) = self.assign(dst, v, &state);
+        new_state.add_offsets(offsets.into_iter());
         new_state.add_reads(reads.into_iter());
         new_state.add_writes(writes.into_iter());
         new_state.add_writes(writes_ret.into_iter());
@@ -178,11 +187,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
     fn transfer_intra_call(
         &mut self,
+        callee: DefId,
         summary: &FunctionSummary,
         args: &[AbsValue],
         dst: &Place<'tcx>,
         state: AbsState,
-        reads: Vec<AbsPath>,
+        mut reads: Vec<AbsPath>,
     ) -> Vec<AbsState> {
         if summary.return_states.is_empty() {
             return vec![];
@@ -193,6 +203,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if let Some(idx) = param.ptrv.get_arg() {
                 ptr_maps.insert(idx, arg.ptrv.clone());
             }
+        }
+
+        let sig = self.tcx.fn_sig(callee).skip_binder();
+        let inputs = sig.inputs().skip_binder();
+        for arg in args.iter().skip(inputs.len()) {
+            let reads2 = self.get_read_paths_of_ptr(&arg.ptrv, &[]);
+            reads.extend(reads2);
         }
 
         let mut states = vec![];
@@ -320,6 +337,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
             reads.extend(reads2);
         }
+        for arg in args.iter().skip(inputs.len()) {
+            let reads2 = self.get_read_paths_of_ptr(&arg.ptrv, &[]);
+            reads.extend(reads2);
+        }
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
@@ -335,6 +356,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         callee: DefId,
         args: &[AbsValue],
         state: &mut AbsState,
+        offsets: &mut Vec<AbsPath>,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
     ) -> AbsValue {
@@ -363,6 +385,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsValue::ptr(ptr)
             }
             ("ptr", "mut_ptr" | "const_ptr", _, "offset") => {
+                let offsets2 = self.get_read_paths_of_ptr(&args[0].ptrv, &[]);
+                offsets.extend(offsets2);
                 let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                     AbsPtr::alphas(
                         ptrs.iter()

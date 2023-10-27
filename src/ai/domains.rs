@@ -72,6 +72,13 @@ impl AbsState {
         }
     }
 
+    pub fn add_offsets<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            self.writes.remove(&path);
+            self.reads.insert(path);
+        }
+    }
+
     pub fn add_reads<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
             if !self.writes.contains(&path) {
@@ -2993,6 +3000,13 @@ impl MustPathSet {
     pub fn insert(&mut self, place: AbsPath) {
         if let Self::Set(set) = self {
             set.insert(place);
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, place: &AbsPath) {
+        if let Self::Set(set) = self {
+            set.remove(place);
         }
     }
 
