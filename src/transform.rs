@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -101,6 +101,9 @@ fn transform(
 
         let def_id = id.owner_id.to_def_id();
         let body = hir.body(body_id);
+        let curr = funcs.get(&def_id);
+
+        let mut ret_call_spans = BTreeSet::new();
 
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
@@ -115,32 +118,26 @@ fn transform(
             let func = some_or!(funcs.get(&callee), continue);
 
             for index in func.index_map.keys() {
-                let span = to_comma(args[*index].0, source_map);
+                let span = to_comma(args[*index].span, source_map);
                 fix(span, "".to_string());
             }
 
-            let args: Vec<_> = args
-                .into_iter()
-                .map(|(span, is_null)| {
-                    let arg = source_map.span_to_snippet(span).unwrap();
-                    (arg, is_null)
-                })
-                .collect();
+            let mut mtch = func.call_match(&args, curr);
 
-            let mtch = if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
+            if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
                 if let Some(then) = func.cmp(call.op, call.target) {
                     let if_span = call.if_span;
                     let if_span = if_span.with_hi(span.lo());
-                    fix(if_span, "match ".to_string());
+                    fix(if_span, "{ match ".to_string());
 
                     let succ = "Ok(v) => ";
                     let fail = "Err(_) => ";
                     let (_, i) = func.first_return.as_ref().unwrap();
-                    let (arg, is_null) = &args[*i];
-                    let assign = if *is_null {
+                    let arg = &args[*i];
+                    let assign = if arg.is_null {
                         "".to_string()
                     } else {
-                        format!(" (*{}) = v;", arg)
+                        format!(" (*{}) = v;", arg.code)
                     };
 
                     let bt = if then { succ } else { fail };
@@ -167,23 +164,32 @@ fn transform(
 
                         let pos = else_span.hi();
                         let end_span = else_span.with_hi(pos).with_lo(pos);
-                        fix(end_span, "\n}".to_string());
+                        fix(end_span, "\n}}".to_string());
                     } else {
                         let (be, assign) = if !then {
                             (succ, assign)
                         } else {
                             (fail, "".to_string())
                         };
-                        fix(be_span, format!("\n{} {{ {} }}\n}}", be, assign));
+                        fix(be_span, format!("\n{} {{ {} }}\n}}}}", be, assign));
                     }
 
-                    None
-                } else {
-                    func.call_match(&args)
+                    mtch = None
                 }
-            } else {
-                func.call_match(&args)
-            };
+            } else if let Some(expr) = get_parent(hir_id, tcx) {
+                if matches!(expr.kind, ExprKind::Ret(_)) {
+                    if let Some(func) = curr {
+                        ret_call_spans.insert(expr.span);
+                        let span = expr.span.with_hi(expr.span.lo() + BytePos(6));
+                        fix(span, "let rv___ =".to_string());
+
+                        let pos = expr.span.hi() + BytePos(1);
+                        let span = expr.span.with_hi(pos).with_lo(pos);
+                        let rv = func.return_value(Some("rv___".to_string()));
+                        fix(span, format!("; return {};", rv));
+                    }
+                }
+            }
 
             let mut binding = func.call_binding();
             if mtch.is_some() {
@@ -191,14 +197,14 @@ fn transform(
             }
             fix(span.shrink_to_lo(), binding);
 
-            let mut assign = func.call_assign(&args);
+            let mut assign = func.call_assign(&args, curr);
             if let Some(m) = &mtch {
                 assign += m;
             }
             fix(span.shrink_to_hi(), assign);
         }
 
-        let func = some_or!(funcs.get(&def_id), continue);
+        let func = some_or!(curr, continue);
         for param in func.params() {
             fix(param.span, "".to_string());
         }
@@ -240,6 +246,9 @@ fn transform(
 
         for ret in visitor.returns {
             let Return { span, value } = ret;
+            if ret_call_spans.contains(&span) {
+                continue;
+            }
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
             let ret_v = func.return_value(orig);
             fix(span, format!("return {}", ret_v));
@@ -343,17 +352,33 @@ impl Func {
         }
     }
 
-    fn call_assign<S: AsRef<str>>(&self, args: &[(S, bool)]) -> String {
+    fn is_must(curr: Option<&Self>, hir_id: &Option<HirId>) -> Option<bool> {
+        let curr = curr?;
+        let hir_id = hir_id.as_ref()?;
+        let param = curr.hir_id_map.get(hir_id)?;
+        Some(param.must)
+    }
+
+    fn call_assign(&self, args: &[Arg], curr: Option<&Self>) -> String {
         let mut assigns = vec![];
         for i in &self.remaining_return {
-            let (arg, is_null) = &args[*i];
-            if !is_null {
-                let arg = arg.as_ref();
+            let arg = &args[*i];
+            if !arg.is_null {
                 let param = &self.index_map[i];
-                let assign = if param.must {
-                    format!("*({}) = rv___{};", arg, i)
+                let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
+                let assign = if need_some {
+                    if param.must {
+                        format!("{}___v = Some(rv___{});", arg.code, i)
+                    } else {
+                        format!(
+                            "if let Some(v) = rv___{} {{ {}___v = Some(v); }}",
+                            i, arg.code
+                        )
+                    }
+                } else if param.must {
+                    format!("*({}) = rv___{};", arg.code, i)
                 } else {
-                    format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i, arg)
+                    format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i, arg.code)
                 };
                 assigns.push(assign);
             }
@@ -361,14 +386,18 @@ impl Func {
         mk_string(assigns.iter(), ";\n", "\n", "\nrv___ }")
     }
 
-    fn call_match<S: AsRef<str>>(&self, args: &[(S, bool)]) -> Option<String> {
+    fn call_match(&self, args: &[Arg], curr: Option<&Self>) -> Option<String> {
         let (succ_value, first) = &self.first_return?;
-        let (arg, is_null) = &args[*first];
-        let arg = arg.as_ref();
-        let assign = if *is_null {
+        let arg = &args[*first];
+        let assign = if arg.is_null {
             "".to_string()
         } else {
-            format!("*({}) = v;", arg)
+            let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
+            if need_some {
+                format!("{}___v = Some(v);", arg.code)
+            } else {
+                format!("*({}) = v;", arg.code)
+            }
         };
         let v = match succ_value {
             SuccValue::Int(v) => v.to_string(),
@@ -441,7 +470,15 @@ struct Call {
     hir_id: HirId,
     span: Span,
     callee: DefId,
-    args: Vec<(Span, bool)>,
+    args: Vec<Arg>,
+}
+
+#[derive(Debug)]
+struct Arg {
+    span: Span,
+    code: String,
+    hir_id: Option<HirId>,
+    is_null: bool,
 }
 
 #[derive(Debug)]
@@ -494,11 +531,25 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
             ExprKind::Call(callee, args) => {
                 if let Some(path) = expr_to_path(callee) {
                     if let Res::Def(_, def_id) = path.res {
+                        let source_map = self.tcx.sess.source_map();
                         let args = args
                             .iter()
                             .map(|arg| {
+                                let code = source_map.span_to_snippet(arg.span).unwrap();
+                                let hir_id = expr_to_path(arg).and_then(|path| {
+                                    if let Res::Local(hir_id) = path.res {
+                                        Some(hir_id)
+                                    } else {
+                                        None
+                                    }
+                                });
                                 let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
-                                (arg.span, is_null)
+                                Arg {
+                                    span: arg.span,
+                                    code,
+                                    hir_id,
+                                    is_null,
+                                }
                             })
                             .collect();
                         let call = Call {
