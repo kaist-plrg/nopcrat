@@ -157,7 +157,7 @@ fn transform(
                         fix(be_span, format!("\n{}", be));
 
                         if !then {
-                            let pos = be_span.lo() + BytePos(1);
+                            let pos = be_span.hi() + BytePos(1);
                             let ba_span = be_span.with_hi(pos).with_lo(pos);
                             fix(ba_span, assign);
                         }
