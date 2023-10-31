@@ -9,7 +9,7 @@ use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
     MutTy, Node, PatKind, QPath, TyKind, UnOp,
 };
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{hir::nested_filter, mir::BasicBlock, ty::TyCtxt};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
 use rustfix::Suggestion;
 
@@ -53,11 +53,24 @@ fn transform(
         let name = tcx.def_path_str(def_id);
         let params = some_or!(param_map.get(&name), continue);
         let body = hir.body(body_id);
+        let mir_body = tcx.optimized_mir(def_id);
         let index_map: BTreeMap<_, _> = params
             .iter()
             .map(|param| {
-                let OutputParam { index, must, .. } = param;
+                let OutputParam {
+                    index,
+                    must,
+                    complete_writes,
+                    ..
+                } = param;
                 let param = &body.params[*index];
+                let complete_writes = complete_writes
+                    .iter()
+                    .map(|(bb, i)| {
+                        let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*bb)];
+                        bbd.statements[*i].source_info.span
+                    })
+                    .collect();
                 let PatKind::Binding(_, hir_id, ident, _) = param.pat.kind else {
                     unreachable!()
                 };
@@ -79,6 +92,7 @@ fn transform(
                 };
                 let param = Param {
                     must: *must,
+                    complete_writes,
                     name,
                     ty,
                     span,
@@ -333,6 +347,8 @@ fn transform(
 #[derive(Debug, Clone)]
 struct Param {
     must: bool,
+    #[allow(unused)]
+    complete_writes: Vec<Span>,
     span: Span,
     hir_id: HirId,
     name: String,

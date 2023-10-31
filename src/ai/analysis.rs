@@ -13,7 +13,7 @@ use rustc_hir::{
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, TerminatorKind},
+    mir::{BasicBlock, Body, Local, Location, ProjectionElem, StatementKind, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -227,6 +227,7 @@ pub struct OutputParam {
     pub index: usize,
     pub must: bool,
     pub return_values: ReturnValues,
+    pub complete_writes: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +405,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     index: index - 1,
                     must,
                     return_values,
+                    complete_writes: vec![],
                 }
             })
             .collect()
@@ -425,7 +427,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
 
         let body = self.tcx.optimized_mir(def_id);
-        let predecessors = body.basic_blocks.predecessors();
         for (location, sts) in result {
             let complete = sts.keys().any(|w| {
                 let w = w.as_set();
@@ -434,41 +435,32 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if !complete {
                 continue;
             }
-            let prevs = if location.statement_index == 0 {
-                predecessors[location.block]
-                    .iter()
-                    .map(|bb| {
-                        let bbd = &body.basic_blocks[*bb];
-                        Location {
-                            block: *bb,
-                            statement_index: bbd.statements.len(),
-                        }
-                    })
-                    .collect()
-            } else {
-                let mut l = *location;
-                l.statement_index -= 1;
-                vec![l]
-            };
-            let pcomplete = prevs
-                .iter()
-                .filter_map(|l| result.get(l))
-                .flat_map(|sts| sts.keys())
-                .any(|w| {
-                    let w = w.as_set();
-                    paths.iter().all(|p| w.contains(p))
-                });
+            if location.statement_index == 0 {
+                continue;
+            }
+            let mut prev = *location;
+            prev.statement_index -= 1;
+            let pcomplete = result[&prev].keys().any(|w| {
+                let w = w.as_set();
+                paths.iter().all(|p| w.contains(p))
+            });
             if !pcomplete {
-                for location in prevs {
-                    let bbd = &body.basic_blocks[location.block];
-                    let span = if bbd.statements.len() == location.statement_index {
-                        println!("{:?}", bbd.terminator());
-                        bbd.terminator().source_info.span
-                    } else {
-                        println!("{:?}", bbd.statements[location.statement_index]);
-                        bbd.statements[location.statement_index].source_info.span
-                    };
-                    println!("{:?}", span);
+                let Location {
+                    block,
+                    statement_index,
+                } = *location;
+                let bbd = &body.basic_blocks[block];
+                let stmt = &bbd.statements[statement_index];
+                let StatementKind::Assign(box (p, _)) = stmt.kind else {
+                    continue;
+                };
+                if p.projection
+                    .iter()
+                    .any(|proj| matches!(proj, ProjectionElem::Field(_, _)))
+                {
+                    param
+                        .complete_writes
+                        .push((block.as_usize(), statement_index));
                 }
             }
         }
