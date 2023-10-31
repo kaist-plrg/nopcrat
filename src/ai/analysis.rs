@@ -448,7 +448,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let Location {
                     block,
                     statement_index,
-                } = *location;
+                } = prev;
                 let bbd = &body.basic_blocks[block];
                 let stmt = &bbd.statements[statement_index];
                 let StatementKind::Assign(box (p, _)) = stmt.kind else {

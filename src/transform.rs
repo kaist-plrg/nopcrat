@@ -268,10 +268,18 @@ fn transform(
     let {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
-                } else {
+                } else if param.complete_writes.is_empty() {
                     format!(
                         "
     let mut {0}___v: Option<{1}> = None;",
+                        param.name, param.ty,
+                    )
+                } else {
+                    format!(
+                        "
+    let mut {0}___v: Option<{1}> = None;
+    let mut {0}___vv: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);
+    let mut {0}: *mut {1} = &mut {0}___vv;",
                         param.name, param.ty,
                     )
                 }
@@ -281,6 +289,20 @@ fn transform(
         let pos = body.value.span.lo() + BytePos(1);
         let span = body.value.span.with_lo(pos).with_hi(pos);
         fix(span, local_vars);
+
+        for param in func.params() {
+            for span in &param.complete_writes {
+                let pos = span.hi() + BytePos(1);
+                let span = span.with_hi(pos).with_lo(pos);
+                let assign = format!(
+                    "
+                    {0}___v = Some({0}___vv);
+                    {0} = {0}___v.as_mut().unwrap();",
+                    param.name,
+                );
+                fix(span, assign);
+            }
+        }
 
         for ret in visitor.returns {
             let Return { span, value } = ret;
@@ -347,7 +369,6 @@ fn transform(
 #[derive(Debug, Clone)]
 struct Param {
     must: bool,
-    #[allow(unused)]
     complete_writes: Vec<Span>,
     span: Span,
     hir_id: HirId,
@@ -638,7 +659,7 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
                 }
             }
             ExprKind::Unary(UnOp::Deref, ptr) => {
-                let exclude = if let Some(p) = get_parent(expr.hir_id, self.tcx) {
+                let exclude = if let Some(p) = get_parent_wo_field(expr.hir_id, self.tcx) {
                     match p.kind {
                         ExprKind::Assign(lhs, _, _) => lhs.span.overlaps(expr.span),
                         ExprKind::AddrOf(_, _, _) => true,
@@ -747,16 +768,16 @@ fn expr_to_path<'a, 'tcx>(expr: &'a Expr<'tcx>) -> Option<&'a rustc_hir::Path<'t
     }
 }
 
-fn remove_cast_and_drop_temps<'a, 'tcx>(expr: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
+fn remove_cast<'a, 'tcx>(expr: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
     if let ExprKind::Cast(expr, _) | ExprKind::DropTemps(expr) = expr.kind {
-        remove_cast_and_drop_temps(expr)
+        remove_cast(expr)
     } else {
         expr
     }
 }
 
 fn as_int_lit(expr: &Expr<'_>) -> Option<u128> {
-    if let ExprKind::Lit(lit) = remove_cast_and_drop_temps(expr).kind {
+    if let ExprKind::Lit(lit) = remove_cast(expr).kind {
         if let LitKind::Int(n, _) = lit.node {
             return Some(n);
         }
@@ -771,6 +792,19 @@ fn get_parent(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
     };
     match e.kind {
         ExprKind::DropTemps(_) | ExprKind::Cast(_, _) => get_parent(e.hir_id, tcx),
+        _ => Some(e),
+    }
+}
+
+fn get_parent_wo_field(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
+    let hir = tcx.hir();
+    let Node::Expr(e) = hir.find_parent(hir_id)? else {
+        return None;
+    };
+    match e.kind {
+        ExprKind::DropTemps(_) | ExprKind::Cast(_, _) | ExprKind::Field(_, _) => {
+            get_parent(e.hir_id, tcx)
+        }
         _ => Some(e),
     }
 }
