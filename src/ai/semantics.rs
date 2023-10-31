@@ -160,7 +160,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if let Some(summary) = self.summaries.get(&callee) {
                 return self.transfer_intra_call(callee, &summary.clone(), args, dst, state, reads);
             } else if name.contains("{extern#0}") {
-                self.transfer_c_call(callee, args, &mut reads)
+                self.transfer_c_call(callee, args, &state, &mut reads)
             } else if name.contains("{impl#") {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
@@ -312,6 +312,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         callee: DefId,
         args: &[AbsValue],
+        state: &AbsState,
         reads: &mut Vec<AbsPath>,
     ) -> AbsValue {
         let sig = self.tcx.fn_sig(callee).skip_binder();
@@ -341,6 +342,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let reads2 = self.get_read_paths_of_ptr(&arg.ptrv, &[]);
             reads.extend(reads2);
         }
+
+        let reads2 = args.iter().flat_map(|arg| {
+            let (v, _) = self.read_ptr(&arg.ptrv, &[], state);
+            self.get_read_paths_of_ptr(&v.ptrv, &[])
+        });
+        reads.extend(reads2);
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
