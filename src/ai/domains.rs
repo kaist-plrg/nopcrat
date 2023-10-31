@@ -2977,7 +2977,7 @@ impl MustPathSet {
         matches!(self, Self::All)
     }
 
-    fn join(&self, other: &Self) -> Self {
+    pub fn join(&self, other: &Self) -> Self {
         match (self, other) {
             (s, Self::All) | (Self::All, s) => s.clone(),
             (Self::Set(s1), Self::Set(s2)) => Self::Set(s1.intersection(s2).cloned().collect()),

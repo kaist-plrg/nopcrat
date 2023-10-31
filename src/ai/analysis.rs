@@ -9,12 +9,12 @@ use rustc_abi::VariantIdx;
 use rustc_hir::{
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
-    Expr, ExprKind, QPath,
+    Expr, ExprKind, HirId, QPath,
 };
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, BasicBlockData, Body, Local, Location, TerminatorKind},
+    mir::{BasicBlock, Body, Local, Location, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -56,8 +56,16 @@ pub fn analyze_code(code: &str, conf: &AnalysisConfig) -> AnalysisResult {
 pub fn analyze_input(input: Input, conf: &AnalysisConfig) -> AnalysisResult {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
-        let results = analyze(tcx, conf);
-        collect_output_params(results, tcx)
+        analyze(tcx, conf)
+            .into_iter()
+            .filter_map(|(def_id, (_, params))| {
+                if params.is_empty() {
+                    None
+                } else {
+                    Some((tcx.def_path_str(def_id), params))
+                }
+            })
+            .collect()
     })
     .unwrap()
 }
@@ -69,17 +77,230 @@ enum Write {
     None,
 }
 
-pub fn collect_output_params(
-    results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>, BTreeSet<usize>)>,
+pub fn analyze(
     tcx: TyCtxt<'_>,
-) -> BTreeMap<String, Vec<OutputParam>> {
-    let mut visitor = CrateVisitor::new(tcx);
+    conf: &AnalysisConfig,
+) -> BTreeMap<DefId, (FunctionSummary, Vec<OutputParam>)> {
+    let hir = tcx.hir();
+
+    let mut call_graph = BTreeMap::new();
+    let mut inputs_map = BTreeMap::new();
+    for id in hir.items() {
+        let item = hir.item(id);
+        if item.ident.name.to_ident_string() == "main" {
+            continue;
+        }
+        let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
+            sig.decl.inputs.len()
+        } else {
+            continue;
+        };
+        let def_id = item.item_id().owner_id.def_id.to_def_id();
+        inputs_map.insert(def_id, inputs);
+        let mut visitor = CallVisitor::new(tcx);
+        visitor.visit_item(item);
+        call_graph.insert(def_id, visitor.callees);
+    }
+
+    let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
+    for callees in call_graph.values_mut() {
+        callees.retain(|callee| funcs.contains(callee));
+    }
+    let (graph, elems) = graph::compute_sccs(&call_graph);
+    let inv_graph = graph::inverse(&graph);
+    let po: Vec<_> = graph::post_order(&graph, &inv_graph)
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut visitor = FnPtrVisitor::new(tcx);
     tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
 
-    let mut func_param_map = BTreeMap::new();
-    for (def_id, (summary, param_tys, return_ptrs)) in results {
-        if visitor.fn_ptrs.contains(&def_id) {
-            continue;
+    let info_map: BTreeMap<_, _> = funcs
+        .iter()
+        .map(|def_id| {
+            let inputs = inputs_map[def_id];
+            let body = tcx.optimized_mir(def_id);
+            let param_tys = get_param_tys(body, inputs, tcx);
+            let pre_rpo_map = get_rpo_map(body);
+            let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
+            let rpo_map = compute_rpo_map(body, &loop_blocks);
+            let dead_locals = get_dead_locals(body, tcx);
+            let fn_ptr = visitor.fn_ptrs.contains(def_id);
+            let info = FuncInfo {
+                inputs,
+                param_tys,
+                loop_blocks,
+                rpo_map,
+                dead_locals,
+                fn_ptr,
+            };
+            (*def_id, info)
+        })
+        .collect();
+
+    let mut ptr_params_map = BTreeMap::new();
+    let mut output_params_map = BTreeMap::new();
+    let mut summaries = BTreeMap::new();
+    let mut results = BTreeMap::new();
+    for id in &po {
+        let def_ids = &elems[id];
+        let recursive = if def_ids.len() == 1 {
+            let def_id = def_ids.first().unwrap();
+            call_graph[def_id].contains(def_id)
+        } else {
+            true
+        };
+
+        loop {
+            if recursive {
+                for def_id in def_ids {
+                    let _ = summaries.try_insert(*def_id, FunctionSummary::bot());
+                }
+            }
+
+            let mut need_rerun = false;
+            for def_id in def_ids {
+                tracing::info!("{:?}", def_id);
+                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
+                let body = tcx.optimized_mir(*def_id);
+                if conf.verbose {
+                    println!(
+                        "{:?} {} {}",
+                        def_id,
+                        body.basic_blocks.len(),
+                        body.local_decls.len()
+                    );
+                }
+
+                let (result, init_state) = analyzer.analyze_body(body);
+                tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
+
+                let return_states = return_location(body)
+                    .and_then(|ret| result.get(&ret))
+                    .cloned()
+                    .unwrap_or_default();
+                let summary = FunctionSummary::new(init_state, return_states);
+                results.insert(*def_id, result);
+                ptr_params_map.insert(*def_id, analyzer.ptr_params);
+
+                let (summary, updated) = if let Some(old) = summaries.get(def_id) {
+                    let new_summary = summary.join(old);
+                    let updated = !new_summary.ord(old);
+                    (new_summary, updated)
+                } else {
+                    (summary, false)
+                };
+                summaries.insert(*def_id, summary);
+                need_rerun |= updated;
+            }
+
+            if !need_rerun {
+                for def_id in def_ids {
+                    let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
+                    analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
+                    let summary = &summaries[def_id];
+                    let return_ptrs = analyzer.get_return_ptrs(summary);
+                    let mut output_params =
+                        analyzer.find_output_params(summary, &return_ptrs, *def_id);
+                    let result = results.remove(def_id).unwrap();
+                    for p in &mut output_params {
+                        analyzer.find_complete_write(p, &result, *def_id);
+                    }
+                    output_params_map.insert(*def_id, output_params);
+                }
+                break;
+            }
+        }
+    }
+
+    summaries
+        .into_iter()
+        .map(|(def_id, summary)| {
+            let output_params = output_params_map.remove(&def_id).unwrap();
+            (def_id, (summary, output_params))
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputParam {
+    pub index: usize,
+    pub must: bool,
+    pub return_values: ReturnValues,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ReturnValues {
+    None,
+    Int(AbsInt, AbsInt),
+    Uint(AbsUint, AbsUint),
+    Bool(AbsBool, AbsBool),
+}
+
+#[derive(Debug, Clone)]
+struct FuncInfo {
+    inputs: usize,
+    param_tys: Vec<TypeInfo>,
+    loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
+    rpo_map: BTreeMap<BasicBlock, usize>,
+    dead_locals: Vec<BitSet<Local>>,
+    fn_ptr: bool,
+}
+
+impl FuncInfo {
+    fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
+        expands_path(&place.0, &self.param_tys, vec![])
+            .into_iter()
+            .map(AbsPath)
+            .collect()
+    }
+}
+
+pub struct Analyzer<'a, 'tcx> {
+    pub tcx: TyCtxt<'tcx>,
+    info: &'a FuncInfo,
+    conf: &'a AnalysisConfig,
+    pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
+    pub ptr_params: Vec<usize>,
+}
+
+impl<'a, 'tcx> Analyzer<'a, 'tcx> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        info: &'a FuncInfo,
+        conf: &'a AnalysisConfig,
+        summaries: &'a BTreeMap<DefId, FunctionSummary>,
+    ) -> Self {
+        Self {
+            tcx,
+            info,
+            conf,
+            summaries,
+            ptr_params: vec![],
+        }
+    }
+
+    fn get_return_ptrs(&self, summary: &FunctionSummary) -> BTreeSet<usize> {
+        summary
+            .return_states
+            .values()
+            .flat_map(|st| {
+                let v = st.local.get(0);
+                self.get_read_paths_of_ptr(&v.ptrv, &[])
+            })
+            .map(|p| p.base())
+            .collect()
+    }
+
+    fn find_output_params(
+        &self,
+        summary: &FunctionSummary,
+        return_ptrs: &BTreeSet<usize>,
+        def_id: DefId,
+    ) -> Vec<OutputParam> {
+        if self.info.fn_ptr {
+            return vec![];
         }
         let reads: BTreeSet<_> = summary
             .return_states
@@ -88,11 +309,15 @@ pub fn collect_output_params(
             .map(|p| p.base())
             .collect();
         if summary.return_states.values().any(|st| st.writes.is_bot()) {
-            continue;
+            return vec![];
         }
-        let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..param_tys.len())
+        let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..=self.info.inputs)
             .map(|i| {
-                let expanded = expands_path(&[i], &param_tys, vec![]).into_iter().collect();
+                let expanded = self
+                    .expands_path(&AbsPath(vec![i]))
+                    .into_iter()
+                    .map(|p| p.0)
+                    .collect();
                 (i, expanded)
             })
             .collect();
@@ -122,18 +347,18 @@ pub fn collect_output_params(
                     .collect()
             })
             .collect();
-        let writes: BTreeSet<_> = (1..param_tys.len())
+        let writes: BTreeSet<_> = (1..=self.info.inputs)
             .filter(|i| {
                 let ws: BTreeSet<_> = writes.iter().map(|map| map[&i]).collect();
                 !reads.contains(i)
                     && !return_ptrs.contains(i)
-                    && param_tys[*i] != TypeInfo::Union
+                    && self.info.param_tys[*i] != TypeInfo::Union
                     && ws.contains(&Write::All)
                     && !ws.contains(&Write::Partial)
             })
             .collect();
         if writes.is_empty() {
-            continue;
+            return vec![];
         }
         let ret_writes: Vec<_> = summary
             .return_states
@@ -145,9 +370,9 @@ pub fn collect_output_params(
                 (st.local.get(0).clone(), writes2)
             })
             .collect();
-        let body = tcx.optimized_mir(def_id);
+        let body = self.tcx.optimized_mir(def_id);
         let ret_ty = &body.local_decls[Local::from_usize(0)].ty;
-        let params = writes
+        writes
             .into_iter()
             .map(|index| {
                 let must = ret_writes.iter().all(|(_, writes)| writes.contains(&index));
@@ -182,195 +407,64 @@ pub fn collect_output_params(
                     return_values,
                 }
             })
-            .collect();
-        func_param_map.insert(tcx.def_path_str(def_id), params);
+            .collect()
     }
-    func_param_map
-}
 
-pub fn analyze(
-    tcx: TyCtxt<'_>,
-    conf: &AnalysisConfig,
-) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>, BTreeSet<usize>)> {
-    let hir = tcx.hir();
-
-    let mut call_graph = BTreeMap::new();
-    let mut inputs_map = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
-        if item.ident.name.to_ident_string() == "main" {
-            continue;
+    fn find_complete_write(
+        &self,
+        param: &mut OutputParam,
+        result: &BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
+        def_id: DefId,
+    ) {
+        if param.must {
+            return;
         }
-        let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
-            sig.decl.inputs.len()
-        } else {
-            continue;
-        };
-        let def_id = item.item_id().owner_id.def_id.to_def_id();
-        inputs_map.insert(def_id, inputs);
-        let mut visitor = CallVisitor::new(tcx);
-        visitor.visit_item(item);
-        call_graph.insert(def_id, visitor.callees);
-    }
 
-    let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
-    for callees in call_graph.values_mut() {
-        callees.retain(|callee| funcs.contains(callee));
-    }
-    let (graph, elems) = graph::compute_sccs(&call_graph);
-    let inv_graph = graph::inverse(&graph);
-    let po: Vec<_> = graph::post_order(&graph, &inv_graph)
-        .into_iter()
-        .flatten()
-        .collect();
+        let paths = self.expands_path(&AbsPath(vec![param.index + 1]));
+        if paths[0].0.len() == 1 {
+            return;
+        }
 
-    let mut info_map: BTreeMap<_, _> = funcs
-        .iter()
-        .map(|def_id| {
-            let inputs = inputs_map[def_id];
-            let body = tcx.optimized_mir(def_id);
-            let param_tys = get_param_tys(body, inputs, tcx);
-            let pre_rpo_map = get_rpo_map(body);
-            let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
-            let rpo_map = compute_rpo_map(body, &loop_blocks);
-            let dead_locals = get_dead_locals(body, tcx);
-            let info = FuncInfo {
-                inputs,
-                param_tys,
-                loop_blocks,
-                rpo_map,
-                dead_locals,
+        let body = self.tcx.optimized_mir(def_id);
+        let predecessors = body.basic_blocks.predecessors();
+        let mut locations = BTreeSet::new();
+        for (location, sts) in result {
+            let w = some_or!(sts.keys().cloned().reduce(|a, b| a.join(&b)), continue);
+            let w = w.into_inner();
+            if paths.iter().any(|p| !w.contains(p)) {
+                continue;
+            }
+            let prevs = if location.statement_index == 0 {
+                predecessors[location.block]
+                    .iter()
+                    .map(|bb| {
+                        let bbd = &body.basic_blocks[*bb];
+                        Location {
+                            block: *bb,
+                            statement_index: bbd.statements.len(),
+                        }
+                    })
+                    .collect()
+            } else {
+                let mut l = *location;
+                l.statement_index -= 1;
+                vec![l]
             };
-            (*def_id, info)
-        })
-        .collect();
-    let mut return_ptr_map = BTreeMap::new();
-
-    let mut summaries = BTreeMap::new();
-    for id in &po {
-        let def_ids = &elems[id];
-        let recursive = if def_ids.len() == 1 {
-            let def_id = def_ids.first().unwrap();
-            call_graph[def_id].contains(def_id)
-        } else {
-            true
-        };
-
-        loop {
-            if recursive {
-                for def_id in def_ids {
-                    let _ = summaries.try_insert(*def_id, FunctionSummary::bot());
-                }
-            }
-
-            let mut need_rerun = false;
-            for def_id in def_ids {
-                tracing::info!("{:?}", def_id);
-                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
-                let body = tcx.optimized_mir(*def_id);
-                if conf.verbose {
-                    println!(
-                        "{:?} {} {}",
-                        def_id,
-                        body.basic_blocks.len(),
-                        body.local_decls.len()
-                    );
-                }
-                let (summary, return_ptr) = analyzer.make_summary(body);
-                return_ptr_map.insert(*def_id, return_ptr);
-
-                let (summary, updated) = if let Some(old) = summaries.get(def_id) {
-                    let new_summary = summary.join(old);
-                    let updated = !new_summary.ord(old);
-                    (new_summary, updated)
-                } else {
-                    (summary, false)
-                };
-                summaries.insert(*def_id, summary);
-                need_rerun |= updated;
-            }
-
-            if !need_rerun {
-                break;
+            let pw = some_or!(
+                prevs
+                    .iter()
+                    .flat_map(|l| result[l].keys())
+                    .cloned()
+                    .reduce(|a, b| a.join(&b)),
+                continue
+            );
+            if paths.iter().any(|p| !pw.contains(p)) {
+                locations.insert(*location);
             }
         }
-    }
-
-    summaries
-        .into_iter()
-        .map(|(def_id, summary)| {
-            let param_tys = info_map.remove(&def_id).unwrap().param_tys;
-            let return_ptr = return_ptr_map.remove(&def_id).unwrap();
-            (def_id, (summary, param_tys, return_ptr))
-        })
-        .collect()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OutputParam {
-    pub index: usize,
-    pub must: bool,
-    pub return_values: ReturnValues,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ReturnValues {
-    None,
-    Int(AbsInt, AbsInt),
-    Uint(AbsUint, AbsUint),
-    Bool(AbsBool, AbsBool),
-}
-
-#[derive(Debug, Clone)]
-struct FuncInfo {
-    inputs: usize,
-    param_tys: Vec<TypeInfo>,
-    loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
-    rpo_map: BTreeMap<BasicBlock, usize>,
-    dead_locals: Vec<BitSet<Local>>,
-}
-
-pub struct Analyzer<'a, 'tcx> {
-    pub tcx: TyCtxt<'tcx>,
-    info: &'a FuncInfo,
-    conf: &'a AnalysisConfig,
-    pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
-    pub ptr_params: Vec<usize>,
-}
-
-impl<'a, 'tcx> Analyzer<'a, 'tcx> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        info: &'a FuncInfo,
-        conf: &'a AnalysisConfig,
-        summaries: &'a BTreeMap<DefId, FunctionSummary>,
-    ) -> Self {
-        Self {
-            tcx,
-            info,
-            conf,
-            summaries,
-            ptr_params: vec![],
+        for l in locations {
+            println!("{:?}", l);
         }
-    }
-
-    fn make_summary(&mut self, body: &Body<'tcx>) -> (FunctionSummary, BTreeSet<usize>) {
-        let (mut result, init_state) = self.analyze_body(body);
-        tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
-
-        let return_states = return_location(body)
-            .and_then(|ret| result.remove(&ret))
-            .unwrap_or_default();
-        let ret_v = return_states
-            .values()
-            .map(|st| st.local.get(0))
-            .cloned()
-            .reduce(|a, b| a.join(&b))
-            .unwrap_or(AbsValue::bot());
-        let reads = self.get_read_paths_of_ptr(&ret_v.ptrv, &[]);
-        let reads = reads.into_iter().map(|r| r.base()).collect();
-        let summary = FunctionSummary::new(init_state, return_states);
-        (summary, reads)
     }
 
     pub fn analyze_body(
@@ -540,10 +634,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
-        expands_path(&place.0, &self.info.param_tys, vec![])
-            .into_iter()
-            .map(AbsPath)
-            .collect()
+        self.info.expands_path(place)
     }
 
     pub fn def_id_to_string(&self, def_id: DefId) -> String {
@@ -640,13 +731,13 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
     }
 }
 
-struct CrateVisitor<'tcx> {
+struct FnPtrVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    callees: BTreeSet<Span>,
+    callees: BTreeSet<HirId>,
     fn_ptrs: BTreeSet<DefId>,
 }
 
-impl<'tcx> CrateVisitor<'tcx> {
+impl<'tcx> FnPtrVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
@@ -656,7 +747,7 @@ impl<'tcx> CrateVisitor<'tcx> {
     }
 }
 
-impl<'tcx> HVisitor<'tcx> for CrateVisitor<'tcx> {
+impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
@@ -666,10 +757,10 @@ impl<'tcx> HVisitor<'tcx> for CrateVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         match expr.kind {
             ExprKind::Call(callee, _) => {
-                self.callees.insert(callee.span);
+                self.callees.insert(callee.hir_id);
             }
             ExprKind::Path(QPath::Resolved(_, path)) => {
-                if !self.callees.contains(&expr.span) {
+                if !self.callees.contains(&expr.hir_id) {
                     if let Res::Def(def_kind, def_id) = path.res {
                         if def_kind.is_fn_like() {
                             self.fn_ptrs.insert(def_id);
@@ -886,25 +977,6 @@ fn compute_rpo_map(
     body: &Body<'_>,
     loop_blocks: &BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
 ) -> BTreeMap<BasicBlock, usize> {
-    fn succs(bbd: &BasicBlockData<'_>) -> Vec<BasicBlock> {
-        let terminator = some_or!(bbd.terminator.as_ref(), return vec![]);
-        match &terminator.kind {
-            TerminatorKind::Goto { target }
-            | TerminatorKind::Drop { target, .. }
-            | TerminatorKind::Assert { target, .. } => vec![*target],
-            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
-            TerminatorKind::UnwindResume
-            | TerminatorKind::UnwindTerminate(_)
-            | TerminatorKind::Return
-            | TerminatorKind::Unreachable => vec![],
-            TerminatorKind::Call { target, .. }
-            | TerminatorKind::InlineAsm {
-                destination: target,
-                ..
-            } => target.iter().copied().collect(),
-            _ => unreachable!("{:?}", terminator.kind),
-        }
-    }
     fn traverse(
         current: BasicBlock,
         visited: &mut BTreeSet<BasicBlock>,
@@ -920,7 +992,7 @@ fn compute_rpo_map(
             .values()
             .filter(|blocks| blocks.contains(&current))
             .collect();
-        let mut succs = succs(&body.basic_blocks[current]);
+        let mut succs: Vec<_> = body.basic_blocks.successors(current).collect();
         succs.sort_by_key(|succ| loops.iter().filter(|blocks| blocks.contains(succ)).count());
         for succ in succs {
             traverse(succ, visited, po, body, loop_blocks);
