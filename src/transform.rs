@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_ast::LitKind;
 use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
-    Node, PatKind, QPath, UnOp,
+    MutTy, Node, PatKind, QPath, TyKind, UnOp,
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
@@ -29,6 +29,20 @@ fn transform(
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
+    let mut def_id_ty_map = BTreeMap::new();
+    for id in hir.items() {
+        let item = hir.item(id);
+        let ItemKind::TyAlias(ty, _) = item.kind else {
+            continue;
+        };
+        let TyKind::Ptr(MutTy { ty, .. }) = ty.kind else {
+            continue;
+        };
+        let def_id = item.owner_id.to_def_id();
+        let ty = source_map.span_to_snippet(ty.span).unwrap();
+        def_id_ty_map.insert(def_id, ty);
+    }
+
     let mut funcs = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
@@ -49,10 +63,20 @@ fn transform(
                 };
                 let span = to_comma(param.span, source_map);
                 let name = ident.name.to_ident_string();
-                let ty = source_map
-                    .span_to_snippet(sig.decl.inputs[*index].span)
-                    .unwrap();
-                let ty = ty.strip_prefix("*mut ").expect(&ty).to_string();
+                let ty = &sig.decl.inputs[*index];
+                let ty = match ty.kind {
+                    TyKind::Ptr(MutTy { ty, .. }) => source_map.span_to_snippet(ty.span).unwrap(),
+                    TyKind::Path(QPath::Resolved(_, path)) => {
+                        let Res::Def(_, def_id) = path.res else {
+                            unreachable!("{:?}", ty);
+                        };
+                        def_id_ty_map
+                            .get(&def_id)
+                            .expect(&format!("{:?}", ty))
+                            .clone()
+                    }
+                    _ => unreachable!("{:?}", ty),
+                };
                 let param = Param {
                     must: *must,
                     name,
@@ -551,34 +575,36 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
             ExprKind::Call(callee, args) => {
                 if let Some(path) = expr_to_path(callee) {
                     if let Res::Def(_, def_id) = path.res {
-                        let source_map = self.tcx.sess.source_map();
-                        let args = args
-                            .iter()
-                            .map(|arg| {
-                                let code = source_map.span_to_snippet(arg.span).unwrap();
-                                let hir_id = expr_to_path(arg).and_then(|path| {
-                                    if let Res::Local(hir_id) = path.res {
-                                        Some(hir_id)
-                                    } else {
-                                        None
+                        if def_id.is_local() {
+                            let source_map = self.tcx.sess.source_map();
+                            let args = args
+                                .iter()
+                                .map(|arg| {
+                                    let code = source_map.span_to_snippet(arg.span).unwrap();
+                                    let hir_id = expr_to_path(arg).and_then(|path| {
+                                        if let Res::Local(hir_id) = path.res {
+                                            Some(hir_id)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
+                                    Arg {
+                                        span: arg.span,
+                                        code,
+                                        hir_id,
+                                        is_null,
                                     }
-                                });
-                                let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
-                                Arg {
-                                    span: arg.span,
-                                    code,
-                                    hir_id,
-                                    is_null,
-                                }
-                            })
-                            .collect();
-                        let call = Call {
-                            hir_id: expr.hir_id,
-                            span: expr.span,
-                            callee: def_id,
-                            args,
-                        };
-                        self.calls.push(call);
+                                })
+                                .collect();
+                            let call = Call {
+                                hir_id: expr.hir_id,
+                                span: expr.span,
+                                callee: def_id,
+                                args,
+                            };
+                            self.calls.push(call);
+                        }
                     }
                 }
             }
