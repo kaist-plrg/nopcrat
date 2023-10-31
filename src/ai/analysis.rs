@@ -4,7 +4,6 @@ use std::{
     path::Path,
 };
 
-use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
     def::{DefKind, Res},
@@ -427,11 +426,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let body = self.tcx.optimized_mir(def_id);
         let predecessors = body.basic_blocks.predecessors();
-        let mut locations = BTreeSet::new();
         for (location, sts) in result {
-            let w = some_or!(sts.keys().cloned().reduce(|a, b| a.join(&b)), continue);
-            let w = w.into_inner();
-            if paths.iter().any(|p| !w.contains(p)) {
+            let complete = sts.keys().any(|w| {
+                let w = w.as_set();
+                paths.iter().all(|p| w.contains(p))
+            });
+            if !complete {
                 continue;
             }
             let prevs = if location.statement_index == 0 {
@@ -450,20 +450,27 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 l.statement_index -= 1;
                 vec![l]
             };
-            let pw = some_or!(
-                prevs
-                    .iter()
-                    .flat_map(|l| result[l].keys())
-                    .cloned()
-                    .reduce(|a, b| a.join(&b)),
-                continue
-            );
-            if paths.iter().any(|p| !pw.contains(p)) {
-                locations.insert(*location);
+            let pcomplete = prevs
+                .iter()
+                .filter_map(|l| result.get(l))
+                .flat_map(|sts| sts.keys())
+                .any(|w| {
+                    let w = w.as_set();
+                    paths.iter().all(|p| w.contains(p))
+                });
+            if !pcomplete {
+                for location in prevs {
+                    let bbd = &body.basic_blocks[location.block];
+                    let span = if bbd.statements.len() == location.statement_index {
+                        println!("{:?}", bbd.terminator());
+                        bbd.terminator().source_info.span
+                    } else {
+                        println!("{:?}", bbd.statements[location.statement_index]);
+                        bbd.statements[location.statement_index].source_info.span
+                    };
+                    println!("{:?}", span);
+                }
             }
-        }
-        for l in locations {
-            println!("{:?}", l);
         }
     }
 
@@ -540,9 +547,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     };
                     (vec![new_next_state], vec![next_location])
                 } else {
-                    let terminator = bbd.terminator.as_ref().unwrap();
                     let (new_next_states, next_locations) =
-                        self.transfer_terminator(terminator, state);
+                        self.transfer_terminator(bbd.terminator(), state);
                     (new_next_states, next_locations)
                 };
                 for location in &next_locations {
