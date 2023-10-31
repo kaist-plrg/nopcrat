@@ -70,14 +70,14 @@ enum Write {
 }
 
 pub fn collect_output_params(
-    results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)>,
+    results: BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>, BTreeSet<usize>)>,
     tcx: TyCtxt<'_>,
 ) -> BTreeMap<String, Vec<OutputParam>> {
     let mut visitor = CrateVisitor::new(tcx);
     tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
 
     let mut func_param_map = BTreeMap::new();
-    for (def_id, (summary, param_tys)) in results {
+    for (def_id, (summary, param_tys, return_ptrs)) in results {
         if visitor.fn_ptrs.contains(&def_id) {
             continue;
         }
@@ -126,6 +126,7 @@ pub fn collect_output_params(
             .filter(|i| {
                 let ws: BTreeSet<_> = writes.iter().map(|map| map[&i]).collect();
                 !reads.contains(i)
+                    && !return_ptrs.contains(i)
                     && param_tys[*i] != TypeInfo::Union
                     && ws.contains(&Write::All)
                     && !ws.contains(&Write::Partial)
@@ -190,7 +191,7 @@ pub fn collect_output_params(
 pub fn analyze(
     tcx: TyCtxt<'_>,
     conf: &AnalysisConfig,
-) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>)> {
+) -> BTreeMap<DefId, (FunctionSummary, Vec<TypeInfo>, BTreeSet<usize>)> {
     let hir = tcx.hir();
 
     let mut call_graph = BTreeMap::new();
@@ -243,6 +244,7 @@ pub fn analyze(
             (*def_id, info)
         })
         .collect();
+    let mut return_ptr_map = BTreeMap::new();
 
     let mut summaries = BTreeMap::new();
     for id in &po {
@@ -274,7 +276,8 @@ pub fn analyze(
                         body.local_decls.len()
                     );
                 }
-                let summary = analyzer.make_summary(body);
+                let (summary, return_ptr) = analyzer.make_summary(body);
+                return_ptr_map.insert(*def_id, return_ptr);
 
                 let (summary, updated) = if let Some(old) = summaries.get(def_id) {
                     let new_summary = summary.join(old);
@@ -296,10 +299,9 @@ pub fn analyze(
     summaries
         .into_iter()
         .map(|(def_id, summary)| {
-            (
-                def_id,
-                (summary, info_map.remove(&def_id).unwrap().param_tys),
-            )
+            let param_tys = info_map.remove(&def_id).unwrap().param_tys;
+            let return_ptr = return_ptr_map.remove(&def_id).unwrap();
+            (def_id, (summary, param_tys, return_ptr))
         })
         .collect()
 }
@@ -352,14 +354,23 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
     }
 
-    fn make_summary(&mut self, body: &Body<'tcx>) -> FunctionSummary {
+    fn make_summary(&mut self, body: &Body<'tcx>) -> (FunctionSummary, BTreeSet<usize>) {
         let (mut result, init_state) = self.analyze_body(body);
         tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
 
         let return_states = return_location(body)
             .and_then(|ret| result.remove(&ret))
             .unwrap_or_default();
-        FunctionSummary::new(init_state, return_states)
+        let ret_v = return_states
+            .values()
+            .map(|st| st.local.get(0))
+            .cloned()
+            .reduce(|a, b| a.join(&b))
+            .unwrap_or(AbsValue::bot());
+        let reads = self.get_read_paths_of_ptr(&ret_v.ptrv, &[]);
+        let reads = reads.into_iter().map(|r| r.base()).collect();
+        let summary = FunctionSummary::new(init_state, return_states);
+        (summary, reads)
     }
 
     pub fn analyze_body(

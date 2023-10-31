@@ -1067,7 +1067,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         (v, self.get_read_paths_of_ptr(ptr, projection))
     }
 
-    fn get_read_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
+    pub fn get_read_paths_of_ptr(&self, ptr: &AbsPtr, projection: &[AbsProjElem]) -> Vec<AbsPath> {
         if let AbsPtr::Set(ptrs) = ptr {
             ptrs.iter()
                 .cloned()
