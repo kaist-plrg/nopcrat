@@ -6,8 +6,8 @@ use std::{
 use etrace::some_or;
 use rustc_ast::LitKind;
 use rustc_hir::{
-    def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
-    MutTy, Node, PatKind, QPath, TyKind, UnOp,
+    def::Res, intravisit::Visitor as HVisitor, BinOp, BinOpKind, Expr, ExprKind, FnRetTy, HirId,
+    ItemKind, MutTy, Node, PatKind, PathSegment, QPath, TyKind, UnOp,
 };
 use rustc_middle::{hir::nested_filter, mir::BasicBlock, ty::TyCtxt};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
@@ -214,18 +214,22 @@ fn transform(
 
                     mtch = None
                 }
-            } else if let Some(expr) = get_parent(hir_id, tcx) {
-                if matches!(expr.kind, ExprKind::Ret(_)) {
-                    if let Some(func) = curr {
-                        ret_call_spans.insert(expr.span);
-                        let span = expr.span.with_hi(expr.span.lo() + BytePos(6));
-                        fix(span, "let rv___ =".to_string());
+            } else if let Some(expr) = get_parent_return(hir_id, tcx) {
+                if let Some(func) = curr {
+                    ret_call_spans.insert(expr.span);
+                    let pre_span = expr.span.with_hi(span.lo());
+                    fix(pre_span, "let rv___ =".to_string());
 
-                        let pos = expr.span.hi() + BytePos(1);
-                        let span = expr.span.with_hi(pos).with_lo(pos);
-                        let rv = func.return_value(Some("rv___".to_string()));
-                        fix(span, format!("; return {};", rv));
-                    }
+                    let pre_span = pre_span.with_lo(pre_span.lo() + BytePos(6));
+                    let pre_s = source_map.span_to_snippet(pre_span).unwrap();
+
+                    let post_span = expr.span.with_lo(span.hi());
+                    let post_s = source_map.span_to_snippet(post_span).unwrap();
+
+                    let post_span = post_span.with_hi(post_span.hi() + BytePos(1));
+                    let rv = format!("{}rv___{}", pre_s, post_s);
+                    let rv = func.return_value(Some(rv));
+                    fix(post_span, format!("; return {};", rv));
                 }
             }
 
@@ -352,11 +356,15 @@ fn transform(
         }
 
         for check in visitor.null_checks {
-            let NullCheck { span, hir_id } = check;
+            let NullCheck {
+                span,
+                hir_id,
+                value,
+            } = check;
             if !func.hir_id_map.contains_key(&hir_id) {
                 continue;
             }
-            fix(span, "false".to_string());
+            fix(span, value.to_string());
         }
     }
     suggestions.retain(|_, v| !v.is_empty());
@@ -571,6 +579,7 @@ struct Deref {
 struct NullCheck {
     span: Span,
     hir_id: HirId,
+    value: bool,
 }
 
 struct BodyVisitor<'tcx> {
@@ -595,6 +604,154 @@ impl<'tcx> BodyVisitor<'tcx> {
     }
 }
 
+impl<'tcx> BodyVisitor<'tcx> {
+    fn visit_expr_ret(&mut self, expr: &'tcx Expr<'tcx>, e: Option<&'tcx Expr<'tcx>>) {
+        let value = e.as_ref().map(|e| e.span);
+        let ret = Return {
+            span: expr.span,
+            value,
+        };
+        self.returns.push(ret);
+    }
+
+    fn visit_expr_call(
+        &mut self,
+        expr: &'tcx Expr<'tcx>,
+        callee: &'tcx Expr<'tcx>,
+        args: &'tcx [Expr<'tcx>],
+    ) {
+        let path = some_or!(expr_to_path(callee), return);
+        let Res::Def(_, def_id) = path.res else {
+            return;
+        };
+        if !def_id.is_local() {
+            return;
+        }
+        let source_map = self.tcx.sess.source_map();
+        let args = args
+            .iter()
+            .map(|arg| {
+                let code = source_map.span_to_snippet(arg.span).unwrap();
+                let hir_id = expr_to_path(arg).and_then(|path| {
+                    if let Res::Local(hir_id) = path.res {
+                        Some(hir_id)
+                    } else {
+                        None
+                    }
+                });
+                let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
+                Arg {
+                    span: arg.span,
+                    code,
+                    hir_id,
+                    is_null,
+                }
+            })
+            .collect();
+        let call = Call {
+            hir_id: expr.hir_id,
+            span: expr.span,
+            callee: def_id,
+            args,
+        };
+        self.calls.push(call);
+    }
+
+    fn visit_expr_assign(
+        &mut self,
+        _: &'tcx Expr<'tcx>,
+        lhs: &'tcx Expr<'tcx>,
+        rhs: &'tcx Expr<'tcx>,
+        _: Span,
+    ) {
+        let ExprKind::Unary(UnOp::Deref, ptr) = lhs.kind else {
+            return;
+        };
+        let path = some_or!(expr_to_path(ptr), return);
+        let Res::Local(hir_id) = path.res else { return };
+        let assign = IndirectAssign {
+            lhs_span: lhs.span,
+            lhs: hir_id,
+            rhs_span: rhs.span,
+        };
+        self.indirect_assigns.push(assign);
+    }
+
+    fn visit_expr_unary(&mut self, expr: &'tcx Expr<'tcx>, op: UnOp, e: &'tcx Expr<'tcx>) {
+        if op != UnOp::Deref {
+            return;
+        }
+        if let Some(p) = get_parent_wo_field(expr.hir_id, self.tcx) {
+            match p.kind {
+                ExprKind::Assign(lhs, _, _) if lhs.span.overlaps(expr.span) => return,
+                ExprKind::AddrOf(_, _, _) => return,
+                _ => {}
+            }
+        }
+        let path = some_or!(expr_to_path(e), return);
+        let Res::Local(hir_id) = path.res else { return };
+        let deref = Deref {
+            span: expr.span,
+            hir_id,
+        };
+        self.derefs.push(deref);
+    }
+
+    fn visit_expr_binary(
+        &mut self,
+        expr: &'tcx Expr<'tcx>,
+        op: BinOp,
+        l: &'tcx Expr<'tcx>,
+        r: &'tcx Expr<'tcx>,
+    ) {
+        let value = match op.node {
+            BinOpKind::Eq => false,
+            BinOpKind::Ne => true,
+            _ => return,
+        };
+        let l = remove_cast(l);
+        let r = remove_cast(r);
+        let (x, n) = if let (Some(x), Some(n)) = (expr_to_path(l), as_int_lit(r)) {
+            (x, n)
+        } else if let (Some(x), Some(n)) = (expr_to_path(r), as_int_lit(l)) {
+            (x, n)
+        } else {
+            return;
+        };
+        if n != 0 {
+            return;
+        }
+        let Res::Local(hir_id) = x.res else { return };
+        let check = NullCheck {
+            span: expr.span,
+            hir_id,
+            value,
+        };
+        self.null_checks.push(check);
+    }
+
+    fn visit_expr_method_call(
+        &mut self,
+        expr: &'tcx Expr<'tcx>,
+        seg: &'tcx PathSegment<'tcx>,
+        receiver: &'tcx Expr<'tcx>,
+        _: &'tcx [Expr<'tcx>],
+        _: Span,
+    ) {
+        if seg.ident.name.to_ident_string() != "is_null" {
+            return;
+        }
+        let path = some_or!(expr_to_path(receiver), return);
+        let Res::Local(hir_id) = path.res else { return };
+        let check = NullCheck {
+            span: expr.span,
+            hir_id,
+            value: false,
+        };
+        self.null_checks.push(check);
+    }
+}
+
 impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
@@ -604,92 +761,13 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         match expr.kind {
-            ExprKind::Ret(e) => {
-                let span = expr.span;
-                let value = e.as_ref().map(|e| e.span);
-                self.returns.push(Return { span, value });
-            }
-            ExprKind::Call(callee, args) => {
-                if let Some(path) = expr_to_path(callee) {
-                    if let Res::Def(_, def_id) = path.res {
-                        if def_id.is_local() {
-                            let source_map = self.tcx.sess.source_map();
-                            let args = args
-                                .iter()
-                                .map(|arg| {
-                                    let code = source_map.span_to_snippet(arg.span).unwrap();
-                                    let hir_id = expr_to_path(arg).and_then(|path| {
-                                        if let Res::Local(hir_id) = path.res {
-                                            Some(hir_id)
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                    let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
-                                    Arg {
-                                        span: arg.span,
-                                        code,
-                                        hir_id,
-                                        is_null,
-                                    }
-                                })
-                                .collect();
-                            let call = Call {
-                                hir_id: expr.hir_id,
-                                span: expr.span,
-                                callee: def_id,
-                                args,
-                            };
-                            self.calls.push(call);
-                        }
-                    }
-                }
-            }
-            ExprKind::Assign(lhs, rhs, _) => {
-                if let ExprKind::Unary(UnOp::Deref, ptr) = lhs.kind {
-                    if let Some(path) = expr_to_path(ptr) {
-                        if let Res::Local(hir_id) = path.res {
-                            self.indirect_assigns.push(IndirectAssign {
-                                lhs_span: lhs.span,
-                                lhs: hir_id,
-                                rhs_span: rhs.span,
-                            });
-                        }
-                    }
-                }
-            }
-            ExprKind::Unary(UnOp::Deref, ptr) => {
-                let exclude = if let Some(p) = get_parent_wo_field(expr.hir_id, self.tcx) {
-                    match p.kind {
-                        ExprKind::Assign(lhs, _, _) => lhs.span.overlaps(expr.span),
-                        ExprKind::AddrOf(_, _, _) => true,
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-                if !exclude {
-                    if let Some(path) = expr_to_path(ptr) {
-                        if let Res::Local(hir_id) = path.res {
-                            self.derefs.push(Deref {
-                                span: expr.span,
-                                hir_id,
-                            });
-                        }
-                    }
-                }
-            }
-            ExprKind::MethodCall(seg, v, _, _) => {
-                if seg.ident.name.to_ident_string() == "is_null" {
-                    if let Some(path) = expr_to_path(v) {
-                        if let Res::Local(hir_id) = path.res {
-                            self.null_checks.push(NullCheck {
-                                span: expr.span,
-                                hir_id,
-                            });
-                        }
-                    }
-                }
+            ExprKind::Ret(e) => self.visit_expr_ret(expr, e),
+            ExprKind::Call(callee, args) => self.visit_expr_call(expr, callee, args),
+            ExprKind::Assign(lhs, rhs, span) => self.visit_expr_assign(expr, lhs, rhs, span),
+            ExprKind::Unary(op, e) => self.visit_expr_unary(expr, op, e),
+            ExprKind::Binary(op, l, r) => self.visit_expr_binary(expr, op, l, r),
+            ExprKind::MethodCall(seg, receiver, args, span) => {
+                self.visit_expr_method_call(expr, seg, receiver, args, span)
             }
             _ => {}
         }
@@ -793,6 +871,15 @@ fn get_parent(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
     match e.kind {
         ExprKind::DropTemps(_) | ExprKind::Cast(_, _) => get_parent(e.hir_id, tcx),
         _ => Some(e),
+    }
+}
+
+fn get_parent_return(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
+    let parent = get_parent(hir_id, tcx)?;
+    if let ExprKind::Ret(_) = parent.kind {
+        Some(parent)
+    } else {
+        get_parent_return(parent.hir_id, tcx)
     }
 }
 
