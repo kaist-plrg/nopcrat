@@ -14,8 +14,10 @@ use serde::{Deserialize, Serialize};
 pub struct AbsState {
     pub local: AbsLocal,
     pub args: AbsArgs,
+    pub excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
+    pub prev_writes: MayPathSet,
 }
 
 impl AbsState {
@@ -26,6 +28,8 @@ impl AbsState {
             args: AbsArgs::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
+            excludes: MayPathSet::bot(),
+            prev_writes: MayPathSet::bot(),
         }
     }
 
@@ -35,6 +39,8 @@ impl AbsState {
             args: self.args.join(&other.args),
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
+            excludes: self.excludes.join(&other.excludes),
+            prev_writes: self.prev_writes.join(&other.prev_writes),
         }
     }
 
@@ -44,6 +50,8 @@ impl AbsState {
             args: self.args.widen(&other.args),
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
+            excludes: self.excludes.widen(&other.excludes),
+            prev_writes: self.prev_writes.widen(&other.prev_writes),
         }
     }
 
@@ -52,6 +60,8 @@ impl AbsState {
             && self.args.ord(&other.args)
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
+            && self.excludes.ord(&other.excludes)
+            && self.prev_writes.ord(&other.prev_writes)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -72,17 +82,9 @@ impl AbsState {
         }
     }
 
-    pub fn add_offsets<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+    pub fn add_excludes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
-            self.writes.remove(&path);
-            self.reads.insert(path);
-        }
-    }
-
-    pub fn add_heap_stored_ptrs<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
-        for path in paths {
-            self.writes.remove(&path);
-            self.reads.insert(path);
+            self.excludes.insert(path);
         }
     }
 
@@ -96,9 +98,21 @@ impl AbsState {
 
     pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
-            if !self.reads.contains(&path) {
-                self.writes.insert(path);
+            if !self.reads.contains(&path) && !self.excludes.contains(&path) {
+                self.writes.insert(path.clone());
+                self.prev_writes.insert(path);
             }
+        }
+    }
+
+    pub fn clone_(&self) -> Self {
+        Self {
+            local: self.local.clone(),
+            args: self.args.clone(),
+            reads: self.reads.clone(),
+            writes: self.writes.clone(),
+            excludes: self.excludes.clone(),
+            prev_writes: MayPathSet::bot(),
         }
     }
 }

@@ -47,10 +47,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             terminator
         );
         match &terminator.kind {
-            TerminatorKind::Goto { target } => (vec![state.clone()], vec![target.start_location()]),
+            TerminatorKind::Goto { target } => {
+                (vec![state.clone_()], vec![target.start_location()])
+            }
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
-                let mut new_state = state.clone();
+                let mut new_state = state.clone_();
                 new_state.add_reads(reads.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
@@ -72,7 +74,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::Return => (vec![], vec![]),
             TerminatorKind::Unreachable => (vec![], vec![]),
             TerminatorKind::Drop { target, .. } => {
-                (vec![state.clone()], vec![target.start_location()])
+                (vec![state.clone_()], vec![target.start_location()])
             }
             TerminatorKind::Call {
                 func,
@@ -96,7 +98,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             *def_id,
                             &args,
                             destination,
-                            state.clone(),
+                            state.clone_(),
                             reads.clone(),
                         );
                         for state in states {
@@ -127,7 +129,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
-                let mut new_state = state.clone();
+                let mut new_state = state.clone_();
                 new_state.add_reads(reads.into_iter());
                 (vec![new_state], vec![target.start_location()])
             }
@@ -140,7 +142,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if let Some(dst) = destination {
                     locations.push(dst.start_location());
                 }
-                (vec![state.clone()], locations)
+                (vec![state.clone_()], locations)
             }
         }
     }
@@ -158,7 +160,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                return self.transfer_intra_call(callee, &summary.clone(), args, dst, state, reads);
+                return self.transfer_intra_call(callee, summary, args, dst, state, reads);
             } else if name.contains("{extern#0}") {
                 self.transfer_c_call(callee, args, &state, &mut reads)
             } else if name.contains("{impl#") {
@@ -178,7 +180,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             )
         };
         let (mut new_state, writes_ret) = self.assign(dst, v, &state);
-        new_state.add_offsets(offsets.into_iter());
+        new_state.add_excludes(offsets.into_iter());
         new_state.add_reads(reads.into_iter());
         new_state.add_writes(writes.into_iter());
         new_state.add_writes(writes_ret.into_iter());
@@ -222,6 +224,23 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             let ret_v = ret_v.subst(&ptr_maps);
             let (mut state, writes) = self.assign(dst, ret_v, &state);
+            let callee_excludes: Vec<_> = return_state
+                .excludes
+                .iter()
+                .filter_map(|read| {
+                    let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
+                        ptrs
+                    } else {
+                        return None;
+                    };
+                    Some(ptrs.iter().filter_map(|ptr| {
+                        let (mut path, _) = AbsPath::from_place(ptr, &self.ptr_params)?;
+                        path.0.extend(read.0[1..].to_owned());
+                        Some(path)
+                    }))
+                })
+                .flatten()
+                .collect();
             let callee_reads: Vec<_> = return_state
                 .reads
                 .iter()
@@ -260,6 +279,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     Some(path)
                 })
                 .collect();
+            state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
             state.add_writes(callee_writes.into_iter());
@@ -963,7 +983,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         new_v: AbsValue,
         state: &AbsState,
     ) -> (AbsState, Vec<AbsPath>) {
-        let mut new_state = state.clone();
+        let mut new_state = state.clone_();
         let writes = if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());
@@ -991,7 +1011,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .any(|ptr| matches!(ptr.base, AbsBase::Arg(_) | AbsBase::Heap))
             {
                 let reads = self.get_read_paths_of_ptr(&new_v.ptrv, &[]);
-                state.add_heap_stored_ptrs(reads.into_iter());
+                state.add_excludes(reads.into_iter());
             }
             let weak = ptrs.len() > 1;
             for ptr in ptrs {

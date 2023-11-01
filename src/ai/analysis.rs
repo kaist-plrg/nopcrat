@@ -13,7 +13,7 @@ use rustc_hir::{
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, ProjectionElem, StatementKind, TerminatorKind},
+    mir::{BasicBlock, Body, Local, Location, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -308,6 +308,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .flat_map(|st| st.reads.as_set())
             .map(|p| p.base())
             .collect();
+        let excludes: BTreeSet<_> = summary
+            .return_states
+            .values()
+            .flat_map(|st| st.excludes.as_set())
+            .map(|p| p.base())
+            .collect();
         if summary.return_states.values().any(|st| st.writes.is_bot()) {
             return vec![];
         }
@@ -352,6 +358,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .filter(|i| {
                 let ws: BTreeSet<_> = writes.iter().map(|map| map[i]).collect();
                 !reads.contains(i)
+                    && !excludes.contains(i)
                     && !return_ptrs.contains(i)
                     && self.info.param_tys[*i] != TypeInfo::Union
                     && ws.contains(&Write::All)
@@ -429,11 +436,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
 
         let paths = self.expands_path(&AbsPath(vec![param.index + 1]));
-        if paths[0].0.len() == 1 {
-            return;
-        }
 
         let body = self.tcx.optimized_mir(def_id);
+        let predecessors = body.basic_blocks.predecessors();
         for (location, sts) in result {
             let complete = sts.keys().any(|w| {
                 let w = w.as_set();
@@ -442,33 +447,44 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if !complete {
                 continue;
             }
-            if location.statement_index == 0 {
+            let pwrite = sts.values().any(|st| {
+                let w = st.prev_writes.as_set();
+                paths.iter().any(|p| w.contains(p))
+            });
+            if !pwrite {
                 continue;
             }
-            let mut prev = *location;
-            prev.statement_index -= 1;
-            let pcomplete = result[&prev].keys().any(|w| {
-                let w = w.as_set();
-                paths.iter().all(|p| w.contains(p))
-            });
-            if !pcomplete {
+            let prevs = if location.statement_index == 0 {
+                predecessors[location.block]
+                    .iter()
+                    .map(|bb| {
+                        let bbd = &body.basic_blocks[*bb];
+                        Location {
+                            block: *bb,
+                            statement_index: bbd.statements.len(),
+                        }
+                    })
+                    .collect()
+            } else {
+                let mut l = *location;
+                l.statement_index -= 1;
+                vec![l]
+            };
+            for prev in prevs {
+                let pcomplete = result[&prev].keys().all(|w| {
+                    let w = w.as_set();
+                    paths.iter().all(|p| w.contains(p))
+                });
+                if pcomplete {
+                    continue;
+                }
                 let Location {
                     block,
                     statement_index,
                 } = prev;
-                let bbd = &body.basic_blocks[block];
-                let stmt = &bbd.statements[statement_index];
-                let StatementKind::Assign(box (p, _)) = stmt.kind else {
-                    continue;
-                };
-                if p.projection
-                    .iter()
-                    .any(|proj| matches!(proj, ProjectionElem::Field(_, _)))
-                {
-                    param
-                        .complete_writes
-                        .push((block.as_usize(), statement_index));
-                }
+                param
+                    .complete_writes
+                    .push((block.as_usize(), statement_index));
             }
         }
     }
