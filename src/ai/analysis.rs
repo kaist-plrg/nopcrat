@@ -144,6 +144,7 @@ pub fn analyze(
     let mut summaries = BTreeMap::new();
     let mut results = BTreeMap::new();
     let mut wm_map = BTreeMap::new();
+    let mut call_args_map = BTreeMap::new();
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -189,6 +190,7 @@ pub fn analyze(
                 results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
                 wm_map.insert(*def_id, writes_map);
+                call_args_map.insert(*def_id, analyzer.call_args);
 
                 let (summary, updated) = if let Some(old) = summaries.get(def_id) {
                     let new_summary = summary.join(old);
@@ -211,6 +213,8 @@ pub fn analyze(
                         analyzer.find_output_params(summary, &return_ptrs, *def_id);
                     let result = results.remove(def_id).unwrap();
                     let writes_map = wm_map.remove(def_id).unwrap();
+                    let call_args = call_args_map.remove(def_id).unwrap();
+                    println!("{:?} {:?}", def_id, call_args);
                     for p in &mut output_params {
                         analyzer.find_complete_write(p, &result, &writes_map, *def_id);
                     }
@@ -271,6 +275,7 @@ pub struct Analyzer<'a, 'tcx> {
     conf: &'a AnalysisConfig,
     pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
+    pub call_args: BTreeMap<Location, BTreeMap<usize, BTreeSet<AbsPath>>>,
 }
 
 struct AnalyzedBody {
@@ -292,6 +297,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             conf,
             summaries,
             ptr_params: vec![],
+            call_args: BTreeMap::new(),
         }
     }
 
@@ -479,14 +485,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 vec![l]
             };
             for prev in prevs {
-                let sts = some_or!(result.get(&prev), continue);
-                let pcomplete = sts.keys().all(|w| {
-                    let w = w.as_set();
-                    paths.iter().all(|p| w.contains(p))
-                });
-                if pcomplete {
-                    continue;
-                }
                 let writes = some_or!(writes_map.get(&prev), continue);
                 let pwrite = paths.iter().any(|p| writes.contains(p));
                 if !pwrite {
@@ -551,6 +549,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .insert(start_label.writes.clone(), start_state.clone());
             let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
 
+            self.call_args.clear();
             while let Some(label) = work_list.pop() {
                 let state = states
                     .get(&label.location)
@@ -576,7 +575,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             next_states,
                             next_locations,
                             writes,
-                        } = self.transfer_terminator(bbd.terminator(), state);
+                        } = self.transfer_terminator(bbd.terminator(), state, label.location);
                         (next_states, next_locations, writes)
                     };
                 writes_map.entry(label.location).or_default().extend(writes);

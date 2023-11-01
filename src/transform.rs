@@ -9,7 +9,11 @@ use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOp, BinOpKind, Expr, ExprKind, FnRetTy, HirId,
     ItemKind, MutTy, Node, PatKind, PathSegment, QPath, TyKind,
 };
-use rustc_middle::{hir::nested_filter, mir::BasicBlock, ty::TyCtxt};
+use rustc_middle::{
+    hir::nested_filter,
+    mir::{BasicBlock, TerminatorKind},
+    ty::TyCtxt,
+};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
 use rustfix::Suggestion;
 
@@ -64,17 +68,21 @@ fn transform(
                     ..
                 } = param;
                 let param = &body.params[*index];
-                let complete_writes = complete_writes
+                let (call_writes, assign_writes): (Vec<_>, Vec<_>) = complete_writes
                     .iter()
                     .map(|(bb, i)| {
                         let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*bb)];
                         if *i == bbd.statements.len() {
-                            bbd.terminator().source_info.span
+                            let t = bbd.terminator();
+                            assert!(matches!(t.kind, TerminatorKind::Call { .. }), "{:?}", t);
+                            (t.source_info.span, true)
                         } else {
-                            bbd.statements[*i].source_info.span
+                            (bbd.statements[*i].source_info.span, false)
                         }
                     })
-                    .collect();
+                    .partition(|(_, b)| *b);
+                let _call_writes: Vec<_> = call_writes.into_iter().map(|(s, _)| s).collect();
+                let assign_writes = assign_writes.into_iter().map(|(s, _)| s).collect();
                 let PatKind::Binding(_, hir_id, ident, _) = param.pat.kind else {
                     unreachable!()
                 };
@@ -96,7 +104,7 @@ fn transform(
                 };
                 let param = Param {
                     must: *must,
-                    complete_writes,
+                    assign_writes,
                     name,
                     ty,
                     span,
@@ -164,7 +172,7 @@ fn transform(
                 fix(span, "".to_string());
             }
 
-            let mut mtch = func.call_match(&args);
+            let mut mtch = func.call_match(&args, curr);
 
             if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
                 if let Some(then) = func.cmp(call.op, call.target) {
@@ -243,7 +251,7 @@ fn transform(
             }
             fix(span.shrink_to_lo(), binding);
 
-            let mut assign = func.call_assign(&args);
+            let mut assign = func.call_assign(&args, curr);
             if let Some(m) = &mtch {
                 assign += m;
             }
@@ -293,17 +301,10 @@ fn transform(
         fix(span, local_vars);
 
         for param in func.params() {
-            for span in &param.complete_writes {
+            for span in &param.assign_writes {
                 let pos = span.hi() + BytePos(1);
                 let span = span.with_hi(pos).with_lo(pos);
-                let assign = format!(
-                    "
-    if {0} == &mut {0}___vv {{
-        {0}___v = Some({0}___vv);
-        {0} = {0}___v.as_mut().unwrap();
-    }}",
-                    param.name,
-                );
+                let assign = format!("{0}___v = Some({0}___vv);", param.name);
                 fix(span, assign);
             }
         }
@@ -347,7 +348,7 @@ fn transform(
 #[derive(Debug, Clone)]
 struct Param {
     must: bool,
-    complete_writes: Vec<Span>,
+    assign_writes: Vec<Span>,
     span: Span,
     hir_id: HirId,
     name: String,
@@ -402,13 +403,30 @@ impl Func {
         }
     }
 
-    fn call_assign(&self, args: &[Arg]) -> String {
+    fn is_must(curr: Option<&Self>, hir_id: &Option<HirId>) -> Option<bool> {
+        let curr = curr?;
+        let hir_id = hir_id.as_ref()?;
+        let param = curr.hir_id_map.get(hir_id)?;
+        Some(param.must)
+    }
+
+    fn call_assign(&self, args: &[Arg], curr: Option<&Self>) -> String {
         let mut assigns = vec![];
         for i in &self.remaining_return {
             let arg = &args[*i];
             if !arg.is_null {
                 let param = &self.index_map[i];
-                let assign = if param.must {
+                let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
+                let assign = if need_some {
+                    if param.must {
+                        format!("{}___v = Some(rv___{});", arg.code, i)
+                    } else {
+                        format!(
+                            "if let Some(v) = rv___{} {{ {}___v = Some(v); }}",
+                            i, arg.code
+                        )
+                    }
+                } else if param.must {
                     if arg.code.starts_with("&mut ") {
                         format!("*({0}) = rv___{1};", arg.code, i)
                     } else {
@@ -429,13 +447,18 @@ impl Func {
         mk_string(assigns.iter(), ";\n", "\n", end)
     }
 
-    fn call_match(&self, args: &[Arg]) -> Option<String> {
+    fn call_match(&self, args: &[Arg], curr: Option<&Self>) -> Option<String> {
         let (succ_value, first) = &self.first_return?;
         let arg = &args[*first];
         let assign = if arg.is_null {
             "".to_string()
         } else {
-            format!("*({}) = v;", arg.code)
+            let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
+            if need_some {
+                format!("{}___v = Some(v);", arg.code)
+            } else {
+                format!("*({}) = v;", arg.code)
+            }
         };
         let v = match succ_value {
             SuccValue::Int(v) => v.to_string(),
@@ -515,6 +538,7 @@ struct Call {
 struct Arg {
     span: Span,
     code: String,
+    hir_id: Option<HirId>,
     is_null: bool,
 }
 
@@ -571,10 +595,18 @@ impl<'tcx> BodyVisitor<'tcx> {
             .iter()
             .map(|arg| {
                 let code = source_map.span_to_snippet(arg.span).unwrap();
+                let hir_id = expr_to_path(arg).and_then(|path| {
+                    if let Res::Local(hir_id) = path.res {
+                        Some(hir_id)
+                    } else {
+                        None
+                    }
+                });
                 let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
                 Arg {
                     span: arg.span,
                     code,
+                    hir_id,
                     is_null,
                 }
             })

@@ -80,6 +80,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         terminator: &Terminator<'tcx>,
         state: &AbsState,
+        location: Location,
     ) -> TransferedTerminator {
         tracing::info!(
             "\n{}\n{:?}",
@@ -139,6 +140,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             *def_id,
                             &args,
                             destination,
+                            location,
                             state.clone(),
                             reads.clone(),
                         );
@@ -195,6 +197,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         callee: DefId,
         args: &[AbsValue],
         dst: &Place<'tcx>,
+        location: Location,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
     ) -> (Vec<AbsState>, BTreeSet<AbsPath>) {
@@ -203,7 +206,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let name = self.def_id_to_string(callee);
         let v = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
-                return self.transfer_intra_call(callee, summary, args, dst, state, reads);
+                return self
+                    .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
                 self.transfer_c_call(callee, args, &state, &mut reads)
             } else if name.contains("{impl#") {
@@ -229,6 +233,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         (vec![new_state], writes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transfer_intra_call(
         &mut self,
         callee: DefId,
@@ -236,6 +241,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         args: &[AbsValue],
         dst: &Place<'tcx>,
         state: AbsState,
+        location: Location,
         mut reads: Vec<AbsPath>,
     ) -> (Vec<AbsState>, BTreeSet<AbsPath>) {
         if summary.return_states.is_empty() {
@@ -301,27 +307,30 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 })
                 .flatten()
                 .collect();
-            let callee_writes: Vec<_> = return_state
-                .writes
-                .iter()
-                .filter_map(|write| {
-                    let ptr = if let AbsPtr::Set(ptrs) = &args[write.base() - 1].ptrv {
-                        if ptrs.len() == 1 {
-                            ptrs.first().unwrap()
-                        } else {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    };
-                    let (mut path, array_access) = AbsPath::from_place(ptr, &self.ptr_params)?;
-                    if array_access {
-                        return None;
-                    }
-                    path.0.extend(write.0[1..].to_owned());
-                    Some(path)
-                })
-                .collect();
+            let mut callee_writes = vec![];
+            for write in return_state.writes.iter() {
+                let idx = write.base() - 1;
+                let AbsPtr::Set(ptrs) = &args[idx].ptrv else {
+                    continue;
+                };
+                if ptrs.len() != 1 {
+                    continue;
+                }
+                let ptr = ptrs.first().unwrap();
+                let (mut path, array_access) =
+                    some_or!(AbsPath::from_place(ptr, &self.ptr_params), continue);
+                if array_access {
+                    continue;
+                }
+                path.0.extend(write.0[1..].to_owned());
+                callee_writes.push(path.clone());
+                self.call_args
+                    .entry(location)
+                    .or_default()
+                    .entry(idx)
+                    .or_default()
+                    .insert(path);
+            }
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
