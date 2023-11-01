@@ -4,6 +4,7 @@ use std::{
     path::Path,
 };
 
+use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
     def::{DefKind, Res},
@@ -471,7 +472,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 vec![l]
             };
             for prev in prevs {
-                let pcomplete = result[&prev].keys().all(|w| {
+                let sts = some_or!(result.get(&prev), continue);
+                let pcomplete = sts.keys().all(|w| {
                     let w = w.as_set();
                     paths.iter().all(|p| w.contains(p))
                 });

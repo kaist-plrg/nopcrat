@@ -7,7 +7,7 @@ use etrace::some_or;
 use rustc_ast::LitKind;
 use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOp, BinOpKind, Expr, ExprKind, FnRetTy, HirId,
-    ItemKind, MutTy, Node, PatKind, PathSegment, QPath, TyKind, UnOp,
+    ItemKind, MutTy, Node, PatKind, PathSegment, QPath, TyKind,
 };
 use rustc_middle::{hir::nested_filter, mir::BasicBlock, ty::TyCtxt};
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
@@ -68,7 +68,11 @@ fn transform(
                     .iter()
                     .map(|(bb, i)| {
                         let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*bb)];
-                        bbd.statements[*i].source_info.span
+                        if *i == bbd.statements.len() {
+                            bbd.terminator().source_info.span
+                        } else {
+                            bbd.statements[*i].source_info.span
+                        }
                     })
                     .collect();
                 let PatKind::Binding(_, hir_id, ident, _) = param.pat.kind else {
@@ -160,7 +164,7 @@ fn transform(
                 fix(span, "".to_string());
             }
 
-            let mut mtch = func.call_match(&args, curr);
+            let mut mtch = func.call_match(&args);
 
             if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
                 if let Some(then) = func.cmp(call.op, call.target) {
@@ -239,7 +243,7 @@ fn transform(
             }
             fix(span.shrink_to_lo(), binding);
 
-            let mut assign = func.call_assign(&args, curr);
+            let mut assign = func.call_assign(&args);
             if let Some(m) = &mtch {
                 assign += m;
             }
@@ -272,12 +276,6 @@ fn transform(
     let {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
-                } else if param.complete_writes.is_empty() {
-                    format!(
-                        "
-    let mut {0}___v: Option<{1}> = None;",
-                        param.name, param.ty,
-                    )
                 } else {
                     format!(
                         "
@@ -300,8 +298,10 @@ fn transform(
                 let span = span.with_hi(pos).with_lo(pos);
                 let assign = format!(
                     "
-                    {0}___v = Some({0}___vv);
-                    {0} = {0}___v.as_mut().unwrap();",
+    if {0} == &mut {0}___vv {{
+        {0}___v = Some({0}___vv);
+        {0} = {0}___v.as_mut().unwrap();
+    }}",
                     param.name,
                 );
                 fix(span, assign);
@@ -323,36 +323,6 @@ fn transform(
             let span = body.value.span.with_lo(pos).with_hi(pos);
             let ret_v = func.return_value(None);
             fix(span, ret_v);
-        }
-
-        for assign in visitor.indirect_assigns {
-            let IndirectAssign {
-                lhs_span,
-                lhs,
-                rhs_span,
-            } = assign;
-            let param = some_or!(func.hir_id_map.get(&lhs), continue);
-            if param.must {
-                continue;
-            }
-
-            let lhs = format!("{}___v", param.name);
-            fix(lhs_span, lhs);
-
-            let rhs = source_map.span_to_snippet(rhs_span).unwrap();
-            let rhs = format!("Some({})", rhs);
-            fix(rhs_span, rhs);
-        }
-
-        for deref in visitor.derefs {
-            let Deref { span, hir_id } = deref;
-            let param = some_or!(func.hir_id_map.get(&hir_id), continue);
-            if param.must {
-                continue;
-            }
-
-            let v = format!("{}___v.unwrap()", param.name);
-            fix(span, v);
         }
 
         for check in visitor.null_checks {
@@ -432,30 +402,13 @@ impl Func {
         }
     }
 
-    fn is_must(curr: Option<&Self>, hir_id: &Option<HirId>) -> Option<bool> {
-        let curr = curr?;
-        let hir_id = hir_id.as_ref()?;
-        let param = curr.hir_id_map.get(hir_id)?;
-        Some(param.must)
-    }
-
-    fn call_assign(&self, args: &[Arg], curr: Option<&Self>) -> String {
+    fn call_assign(&self, args: &[Arg]) -> String {
         let mut assigns = vec![];
         for i in &self.remaining_return {
             let arg = &args[*i];
             if !arg.is_null {
                 let param = &self.index_map[i];
-                let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
-                let assign = if need_some {
-                    if param.must {
-                        format!("{}___v = Some(rv___{});", arg.code, i)
-                    } else {
-                        format!(
-                            "if let Some(v) = rv___{} {{ {}___v = Some(v); }}",
-                            i, arg.code
-                        )
-                    }
-                } else if param.must {
+                let assign = if param.must {
                     if arg.code.starts_with("&mut ") {
                         format!("*({0}) = rv___{1};", arg.code, i)
                     } else {
@@ -476,18 +429,13 @@ impl Func {
         mk_string(assigns.iter(), ";\n", "\n", end)
     }
 
-    fn call_match(&self, args: &[Arg], curr: Option<&Self>) -> Option<String> {
+    fn call_match(&self, args: &[Arg]) -> Option<String> {
         let (succ_value, first) = &self.first_return?;
         let arg = &args[*first];
         let assign = if arg.is_null {
             "".to_string()
         } else {
-            let need_some = !Self::is_must(curr, &arg.hir_id).unwrap_or(true);
-            if need_some {
-                format!("{}___v = Some(v);", arg.code)
-            } else {
-                format!("*({}) = v;", arg.code)
-            }
+            format!("*({}) = v;", arg.code)
         };
         let v = match succ_value {
             SuccValue::Int(v) => v.to_string(),
@@ -567,21 +515,7 @@ struct Call {
 struct Arg {
     span: Span,
     code: String,
-    hir_id: Option<HirId>,
     is_null: bool,
-}
-
-#[derive(Debug)]
-struct IndirectAssign {
-    lhs_span: Span,
-    lhs: HirId,
-    rhs_span: Span,
-}
-
-#[derive(Debug)]
-struct Deref {
-    span: Span,
-    hir_id: HirId,
 }
 
 #[derive(Debug)]
@@ -595,8 +529,6 @@ struct BodyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     returns: Vec<Return>,
     calls: Vec<Call>,
-    indirect_assigns: Vec<IndirectAssign>,
-    derefs: Vec<Deref>,
     null_checks: Vec<NullCheck>,
 }
 
@@ -606,8 +538,6 @@ impl<'tcx> BodyVisitor<'tcx> {
             tcx,
             returns: vec![],
             calls: vec![],
-            indirect_assigns: vec![],
-            derefs: vec![],
             null_checks: vec![],
         }
     }
@@ -641,18 +571,10 @@ impl<'tcx> BodyVisitor<'tcx> {
             .iter()
             .map(|arg| {
                 let code = source_map.span_to_snippet(arg.span).unwrap();
-                let hir_id = expr_to_path(arg).and_then(|path| {
-                    if let Res::Local(hir_id) = path.res {
-                        Some(hir_id)
-                    } else {
-                        None
-                    }
-                });
                 let is_null = as_int_lit(arg).map(|n| n == 0).unwrap_or(false);
                 Arg {
                     span: arg.span,
                     code,
-                    hir_id,
                     is_null,
                 }
             })
@@ -664,46 +586,6 @@ impl<'tcx> BodyVisitor<'tcx> {
             args,
         };
         self.calls.push(call);
-    }
-
-    fn visit_expr_assign(
-        &mut self,
-        _: &'tcx Expr<'tcx>,
-        lhs: &'tcx Expr<'tcx>,
-        rhs: &'tcx Expr<'tcx>,
-        _: Span,
-    ) {
-        let ExprKind::Unary(UnOp::Deref, ptr) = lhs.kind else {
-            return;
-        };
-        let path = some_or!(expr_to_path(ptr), return);
-        let Res::Local(hir_id) = path.res else { return };
-        let assign = IndirectAssign {
-            lhs_span: lhs.span,
-            lhs: hir_id,
-            rhs_span: rhs.span,
-        };
-        self.indirect_assigns.push(assign);
-    }
-
-    fn visit_expr_unary(&mut self, expr: &'tcx Expr<'tcx>, op: UnOp, e: &'tcx Expr<'tcx>) {
-        if op != UnOp::Deref {
-            return;
-        }
-        if let Some(p) = get_parent_wo_field(expr.hir_id, self.tcx) {
-            match p.kind {
-                ExprKind::Assign(lhs, _, _) if lhs.span.overlaps(expr.span) => return,
-                ExprKind::AddrOf(_, _, _) => return,
-                _ => {}
-            }
-        }
-        let path = some_or!(expr_to_path(e), return);
-        let Res::Local(hir_id) = path.res else { return };
-        let deref = Deref {
-            span: expr.span,
-            hir_id,
-        };
-        self.derefs.push(deref);
     }
 
     fn visit_expr_binary(
@@ -772,8 +654,6 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
         match expr.kind {
             ExprKind::Ret(e) => self.visit_expr_ret(expr, e),
             ExprKind::Call(callee, args) => self.visit_expr_call(expr, callee, args),
-            ExprKind::Assign(lhs, rhs, span) => self.visit_expr_assign(expr, lhs, rhs, span),
-            ExprKind::Unary(op, e) => self.visit_expr_unary(expr, op, e),
             ExprKind::Binary(op, l, r) => self.visit_expr_binary(expr, op, l, r),
             ExprKind::MethodCall(seg, receiver, args, span) => {
                 self.visit_expr_method_call(expr, seg, receiver, args, span)
@@ -889,19 +769,6 @@ fn get_parent_return(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
         Some(parent)
     } else {
         get_parent_return(parent.hir_id, tcx)
-    }
-}
-
-fn get_parent_wo_field(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
-    let hir = tcx.hir();
-    let Node::Expr(e) = hir.find_parent(hir_id)? else {
-        return None;
-    };
-    match e.kind {
-        ExprKind::DropTemps(_) | ExprKind::Cast(_, _) | ExprKind::Field(_, _) => {
-            get_parent(e.hir_id, tcx)
-        }
-        _ => Some(e),
     }
 }
 
