@@ -347,14 +347,22 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     .collect()
             })
             .collect();
+        let body = self.tcx.optimized_mir(def_id);
         let writes: BTreeSet<_> = (1..=self.info.inputs)
             .filter(|i| {
-                let ws: BTreeSet<_> = writes.iter().map(|map| map[&i]).collect();
+                let ws: BTreeSet<_> = writes.iter().map(|map| map[i]).collect();
                 !reads.contains(i)
                     && !return_ptrs.contains(i)
                     && self.info.param_tys[*i] != TypeInfo::Union
                     && ws.contains(&Write::All)
                     && !ws.contains(&Write::Partial)
+                    && {
+                        let ty = &body.local_decls[Local::from_usize(*i)].ty;
+                        let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() else {
+                            unreachable!("{:?}", ty);
+                        };
+                        !ty.is_c_void(self.tcx)
+                    }
             })
             .collect();
         if writes.is_empty() {
@@ -370,7 +378,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 (st.local.get(0).clone(), writes2)
             })
             .collect();
-        let body = self.tcx.optimized_mir(def_id);
         let ret_ty = &body.local_decls[Local::from_usize(0)].ty;
         writes
             .into_iter()
