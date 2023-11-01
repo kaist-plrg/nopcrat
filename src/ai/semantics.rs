@@ -17,9 +17,49 @@ use rustc_type_ir::{FloatTy, IntTy, UintTy};
 
 use super::{analysis::FunctionSummary, domains::*};
 
+pub struct TransferedTerminator {
+    pub next_states: Vec<AbsState>,
+    pub next_locations: Vec<Location>,
+    pub writes: BTreeSet<AbsPath>,
+}
+
+impl TransferedTerminator {
+    #[inline]
+    fn new(
+        next_states: Vec<AbsState>,
+        next_locations: Vec<Location>,
+        writes: BTreeSet<AbsPath>,
+    ) -> Self {
+        Self {
+            next_states,
+            next_locations,
+            writes,
+        }
+    }
+
+    #[inline]
+    fn empty() -> Self {
+        Self::new(vec![], vec![], BTreeSet::new())
+    }
+
+    #[inline]
+    fn state_location(st: AbsState, loc: Location) -> Self {
+        Self::new(vec![st], vec![loc], BTreeSet::new())
+    }
+
+    #[inline]
+    fn state_locations(st: AbsState, locs: Vec<Location>) -> Self {
+        Self::new(vec![st], locs, BTreeSet::new())
+    }
+}
+
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
-    pub fn transfer_statement(&self, stmt: &Statement<'tcx>, state: &AbsState) -> AbsState {
+    pub fn transfer_statement(
+        &self,
+        stmt: &Statement<'tcx>,
+        state: &AbsState,
+    ) -> (AbsState, BTreeSet<AbsPath>) {
         tracing::info!(
             "\n{}\n{:?}",
             self.span_to_string(stmt.source_info.span),
@@ -29,8 +69,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (new_v, reads) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_reads(reads.into_iter());
-            new_state.add_writes(writes.into_iter());
-            new_state
+            let writes = new_state.add_writes(writes.into_iter());
+            (new_state, writes)
         } else {
             unreachable!("{:?}", stmt)
         }
@@ -40,7 +80,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         terminator: &Terminator<'tcx>,
         state: &AbsState,
-    ) -> (Vec<AbsState>, Vec<Location>) {
+    ) -> TransferedTerminator {
         tracing::info!(
             "\n{}\n{:?}",
             self.span_to_string(terminator.source_info.span),
@@ -48,11 +88,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         );
         match &terminator.kind {
             TerminatorKind::Goto { target } => {
-                (vec![state.clone_()], vec![target.start_location()])
+                TransferedTerminator::state_location(state.clone(), target.start_location())
             }
             TerminatorKind::SwitchInt { discr, targets } => {
                 let (v, reads) = self.transfer_operand(discr, state);
-                let mut new_state = state.clone_();
+                let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
@@ -67,14 +107,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .map(|target| target.start_location())
                         .collect()
                 };
-                (vec![new_state], locations)
+                TransferedTerminator::state_locations(new_state, locations)
             }
-            TerminatorKind::UnwindResume => (vec![], vec![]),
-            TerminatorKind::UnwindTerminate(_) => (vec![], vec![]),
-            TerminatorKind::Return => (vec![], vec![]),
-            TerminatorKind::Unreachable => (vec![], vec![]),
+            TerminatorKind::UnwindResume => TransferedTerminator::empty(),
+            TerminatorKind::UnwindTerminate(_) => TransferedTerminator::empty(),
+            TerminatorKind::Return => TransferedTerminator::empty(),
+            TerminatorKind::Unreachable => TransferedTerminator::empty(),
             TerminatorKind::Drop { target, .. } => {
-                (vec![state.clone_()], vec![target.start_location()])
+                TransferedTerminator::state_location(state.clone(), target.start_location())
             }
             TerminatorKind::Call {
                 func,
@@ -91,31 +131,34 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 for reads2 in readss {
                     reads.extend(reads2);
                 }
-                let new_states = if let Some(fns) = func.fnv.gamma() {
+                let (new_states, writes) = if let Some(fns) = func.fnv.gamma() {
                     let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                    let mut ret_writes = BTreeSet::new();
                     for def_id in fns {
-                        let states = self.transfer_call(
+                        let (states, writes) = self.transfer_call(
                             *def_id,
                             &args,
                             destination,
-                            state.clone_(),
+                            state.clone(),
                             reads.clone(),
                         );
+                        ret_writes.extend(writes);
                         for state in states {
                             let writes = state.writes.clone();
                             new_states_map.entry(writes).or_default().push(state);
                         }
                     }
-                    new_states_map
+                    let new_states = new_states_map
                         .into_values()
                         .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
-                        .collect()
+                        .collect();
+                    (new_states, ret_writes)
                 } else {
                     tracing::warn!("call to top");
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
                     new_state.add_reads(reads.into_iter());
-                    new_state.add_writes(writes.into_iter());
-                    vec![new_state]
+                    let writes = new_state.add_writes(writes.into_iter());
+                    (vec![new_state], writes)
                 };
                 let locations = if new_states.is_empty() {
                     vec![]
@@ -125,13 +168,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .map(|target| vec![target.start_location()])
                         .unwrap_or(vec![])
                 };
-                (new_states, locations)
+                TransferedTerminator::new(new_states, locations, writes)
             }
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
-                let mut new_state = state.clone_();
+                let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
-                (vec![new_state], vec![target.start_location()])
+                TransferedTerminator::state_location(new_state, target.start_location())
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
@@ -142,7 +185,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if let Some(dst) = destination {
                     locations.push(dst.start_location());
                 }
-                (vec![state.clone_()], locations)
+                TransferedTerminator::state_locations(state.clone(), locations)
             }
         }
     }
@@ -154,7 +197,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         dst: &Place<'tcx>,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
-    ) -> Vec<AbsState> {
+    ) -> (Vec<AbsState>, BTreeSet<AbsPath>) {
         let mut offsets = vec![];
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
@@ -182,9 +225,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let (mut new_state, writes_ret) = self.assign(dst, v, &state);
         new_state.add_excludes(offsets.into_iter());
         new_state.add_reads(reads.into_iter());
-        new_state.add_writes(writes.into_iter());
-        new_state.add_writes(writes_ret.into_iter());
-        vec![new_state]
+        let writes = new_state.add_writes(writes.into_iter().chain(writes_ret));
+        (vec![new_state], writes)
     }
 
     fn transfer_intra_call(
@@ -195,9 +237,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         dst: &Place<'tcx>,
         state: AbsState,
         mut reads: Vec<AbsPath>,
-    ) -> Vec<AbsState> {
+    ) -> (Vec<AbsState>, BTreeSet<AbsPath>) {
         if summary.return_states.is_empty() {
-            return vec![];
+            return (vec![], BTreeSet::new());
         }
 
         let mut ptr_maps = BTreeMap::new();
@@ -215,6 +257,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
 
         let mut states = vec![];
+        let mut ret_writes = BTreeSet::new();
         for return_state in summary.return_states.values() {
             let mut state = state.clone();
             let ret_v = return_state.local.get(0);
@@ -282,11 +325,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
-            state.add_writes(callee_writes.into_iter());
-            state.add_writes(writes.into_iter());
+            let writes = state.add_writes(callee_writes.into_iter().chain(writes));
+            ret_writes.extend(writes);
             states.push(state)
         }
-        states
+        (states, ret_writes)
     }
 
     fn transfer_method_call(
@@ -983,7 +1026,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         new_v: AbsValue,
         state: &AbsState,
     ) -> (AbsState, Vec<AbsPath>) {
-        let mut new_state = state.clone_();
+        let mut new_state = state.clone();
         let writes = if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local.index());

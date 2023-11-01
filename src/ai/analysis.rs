@@ -21,7 +21,7 @@ use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, Span};
 use serde::{Deserialize, Serialize};
 
-use super::domains::*;
+use super::{domains::*, semantics::TransferedTerminator};
 use crate::{
     rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
 };
@@ -143,6 +143,7 @@ pub fn analyze(
     let mut output_params_map = BTreeMap::new();
     let mut summaries = BTreeMap::new();
     let mut results = BTreeMap::new();
+    let mut wm_map = BTreeMap::new();
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -173,16 +174,21 @@ pub fn analyze(
                     );
                 }
 
-                let (result, init_state) = analyzer.analyze_body(body);
-                tracing::info!("\n{}", analysis_result_to_string(body, &result).unwrap());
+                let AnalyzedBody {
+                    states,
+                    writes_map,
+                    init_state,
+                } = analyzer.analyze_body(body);
+                tracing::info!("\n{}", analysis_result_to_string(body, &states).unwrap());
 
                 let return_states = return_location(body)
-                    .and_then(|ret| result.get(&ret))
+                    .and_then(|ret| states.get(&ret))
                     .cloned()
                     .unwrap_or_default();
                 let summary = FunctionSummary::new(init_state, return_states);
-                results.insert(*def_id, result);
+                results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
+                wm_map.insert(*def_id, writes_map);
 
                 let (summary, updated) = if let Some(old) = summaries.get(def_id) {
                     let new_summary = summary.join(old);
@@ -204,8 +210,9 @@ pub fn analyze(
                     let mut output_params =
                         analyzer.find_output_params(summary, &return_ptrs, *def_id);
                     let result = results.remove(def_id).unwrap();
+                    let writes_map = wm_map.remove(def_id).unwrap();
                     for p in &mut output_params {
-                        analyzer.find_complete_write(p, &result, *def_id);
+                        analyzer.find_complete_write(p, &result, &writes_map, *def_id);
                     }
                     output_params_map.insert(*def_id, output_params);
                 }
@@ -264,6 +271,12 @@ pub struct Analyzer<'a, 'tcx> {
     conf: &'a AnalysisConfig,
     pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
+}
+
+struct AnalyzedBody {
+    states: BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
+    writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
+    init_state: AbsState,
 }
 
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
@@ -430,6 +443,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         param: &mut OutputParam,
         result: &BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
+        writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         def_id: DefId,
     ) {
         if param.must {
@@ -446,13 +460,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 paths.iter().all(|p| w.contains(p))
             });
             if !complete {
-                continue;
-            }
-            let pwrite = sts.values().any(|st| {
-                let w = st.prev_writes.as_set();
-                paths.iter().any(|p| w.contains(p))
-            });
-            if !pwrite {
                 continue;
             }
             let prevs = if location.statement_index == 0 {
@@ -480,6 +487,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 if pcomplete {
                     continue;
                 }
+                let writes = some_or!(writes_map.get(&prev), continue);
+                let pwrite = paths.iter().any(|p| writes.contains(p));
+                if !pwrite {
+                    continue;
+                }
                 let Location {
                     block,
                     statement_index,
@@ -491,13 +503,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
     }
 
-    pub fn analyze_body(
-        &mut self,
-        body: &Body<'tcx>,
-    ) -> (
-        BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
-        AbsState,
-    ) {
+    fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
 
@@ -534,7 +540,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             BTreeSet::new()
         };
 
-        let states = 'analysis_loop: loop {
+        let (states, writes_map) = 'analysis_loop: loop {
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -543,6 +549,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .entry(start_label.location)
                 .or_default()
                 .insert(start_label.writes.clone(), start_state.clone());
+            let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
 
             while let Some(label) = work_list.pop() {
                 let state = states
@@ -555,19 +562,24 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     statement_index,
                 } = label.location;
                 let bbd = &body.basic_blocks[block];
-                let (new_next_states, next_locations) = if statement_index < bbd.statements.len() {
-                    let stmt = &bbd.statements[statement_index];
-                    let new_next_state = self.transfer_statement(stmt, state);
-                    let next_location = Location {
-                        block,
-                        statement_index: statement_index + 1,
+                let (new_next_states, next_locations, writes) =
+                    if statement_index < bbd.statements.len() {
+                        let stmt = &bbd.statements[statement_index];
+                        let (new_next_state, writes) = self.transfer_statement(stmt, state);
+                        let next_location = Location {
+                            block,
+                            statement_index: statement_index + 1,
+                        };
+                        (vec![new_next_state], vec![next_location], writes)
+                    } else {
+                        let TransferedTerminator {
+                            next_states,
+                            next_locations,
+                            writes,
+                        } = self.transfer_terminator(bbd.terminator(), state);
+                        (next_states, next_locations, writes)
                     };
-                    (vec![new_next_state], vec![next_location])
-                } else {
-                    let (new_next_states, next_locations) =
-                        self.transfer_terminator(bbd.terminator(), state);
-                    (new_next_states, next_locations)
-                };
+                writes_map.entry(label.location).or_default().extend(writes);
                 for location in &next_locations {
                     let dead_locals = &self.info.dead_locals[location.block.as_usize()];
                     if merging_blocks.contains(&location.block) {
@@ -650,10 +662,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     continue 'analysis_loop;
                 }
             }
-            break states;
+            break (states, writes_map);
         };
 
-        (states, init_state)
+        AnalyzedBody {
+            states,
+            writes_map,
+            init_state,
+        }
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {

@@ -17,7 +17,6 @@ pub struct AbsState {
     pub excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
-    pub prev_writes: MayPathSet,
 }
 
 impl AbsState {
@@ -29,7 +28,6 @@ impl AbsState {
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
             excludes: MayPathSet::bot(),
-            prev_writes: MayPathSet::bot(),
         }
     }
 
@@ -40,7 +38,6 @@ impl AbsState {
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
             excludes: self.excludes.join(&other.excludes),
-            prev_writes: self.prev_writes.join(&other.prev_writes),
         }
     }
 
@@ -51,7 +48,6 @@ impl AbsState {
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
             excludes: self.excludes.widen(&other.excludes),
-            prev_writes: self.prev_writes.widen(&other.prev_writes),
         }
     }
 
@@ -61,7 +57,6 @@ impl AbsState {
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
             && self.excludes.ord(&other.excludes)
-            && self.prev_writes.ord(&other.prev_writes)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -96,24 +91,15 @@ impl AbsState {
         }
     }
 
-    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) -> BTreeSet<AbsPath> {
+        let mut res = BTreeSet::new();
         for path in paths {
             if !self.reads.contains(&path) && !self.excludes.contains(&path) {
                 self.writes.insert(path.clone());
-                self.prev_writes.insert(path);
+                res.insert(path);
             }
         }
-    }
-
-    pub fn clone_(&self) -> Self {
-        Self {
-            local: self.local.clone(),
-            args: self.args.clone(),
-            reads: self.reads.clone(),
-            writes: self.writes.clone(),
-            excludes: self.excludes.clone(),
-            prev_writes: MayPathSet::bot(),
-        }
+        res
     }
 }
 
