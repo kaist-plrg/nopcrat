@@ -986,11 +986,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         state: &mut AbsState,
     ) {
         if let AbsPtr::Set(ptrs) = ptr {
+            if ptrs
+                .iter()
+                .any(|ptr| matches!(ptr.base, AbsBase::Arg(_) | AbsBase::Heap))
+            {
+                let reads = self.get_read_paths_of_ptr(&new_v.ptrv, &[]);
+                state.add_heap_stored_ptrs(reads.into_iter());
+            }
             let weak = ptrs.len() > 1;
             for ptr in ptrs {
-                if ptr.base == AbsBase::Heap {
-                    continue;
-                }
                 let old_v = some_or!(state.get_mut(ptr.base), continue);
                 let mut ptr_projection = ptr.projection.clone();
                 ptr_projection.extend(projection.to_owned());

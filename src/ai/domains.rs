@@ -67,12 +67,19 @@ impl AbsState {
         match base {
             AbsBase::Local(i) => self.local.0.get_mut(i),
             AbsBase::Arg(i) => self.args.0.get_mut(i),
-            AbsBase::Heap => panic!(),
+            AbsBase::Heap => None,
             AbsBase::Null => None,
         }
     }
 
     pub fn add_offsets<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            self.writes.remove(&path);
+            self.reads.insert(path);
+        }
+    }
+
+    pub fn add_heap_stored_ptrs<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
             self.writes.remove(&path);
             self.reads.insert(path);
