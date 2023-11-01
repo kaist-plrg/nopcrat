@@ -352,7 +352,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
         } else if output.is_unsafe_ptr() {
-            AbsValue::heap()
+            AbsValue::heap_or_null()
         } else {
             AbsValue::top()
         }
@@ -905,7 +905,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 }
             }
             TyKind::Slice(_) => unreachable!("{:?}", ty),
-            TyKind::RawPtr(TypeAndMut { .. }) | TyKind::Ref(_, _, _) => AbsValue::heap(),
+            TyKind::RawPtr(TypeAndMut { .. }) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
             TyKind::FnPtr(_) => todo!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),

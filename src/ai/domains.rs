@@ -261,6 +261,7 @@ lazy_static! {
     static ref V_FALSE: AbsValue = AbsValue::new(AbsVal::alpha_bool(false));
     static ref V_HEAP: AbsValue = AbsValue::new(AbsVal::heap());
     static ref V_NULL: AbsValue = AbsValue::new(AbsVal::null());
+    static ref V_HEAP_OR_NULL: AbsValue = AbsValue::new(AbsVal::heap_or_null());
     static ref V_NONE: AbsValue = AbsValue::new(AbsVal::none());
 }
 
@@ -356,6 +357,11 @@ impl AbsValue {
     #[inline]
     pub fn null() -> Self {
         V_NULL.clone()
+    }
+
+    #[inline]
+    pub fn heap_or_null() -> Self {
+        V_HEAP_OR_NULL.clone()
     }
 
     #[inline]
@@ -949,6 +955,11 @@ impl AbsVal {
     #[inline]
     fn null() -> Self {
         Self::ptr(AbsPtr::null())
+    }
+
+    #[inline]
+    fn heap_or_null() -> Self {
+        Self::ptr(AbsPtr::heap_or_null())
     }
 
     #[inline]
@@ -2674,6 +2685,11 @@ impl AbsPtr {
     #[inline]
     fn null() -> Self {
         Self::alpha(AbsPlace::null())
+    }
+
+    #[inline]
+    fn heap_or_null() -> Self {
+        Self::alphas([AbsPlace::heap(), AbsPlace::null()].into_iter().collect())
     }
 
     #[inline]
