@@ -456,9 +456,18 @@ impl Func {
                         )
                     }
                 } else if param.must {
-                    format!("*({}) = rv___{};", arg.code, i)
+                    if arg.code.starts_with("&mut ") {
+                        format!("*({0}) = rv___{1};", arg.code, i)
+                    } else {
+                        format!("if !({0}).is_null() {{ *({0}) = rv___{1}; }}", arg.code, i)
+                    }
+                } else if arg.code.starts_with("&mut ") {
+                    format!("if let Some(v) = rv___{1} {{ *({0}) = v; }}", arg.code, i)
                 } else {
-                    format!("if let Some(v) = rv___{} {{ *({}) = v; }}", i, arg.code)
+                    format!(
+                        "if !({0}).is_null() {{ if let Some(v) = rv___{1} {{ *({0}) = v; }} }}",
+                        arg.code, i
+                    )
                 };
                 assigns.push(assign);
             }
