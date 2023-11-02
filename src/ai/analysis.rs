@@ -214,9 +214,8 @@ pub fn analyze(
                     let result = results.remove(def_id).unwrap();
                     let writes_map = wm_map.remove(def_id).unwrap();
                     let call_args = call_args_map.remove(def_id).unwrap();
-                    println!("{:?} {:?}", def_id, call_args);
                     for p in &mut output_params {
-                        analyzer.find_complete_write(p, &result, &writes_map, *def_id);
+                        analyzer.find_complete_write(p, &result, &writes_map, &call_args, *def_id);
                     }
                     output_params_map.insert(*def_id, output_params);
                 }
@@ -234,12 +233,19 @@ pub fn analyze(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CompleteWrite {
+    pub block: usize,
+    pub statement_index: usize,
+    pub write_arg: Option<usize>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OutputParam {
     pub index: usize,
     pub must: bool,
     pub return_values: ReturnValues,
-    pub complete_writes: Vec<(usize, usize)>,
+    pub complete_writes: Vec<CompleteWrite>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,7 +281,7 @@ pub struct Analyzer<'a, 'tcx> {
     conf: &'a AnalysisConfig,
     pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
-    pub call_args: BTreeMap<Location, BTreeMap<usize, BTreeSet<AbsPath>>>,
+    pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
 }
 
 struct AnalyzedBody {
@@ -450,6 +456,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         param: &mut OutputParam,
         result: &BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
+        call_args: &BTreeMap<Location, BTreeMap<usize, usize>>,
         def_id: DefId,
     ) {
         if param.must {
@@ -485,6 +492,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 vec![l]
             };
             for prev in prevs {
+                let sts = some_or!(result.get(&prev), continue);
+                let pcomplete = sts.keys().all(|w| {
+                    let w = w.as_set();
+                    paths.iter().all(|p| w.contains(p))
+                });
+                if pcomplete {
+                    continue;
+                }
                 let writes = some_or!(writes_map.get(&prev), continue);
                 let pwrite = paths.iter().any(|p| writes.contains(p));
                 if !pwrite {
@@ -494,9 +509,17 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     block,
                     statement_index,
                 } = prev;
-                param
-                    .complete_writes
-                    .push((block.as_usize(), statement_index));
+                let write_arg = call_args
+                    .get(&prev)
+                    .and_then(|call_args| call_args.get(&param.index))
+                    .cloned();
+                let block = block.as_usize();
+                let cw = CompleteWrite {
+                    block,
+                    statement_index,
+                    write_arg,
+                };
+                param.complete_writes.push(cw);
             }
         }
     }

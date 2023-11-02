@@ -327,9 +327,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 self.call_args
                     .entry(location)
                     .or_default()
-                    .entry(idx)
-                    .or_default()
-                    .insert(path);
+                    .insert(path.base() - 1, idx);
             }
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
