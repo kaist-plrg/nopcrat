@@ -647,7 +647,7 @@ impl AbsValue {
             let intv = self.intv.join(&other.intv);
             let uintv = self.uintv.join(&other.uintv);
             let floatv = self.floatv.join(&other.floatv);
-            let boolv = self.boolv.join(&other.boolv);
+            let boolv = self.boolv.join(other.boolv);
             let listv = self.listv.join(&other.listv);
             let ptrv = self.ptrv.join(&other.ptrv);
             let optionv = self.optionv.join(&other.optionv);
@@ -696,7 +696,7 @@ impl AbsValue {
             let intv = self.intv.widen(&other.intv);
             let uintv = self.uintv.widen(&other.uintv);
             let floatv = self.floatv.widen(&other.floatv);
-            let boolv = self.boolv.widen(&other.boolv);
+            let boolv = self.boolv.widen(other.boolv);
             let listv = self.listv.widen(&other.listv);
             let ptrv = self.ptrv.widen(&other.ptrv);
             let optionv = self.optionv.widen(&other.optionv);
@@ -859,7 +859,7 @@ impl AbsVal {
         self.intv.ord(&other.intv)
             && self.uintv.ord(&other.uintv)
             && self.floatv.ord(&other.floatv)
-            && self.boolv.ord(&other.boolv)
+            && self.boolv.ord(other.boolv)
             && self.listv.ord(&other.listv)
             && self.ptrv.ord(&other.ptrv)
             && self.optionv.ord(&other.optionv)
@@ -1126,6 +1126,7 @@ impl AbsVal {
             .to_i8()
             .join(&self.uintv.to_i8())
             .join(&self.floatv.to_i8())
+            .join(&self.boolv.to_int())
     }
 
     #[inline]
@@ -1134,6 +1135,7 @@ impl AbsVal {
             .to_i16()
             .join(&self.uintv.to_i16())
             .join(&self.floatv.to_i16())
+            .join(&self.boolv.to_int())
     }
 
     #[inline]
@@ -1142,6 +1144,7 @@ impl AbsVal {
             .to_i32()
             .join(&self.uintv.to_i32())
             .join(&self.floatv.to_i32())
+            .join(&self.boolv.to_int())
     }
 
     #[inline]
@@ -1150,6 +1153,7 @@ impl AbsVal {
             .to_i64()
             .join(&self.uintv.to_i64())
             .join(&self.floatv.to_i64())
+            .join(&self.boolv.to_int())
     }
 
     #[inline]
@@ -1157,6 +1161,7 @@ impl AbsVal {
         self.intv
             .join(&self.uintv.to_i128())
             .join(&self.floatv.to_i128())
+            .join(&self.boolv.to_int())
     }
 
     #[inline]
@@ -1165,6 +1170,7 @@ impl AbsVal {
             .to_u8()
             .join(&self.uintv.to_u8())
             .join(&self.floatv.to_u8())
+            .join(&self.boolv.to_uint())
     }
 
     #[inline]
@@ -1173,6 +1179,7 @@ impl AbsVal {
             .to_u16()
             .join(&self.uintv.to_u16())
             .join(&self.floatv.to_u16())
+            .join(&self.boolv.to_uint())
     }
 
     #[inline]
@@ -1181,6 +1188,7 @@ impl AbsVal {
             .to_u32()
             .join(&self.uintv.to_u32())
             .join(&self.floatv.to_u32())
+            .join(&self.boolv.to_uint())
     }
 
     #[inline]
@@ -1189,6 +1197,7 @@ impl AbsVal {
             .to_u64()
             .join(&self.uintv.to_u64())
             .join(&self.floatv.to_u64())
+            .join(&self.boolv.to_uint())
     }
 
     #[inline]
@@ -1197,6 +1206,7 @@ impl AbsVal {
             .to_u128()
             .join(&self.uintv)
             .join(&self.floatv.to_u128())
+            .join(&self.boolv.to_uint())
     }
 
     #[inline]
@@ -1265,7 +1275,7 @@ impl AbsVal {
         (
             self.intv.bit_xor(&other.intv),
             self.uintv.bit_xor(&other.uintv),
-            self.boolv.bit_xor(&other.boolv),
+            self.boolv.bit_xor(other.boolv),
         )
     }
 
@@ -1274,7 +1284,7 @@ impl AbsVal {
         (
             self.intv.bit_and(&other.intv),
             self.uintv.bit_and(&other.uintv),
-            self.boolv.bit_and(&other.boolv),
+            self.boolv.bit_and(other.boolv),
         )
     }
 
@@ -1283,7 +1293,7 @@ impl AbsVal {
         (
             self.intv.bit_or(&other.intv),
             self.uintv.bit_or(&other.uintv),
-            self.boolv.bit_or(&other.boolv),
+            self.boolv.bit_or(other.boolv),
         )
     }
 
@@ -1317,56 +1327,56 @@ impl AbsVal {
     fn eq(&self, other: &Self) -> AbsBool {
         self.intv
             .eq(&other.intv)
-            .join(&self.uintv.eq(&other.uintv))
-            .join(&self.floatv.eq(&other.floatv))
-            .join(&self.boolv.eq(&other.boolv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.eq(&other.uintv))
+            .join(self.floatv.eq(&other.floatv))
+            .join(self.boolv.eq(other.boolv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
     fn lt(&self, other: &Self) -> AbsBool {
         self.intv
             .lt(&other.intv)
-            .join(&self.uintv.lt(&other.uintv))
-            .join(&self.floatv.lt(&other.floatv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.lt(&other.uintv))
+            .join(self.floatv.lt(&other.floatv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
     fn le(&self, other: &Self) -> AbsBool {
         self.intv
             .le(&other.intv)
-            .join(&self.uintv.le(&other.uintv))
-            .join(&self.floatv.le(&other.floatv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.le(&other.uintv))
+            .join(self.floatv.le(&other.floatv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
     fn ne(&self, other: &Self) -> AbsBool {
         self.intv
             .ne(&other.intv)
-            .join(&self.uintv.ne(&other.uintv))
-            .join(&self.floatv.ne(&other.floatv))
-            .join(&self.boolv.ne(&other.boolv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.ne(&other.uintv))
+            .join(self.floatv.ne(&other.floatv))
+            .join(self.boolv.ne(other.boolv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
     fn ge(&self, other: &Self) -> AbsBool {
         self.intv
             .ge(&other.intv)
-            .join(&self.uintv.ge(&other.uintv))
-            .join(&self.floatv.ge(&other.floatv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.ge(&other.uintv))
+            .join(self.floatv.ge(&other.floatv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
     fn gt(&self, other: &Self) -> AbsBool {
         self.intv
             .gt(&other.intv)
-            .join(&self.uintv.gt(&other.uintv))
-            .join(&self.floatv.gt(&other.floatv))
-            .join(&self.ptrv.compare(&other.ptrv))
+            .join(self.uintv.gt(&other.uintv))
+            .join(self.floatv.gt(&other.floatv))
+            .join(self.ptrv.compare(&other.ptrv))
     }
 
     #[inline]
@@ -2281,12 +2291,12 @@ impl AbsBool {
     }
 
     #[inline]
-    pub fn is_top(&self) -> bool {
+    pub fn is_top(self) -> bool {
         matches!(self, Self::Top)
     }
 
     #[inline]
-    pub fn is_bot(&self) -> bool {
+    pub fn is_bot(self) -> bool {
         matches!(self, Self::Bot)
     }
 
@@ -2298,7 +2308,7 @@ impl AbsBool {
         }
     }
 
-    pub fn gamma(&self) -> Vec<bool> {
+    pub fn gamma(self) -> Vec<bool> {
         match self {
             Self::Top => vec![true, false],
             Self::True => vec![true],
@@ -2319,27 +2329,27 @@ impl AbsBool {
         }
     }
 
-    fn join(&self, other: &Self) -> Self {
+    fn join(self, other: Self) -> Self {
         match (self, other) {
             (Self::True, Self::True) => Self::True,
             (Self::False, Self::False) => Self::False,
-            (Self::Bot, v) | (v, Self::Bot) => *v,
+            (Self::Bot, v) | (v, Self::Bot) => v,
             _ => Self::Top,
         }
     }
 
-    fn widen(&self, other: &Self) -> Self {
+    fn widen(self, other: Self) -> Self {
         self.join(other)
     }
 
-    fn ord(&self, other: &Self) -> bool {
+    fn ord(self, other: Self) -> bool {
         matches!(
             (self, other),
             (_, Self::Top) | (Self::Bot, _) | (Self::True, Self::True) | (Self::False, Self::False)
         )
     }
 
-    fn not(&self) -> Self {
+    fn not(self) -> Self {
         match self {
             Self::Top => Self::Top,
             Self::True => Self::False,
@@ -2348,7 +2358,25 @@ impl AbsBool {
         }
     }
 
-    fn eq(&self, other: &Self) -> AbsBool {
+    fn to_int(self) -> AbsInt {
+        match self {
+            Self::Top => AbsInt::alphas((0..=1).collect()),
+            Self::True => AbsInt::alpha(1),
+            Self::False => AbsInt::alpha(0),
+            Self::Bot => AbsInt::bot(),
+        }
+    }
+
+    fn to_uint(self) -> AbsUint {
+        match self {
+            Self::Top => AbsUint::alphas((0..=1).collect()),
+            Self::True => AbsUint::alpha(1),
+            Self::False => AbsUint::alpha(0),
+            Self::Bot => AbsUint::bot(),
+        }
+    }
+
+    fn eq(self, other: Self) -> AbsBool {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::True,
@@ -2357,7 +2385,7 @@ impl AbsBool {
         }
     }
 
-    fn ne(&self, other: &Self) -> AbsBool {
+    fn ne(self, other: Self) -> AbsBool {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::False,
@@ -2366,7 +2394,7 @@ impl AbsBool {
         }
     }
 
-    fn bit_xor(&self, other: &Self) -> Self {
+    fn bit_xor(self, other: Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, Self::True) | (Self::False, Self::False) => Self::False,
@@ -2375,7 +2403,7 @@ impl AbsBool {
         }
     }
 
-    fn bit_and(&self, other: &Self) -> Self {
+    fn bit_and(self, other: Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::False, _) | (_, Self::False) => Self::False,
@@ -2384,7 +2412,7 @@ impl AbsBool {
         }
     }
 
-    fn bit_or(&self, other: &Self) -> Self {
+    fn bit_or(self, other: Self) -> Self {
         match (self, other) {
             (Self::Bot, _) | (_, Self::Bot) => Self::Bot,
             (Self::True, _) | (_, Self::True) => Self::True,
