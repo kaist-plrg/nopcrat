@@ -703,7 +703,18 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             unreachable!("{:?}", rvalue)
                         }
                     }
-                    CastKind::PtrToPtr => v,
+                    CastKind::PtrToPtr => {
+                        let void = if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+                            ty.is_c_void(self.tcx)
+                        } else {
+                            false
+                        };
+                        if void {
+                            v
+                        } else {
+                            AbsValue::heap().join(&v)
+                        }
+                    }
                     CastKind::FnPtrToPtr => v,
                     CastKind::Transmute => v,
                 };
