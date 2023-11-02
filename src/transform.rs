@@ -212,7 +212,7 @@ fn transform(
                     } else {
                         "".to_string()
                     };
-                    let assign = if arg.code.starts_with("&mut ") {
+                    let assign = if arg.code.contains("&mut ") {
                         format!(" *({}) = v; {}", arg.code, set_flag)
                     } else {
                         format!(
@@ -455,7 +455,7 @@ impl Func {
                 "".to_string()
             };
             let assign = if param.must {
-                if arg.code.starts_with("&mut ") {
+                if arg.code.contains("&mut ") {
                     format!("*({}) = rv___{}; {}", arg.code, i, set_flag)
                 } else {
                     format!(
@@ -463,7 +463,7 @@ impl Func {
                         arg.code, i, set_flag
                     )
                 }
-            } else if arg.code.starts_with("&mut ") {
+            } else if arg.code.contains("&mut ") {
                 format!(
                     "if let Some(v) = rv___{} {{ *({}) = v; {} }}",
                     i, arg.code, set_flag
@@ -488,7 +488,7 @@ impl Func {
         } else {
             "".to_string()
         };
-        let assign = if arg.code.starts_with("&mut ") {
+        let assign = if arg.code.contains("&mut ") {
             format!("*({}) = v; {}", arg.code, set_flag)
         } else {
             format!(
