@@ -60,11 +60,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         stmt: &Statement<'tcx>,
         state: &AbsState,
     ) -> (AbsState, BTreeSet<AbsPath>) {
-        tracing::info!(
-            "\n{}\n{:?}",
-            self.span_to_string(stmt.source_info.span),
-            stmt
-        );
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
             let (new_v, reads) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
@@ -82,11 +77,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         state: &AbsState,
         location: Location,
     ) -> TransferedTerminator {
-        tracing::info!(
-            "\n{}\n{:?}",
-            self.span_to_string(terminator.source_info.span),
-            terminator
-        );
         match &terminator.kind {
             TerminatorKind::Goto { target } => {
                 TransferedTerminator::state_location(state.clone(), target.start_location())
@@ -156,7 +146,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .collect();
                     (new_states, ret_writes)
                 } else {
-                    tracing::warn!("call to top");
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
                     new_state.add_reads(reads.into_iter());
                     let writes = new_state.add_writes(writes.into_iter());
@@ -213,7 +202,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             } else if name.contains("{impl#") {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
-                tracing::warn!("call to unknown function");
                 AbsValue::top()
             }
         } else {
@@ -1070,8 +1058,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 ptr_projection.extend(projection.to_owned());
                 self.update_value(new_v.clone(), old_v, weak, &ptr_projection);
             }
-        } else {
-            tracing::warn!("indirect_assign to top");
         }
     }
 
@@ -1172,7 +1158,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     if let Some(v) = l.get(*field) {
                         self.get_value(v, &projection[1..])
                     } else {
-                        tracing::warn!("unknown field access");
                         AbsValue::bot()
                     }
                 }

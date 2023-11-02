@@ -213,10 +213,10 @@ fn transform(
                         "".to_string()
                     };
                     let assign = if arg.code.starts_with("&mut ") {
-                        format!(" (*{}) = v; {}", arg.code, set_flag)
+                        format!(" *({}) = v; {}", arg.code, set_flag)
                     } else {
                         format!(
-                            " if !{0}.is_null() {{ (*{0}) = v; {1} }}",
+                            " if !({0}).is_null() {{ *({0}) = v; {1} }}",
                             arg.code, set_flag
                         )
                     };
