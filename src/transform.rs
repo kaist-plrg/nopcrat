@@ -235,23 +235,25 @@ fn transform(
                     if let Some(else_span) = call.else_span {
                         let be = if !then { succ } else { fail };
                         let be_span = be_span.with_hi(else_span.lo());
-                        fix(be_span, format!(" {}", be));
+                        fix(be_span, format!(" {} {{", be));
 
                         if !then {
-                            let pos = be_span.hi() + BytePos(1);
+                            let pos = be_span.hi();
                             let ba_span = be_span.with_hi(pos).with_lo(pos);
                             fix(ba_span, assign);
                         }
 
                         let pos = else_span.hi();
                         let end_span = else_span.with_hi(pos).with_lo(pos);
-                        fix(end_span, " }}".to_string());
+                        // close1
+                        fix(end_span, " }}}".to_string());
                     } else {
                         let (be, assign) = if !then {
                             (succ, assign)
                         } else {
                             (fail, "".to_string())
                         };
+                        // close2
                         fix(be_span, format!(" {} {{ {} }} }}}}", be, assign));
                     }
 
@@ -261,7 +263,7 @@ fn transform(
                 if let Some(func) = curr {
                     ret_call_spans.insert(expr.span);
                     let pre_span = expr.span.with_hi(span.lo());
-                    fix(pre_span, "let rv___ =".to_string());
+                    fix(pre_span, "let mut rv___ =".to_string());
 
                     let pre_span = pre_span.with_lo(pre_span.lo() + BytePos(6));
                     let pre_s = source_map.span_to_snippet(pre_span).unwrap();
@@ -313,7 +315,7 @@ fn transform(
                     format!(
                         "
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);
-    let {0}: *mut {1} = &mut {0}___v;",
+    let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
                 } else {
@@ -360,7 +362,13 @@ fn transform(
     }
     suggestions.retain(|_, v| !v.is_empty());
     for suggestions in suggestions.values_mut() {
-        suggestions.sort_by_key(|s| s.snippets[0].range.start);
+        suggestions.sort_by_key(|s| {
+            (
+                s.snippets[0].range.start,
+                // close2 precedes close1
+                usize::MAX - s.solutions[0].replacements[0].replacement.len(),
+            )
+        });
     }
     suggestions
 }
