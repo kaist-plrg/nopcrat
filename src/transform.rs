@@ -856,6 +856,10 @@ fn get_if_cmp_call(hir_id: HirId, span: Span, tcx: TyCtxt<'_>) -> Option<IfCmpCa
     if !c.span.overlaps(pexpr.span) {
         return None;
     }
+    let code = tcx.sess.source_map().span_to_snippet(ppexpr.span).unwrap();
+    if !code.starts_with("if") {
+        return None;
+    }
     let target = if lhs.span.overlaps(span) { rhs } else { lhs };
     let call = IfCmpCall {
         if_span: ppexpr.span,
