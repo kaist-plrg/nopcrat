@@ -203,7 +203,7 @@ fn transform(
                     let if_span = if_span.with_hi(span.lo());
                     fix(if_span, "{ match ".to_string());
 
-                    let succ = "Ok(v) => ";
+                    let succ = "Ok(v___) => ";
                     let fail = "Err(_) => ";
                     let (_, i) = func.first_return.as_ref().unwrap();
                     let arg = &args[*i];
@@ -213,10 +213,10 @@ fn transform(
                         "".to_string()
                     };
                     let assign = if arg.code.contains("&mut ") {
-                        format!(" *({}) = v; {}", arg.code, set_flag)
+                        format!(" *({}) = v___; {}", arg.code, set_flag)
                     } else {
                         format!(
-                            " if !({0}).is_null() {{ *({0}) = v; {1} }}",
+                            " if !({0}).is_null() {{ *({0}) = v___; {1} }}",
                             arg.code, set_flag
                         )
                     };
@@ -454,12 +454,12 @@ impl Func {
                 }
             } else if arg.code.contains("&mut ") {
                 format!(
-                    "if let Some(v) = rv___{} {{ *({}) = v; {} }}",
+                    "if let Some(v___) = rv___{} {{ *({}) = v___; {} }}",
                     i, arg.code, set_flag
                 )
             } else {
                 format!(
-                    "if !({0}).is_null() {{ if let Some(v) = rv___{1} {{ *({0}) = v; {2} }} }}",
+                    "if !({0}).is_null() {{ if let Some(v___) = rv___{1} {{ *({0}) = v___; {2} }} }}",
                     arg.code, i, set_flag
                 )
             };
@@ -478,10 +478,10 @@ impl Func {
             "".to_string()
         };
         let assign = if arg.code.contains("&mut ") {
-            format!("*({}) = v; {}", arg.code, set_flag)
+            format!("*({}) = v___; {}", arg.code, set_flag)
         } else {
             format!(
-                "if !({0}).is_null() {{ *({0}) = v; {1} }}",
+                "if !({0}).is_null() {{ *({0}) = v___; {1} }}",
                 arg.code, set_flag
             )
         };
@@ -491,7 +491,7 @@ impl Func {
             SuccValue::Bool(v) => v.to_string(),
         };
         Some(format!(
-            " {{ Ok(v) => {{ {} {} }} Err(v) => v, }}",
+            " {{ Ok(v___) => {{ {} {} }} Err(v___) => v___, }}",
             assign, v
         ))
     }
