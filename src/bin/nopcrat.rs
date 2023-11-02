@@ -26,6 +26,8 @@ struct Args {
     transform: bool,
 
     #[arg(short, long)]
+    print_function: Vec<String>,
+    #[arg(short, long)]
     log_file: Option<PathBuf>,
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -67,6 +69,7 @@ fn main() {
         max_loop_head_states: args.max_loop_head_states.unwrap_or(usize::MAX),
         widening: !args.no_widening,
         verbose: args.verbose,
+        print_functions: args.print_function.into_iter().collect(),
     };
     let analysis_result = if let Some(dump_file) = args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();

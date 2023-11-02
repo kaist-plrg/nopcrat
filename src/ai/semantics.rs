@@ -546,7 +546,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "num", _, "wrapping_div") => args[0].div(&args[1]),
             ("", "num", _, "wrapping_rem") => args[0].rem(&args[1]),
             ("", "num", _, "wrapping_neg") => args[0].neg(),
-            (_, "f64", _, "is_finite" | "is_nan") => AbsValue::top_bool(),
+            (_, "f64", _, "is_finite" | "is_infinite" | "is_nan") => AbsValue::top_bool(),
             ("", "", "AsmCastTrait", "cast_out") => AbsValue::bot(),
             ("", "unix", _, "memcpy") => {
                 let reads2 = self.get_read_paths_of_ptr(&args[1].ptrv, &[]);

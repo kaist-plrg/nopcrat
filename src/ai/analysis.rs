@@ -26,11 +26,12 @@ use crate::{
     rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AnalysisConfig {
     pub max_loop_head_states: usize,
     pub widening: bool,
     pub verbose: bool,
+    pub print_functions: BTreeSet<String>,
 }
 
 impl Default for AnalysisConfig {
@@ -39,6 +40,7 @@ impl Default for AnalysisConfig {
             max_loop_head_states: 1,
             widening: true,
             verbose: false,
+            print_functions: BTreeSet::new(),
         }
     }
 }
@@ -163,7 +165,6 @@ pub fn analyze(
 
             let mut need_rerun = false;
             for def_id in def_ids {
-                tracing::info!("{:?}", def_id);
                 let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
                 let body = tcx.optimized_mir(*def_id);
                 if conf.verbose {
@@ -180,7 +181,18 @@ pub fn analyze(
                     writes_map,
                     init_state,
                 } = analyzer.analyze_body(body);
-                tracing::info!("\n{}", analysis_result_to_string(body, &states).unwrap());
+                tracing::info!(
+                    "{:?}\n{}",
+                    def_id,
+                    analysis_result_to_string(body, &states).unwrap()
+                );
+                if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
+                    println!(
+                        "{:?}\n{}",
+                        def_id,
+                        analysis_result_to_string(body, &states).unwrap()
+                    );
+                }
 
                 let return_states = return_location(body)
                     .and_then(|ret| states.get(&ret))
@@ -578,7 +590,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     .get(&label.location)
                     .and_then(|states| states.get(&label.writes))
                     .unwrap_or(&bot);
-                tracing::info!("\n{:?}\n{:?}", label, state);
                 let Location {
                     block,
                     statement_index,
@@ -1104,7 +1115,6 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
                 vec![curr]
             }
         } else {
-            tracing::warn!("unknown field access");
             vec![]
         }
     } else {
