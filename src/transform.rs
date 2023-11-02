@@ -278,13 +278,14 @@ fn transform(
 
             let mut binding = func.call_binding();
             if mtch.is_some() {
-                binding = "match ".to_string() + &binding;
+                binding = "(match ".to_string() + &binding;
             }
             fix(span.shrink_to_lo(), binding);
 
             let mut assign = func.call_assign(&args, &assign_map);
             if let Some(m) = &mtch {
                 assign += m;
+                assign += ")";
             }
             fix(span.shrink_to_hi(), assign);
         }
@@ -429,9 +430,9 @@ impl Func {
             xs.push(format!("rv___{}", i));
         }
         if xs.len() == 1 {
-            format!("{{ let {} = ", xs.pop().unwrap())
+            format!("({{ let {} = ", xs.pop().unwrap())
         } else {
-            mk_string(xs.iter(), "{ let (", ", ", ") = ")
+            mk_string(xs.iter(), "({ let (", ", ", ") = ")
         }
     }
 
@@ -476,7 +477,7 @@ impl Func {
             };
             assigns.push(assign);
         }
-        let end = if self.is_unit { " }" } else { " rv___ }" };
+        let end = if self.is_unit { " })" } else { " rv___ })" };
         mk_string(assigns.iter(), "; ", " ", end)
     }
 
