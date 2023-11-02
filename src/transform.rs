@@ -6,8 +6,8 @@ use std::{
 use etrace::some_or;
 use rustc_ast::LitKind;
 use rustc_hir::{
-    def::Res, intravisit::Visitor as HVisitor, BinOp, BinOpKind, Expr, ExprKind, FnRetTy, HirId,
-    ItemKind, MutTy, Node, PatKind, PathSegment, QPath, TyKind,
+    def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
+    MutTy, Node, PatKind, QPath, TyKind,
 };
 use rustc_middle::{
     hir::nested_filter,
@@ -357,18 +357,6 @@ fn transform(
             let ret_v = func.return_value(None);
             fix(span, ret_v);
         }
-
-        for check in visitor.null_checks {
-            let NullCheck {
-                span,
-                hir_id,
-                value,
-            } = check;
-            if !func.hir_id_map.contains_key(&hir_id) {
-                continue;
-            }
-            fix(span, value.to_string());
-        }
     }
     suggestions.retain(|_, v| !v.is_empty());
     for suggestions in suggestions.values_mut() {
@@ -584,18 +572,10 @@ struct Arg {
     code: String,
 }
 
-#[derive(Debug)]
-struct NullCheck {
-    span: Span,
-    hir_id: HirId,
-    value: bool,
-}
-
 struct BodyVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     returns: Vec<Return>,
     calls: Vec<Call>,
-    null_checks: Vec<NullCheck>,
 }
 
 impl<'tcx> BodyVisitor<'tcx> {
@@ -604,7 +584,6 @@ impl<'tcx> BodyVisitor<'tcx> {
             tcx,
             returns: vec![],
             calls: vec![],
-            null_checks: vec![],
         }
     }
 }
@@ -651,60 +630,6 @@ impl<'tcx> BodyVisitor<'tcx> {
         };
         self.calls.push(call);
     }
-
-    fn visit_expr_binary(
-        &mut self,
-        expr: &'tcx Expr<'tcx>,
-        op: BinOp,
-        l: &'tcx Expr<'tcx>,
-        r: &'tcx Expr<'tcx>,
-    ) {
-        let value = match op.node {
-            BinOpKind::Eq => false,
-            BinOpKind::Ne => true,
-            _ => return,
-        };
-        let l = remove_cast(l);
-        let r = remove_cast(r);
-        let (x, n) = if let (Some(x), Some(n)) = (expr_to_path(l), as_int_lit(r)) {
-            (x, n)
-        } else if let (Some(x), Some(n)) = (expr_to_path(r), as_int_lit(l)) {
-            (x, n)
-        } else {
-            return;
-        };
-        if n != 0 {
-            return;
-        }
-        let Res::Local(hir_id) = x.res else { return };
-        let check = NullCheck {
-            span: expr.span,
-            hir_id,
-            value,
-        };
-        self.null_checks.push(check);
-    }
-
-    fn visit_expr_method_call(
-        &mut self,
-        expr: &'tcx Expr<'tcx>,
-        seg: &'tcx PathSegment<'tcx>,
-        receiver: &'tcx Expr<'tcx>,
-        _: &'tcx [Expr<'tcx>],
-        _: Span,
-    ) {
-        if seg.ident.name.to_ident_string() != "is_null" {
-            return;
-        }
-        let path = some_or!(expr_to_path(receiver), return);
-        let Res::Local(hir_id) = path.res else { return };
-        let check = NullCheck {
-            span: expr.span,
-            hir_id,
-            value: false,
-        };
-        self.null_checks.push(check);
-    }
 }
 
 impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
@@ -718,10 +643,6 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
         match expr.kind {
             ExprKind::Ret(e) => self.visit_expr_ret(expr, e),
             ExprKind::Call(callee, args) => self.visit_expr_call(expr, callee, args),
-            ExprKind::Binary(op, l, r) => self.visit_expr_binary(expr, op, l, r),
-            ExprKind::MethodCall(seg, receiver, args, span) => {
-                self.visit_expr_method_call(expr, seg, receiver, args, span)
-            }
             _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
