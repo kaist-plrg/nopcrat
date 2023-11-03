@@ -18,7 +18,7 @@ use rustc_middle::{
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::DefId, Span};
+use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
@@ -181,16 +181,11 @@ pub fn analyze(
                     writes_map,
                     init_state,
                 } = analyzer.analyze_body(body);
-                tracing::info!(
-                    "{:?}\n{}",
-                    def_id,
-                    analysis_result_to_string(body, &states).unwrap()
-                );
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
-                    println!(
+                    tracing::info!(
                         "{:?}\n{}",
                         def_id,
-                        analysis_result_to_string(body, &states).unwrap()
+                        analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
 
@@ -930,6 +925,7 @@ impl TypeInfo {
 fn analysis_result_to_string(
     body: &Body<'_>,
     states: &BTreeMap<Location, BTreeMap<MustPathSet, AbsState>>,
+    source_map: &SourceMap,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut res = String::new();
     for block in body.basic_blocks.indices() {
@@ -946,6 +942,9 @@ fn analysis_result_to_string(
                 }
             }
             writeln!(&mut res, "{:?}", stmt)?;
+            if let Ok(s) = source_map.span_to_snippet(stmt.source_info.span) {
+                writeln!(&mut res, "{}", s)?;
+            }
         }
         if let Some(terminator) = bbd.terminator.as_ref() {
             let location = Location {
@@ -958,6 +957,9 @@ fn analysis_result_to_string(
                 }
             }
             writeln!(&mut res, "{:?}", terminator)?;
+            if let Ok(s) = source_map.span_to_snippet(terminator.source_info.span) {
+                writeln!(&mut res, "{}", s)?;
+            }
         }
     }
     Ok(res)

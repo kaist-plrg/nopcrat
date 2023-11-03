@@ -148,8 +148,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     (new_states, ret_writes)
                 } else {
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
+                    let reads2 = args
+                        .iter()
+                        .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
+                    reads.extend(reads2);
                     new_state.add_reads(reads.into_iter());
                     let writes = new_state.add_writes(writes.into_iter());
+                    for arg in &args {
+                        self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
+                    }
                     (vec![new_state], writes)
                 };
                 let locations = if new_states.is_empty() {
