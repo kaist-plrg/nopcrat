@@ -69,9 +69,9 @@ fn transform(
                 } = param;
                 let param = &body.params[*index];
 
-                let assign_writes: Vec<_> = complete_writes
+                let writes: Vec<_> = complete_writes
                     .iter()
-                    .filter_map(|cw| {
+                    .map(|cw| {
                         let CompleteWrite {
                             block: bb,
                             statement_index: i,
@@ -79,9 +79,9 @@ fn transform(
                         } = cw;
                         let bbd = &mir_body.basic_blocks[BasicBlock::from_usize(*bb)];
                         if *i != bbd.statements.len() {
-                            Some(bbd.statements[*i].source_info.span)
+                            bbd.statements[*i].source_info.span
                         } else {
-                            None
+                            bbd.terminator().source_info.span
                         }
                     })
                     .collect();
@@ -125,7 +125,7 @@ fn transform(
                 };
                 let param = Param {
                     must: *must,
-                    assign_writes,
+                    writes,
                     write_args,
                     name,
                     ty,
@@ -175,10 +175,11 @@ fn transform(
         let body = hir.body(body_id);
         let curr = funcs.get(&def_id);
 
-        let mut ret_call_spans = BTreeSet::new();
-
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
+
+        let mut ret_call_spans = BTreeSet::new();
+        let mut call_spans = BTreeSet::new();
 
         for call in visitor.calls {
             let Call {
@@ -188,6 +189,7 @@ fn transform(
                 args,
             } = call;
             let func = some_or!(funcs.get(&callee), continue);
+            call_spans.insert(span);
 
             for index in func.index_map.keys() {
                 let span = to_comma(args[*index].span, source_map);
@@ -335,7 +337,10 @@ fn transform(
         fix(span, local_vars);
 
         for param in func.params() {
-            for span in &param.assign_writes {
+            for span in &param.writes {
+                if call_spans.contains(span) {
+                    continue;
+                }
                 let pos = span.hi() + BytePos(1);
                 let span = span.with_hi(pos).with_lo(pos);
                 let assign = format!("{0}___s = true;", param.name);
@@ -376,7 +381,7 @@ fn transform(
 #[derive(Debug, Clone)]
 struct Param {
     must: bool,
-    assign_writes: Vec<Span>,
+    writes: Vec<Span>,
     write_args: BTreeMap<Span, usize>,
     span: Span,
     hir_id: HirId,
