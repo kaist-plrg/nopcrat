@@ -88,6 +88,10 @@ fn main() {
         }
     }
     println!("{}", analysis_result.len());
+    println!(
+        "{}",
+        analysis_result.values().map(|v| v.len()).sum::<usize>()
+    );
 
     if let Some(dump_file) = args.dump_analysis_result {
         let dump_file = File::create(dump_file).unwrap();
