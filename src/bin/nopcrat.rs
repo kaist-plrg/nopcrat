@@ -105,7 +105,10 @@ fn clear_dir(path: &Path) {
     for entry in fs::read_dir(path).unwrap() {
         let entry_path = entry.unwrap().path();
         if entry_path.is_dir() {
-            fs::remove_dir_all(entry_path).unwrap();
+            let name = entry_path.file_name().unwrap();
+            if name != "target" {
+                fs::remove_dir_all(entry_path).unwrap();
+            }
         } else {
             fs::remove_file(entry_path).unwrap();
         }
