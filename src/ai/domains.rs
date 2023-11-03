@@ -2732,6 +2732,15 @@ impl AbsPtr {
         Self::alpha(AbsPlace::arg(i))
     }
 
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        let Self::Set(ptrs) = self else { return false };
+        if ptrs.len() != 1 {
+            return false;
+        }
+        matches!(ptrs.first().unwrap().base, AbsBase::Null)
+    }
+
     pub fn get_arg(&self) -> Option<usize> {
         if let Self::Set(ptrs) = self {
             if ptrs.len() == 1 {
