@@ -137,8 +137,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         );
                         ret_writes.extend(writes);
                         for state in states {
-                            let writes = state.writes.clone();
-                            new_states_map.entry(writes).or_default().push(state);
+                            let wn = (state.writes.clone(), state.nulls.clone());
+                            new_states_map.entry(wn).or_default().push(state);
                         }
                     }
                     let new_states = new_states_map
@@ -201,8 +201,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let mut offsets = vec![];
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
-        let v = if callee.is_local() {
-            if let Some(summary) = self.summaries.get(&callee) {
+        let vns = if callee.is_local() {
+            let v = if let Some(summary) = self.summaries.get(&callee) {
                 return self
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
@@ -211,7 +211,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 self.transfer_method_call(callee, args, &mut reads)
             } else {
                 AbsValue::top()
-            }
+            };
+            vec![(v, None)]
         } else {
             self.transfer_rust_call(
                 callee,
@@ -222,11 +223,21 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 &mut writes,
             )
         };
-        let (mut new_state, writes_ret) = self.assign(dst, v, &state);
-        new_state.add_excludes(offsets.into_iter());
-        new_state.add_reads(reads.into_iter());
-        let writes = new_state.add_writes(writes.into_iter().chain(writes_ret));
-        (vec![new_state], writes)
+        let (new_states, writess): (Vec<_>, Vec<_>) = vns
+            .into_iter()
+            .map(|(v, null)| {
+                let (mut new_state, writes_ret) = self.assign(dst, v, &state);
+                new_state.add_excludes(offsets.iter().cloned());
+                new_state.add_reads(reads.iter().cloned());
+                let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
+                if let Some(null) = null {
+                    new_state.add_null(null);
+                }
+                (new_state, writes)
+            })
+            .unzip();
+        let writes = writess.into_iter().flatten().collect();
+        (new_states, writes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -432,14 +443,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         offsets: &mut Vec<AbsPath>,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
-    ) -> AbsValue {
+    ) -> Vec<(AbsValue, Option<usize>)> {
         let name = self.def_id_to_string(callee);
         let mut segs: Vec<_> = name.split("::").collect();
         let segs0 = segs.pop().unwrap_or_default();
         let segs1 = segs.pop().unwrap_or_default();
         let segs2 = segs.pop().unwrap_or_default();
         let segs3 = segs.pop().unwrap_or_default();
-        match (segs3, segs2, segs1, segs0) {
+        let v = match (segs3, segs2, segs1, segs0) {
             ("", "slice", _, "as_mut_ptr" | "as_ptr") => {
                 let ptr = if let Some(ptrs) = args[0].ptrv.gamma() {
                     AbsPtr::alphas(
@@ -479,12 +490,35 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsValue::ptr(ptr)
             }
             ("ptr", "mut_ptr" | "const_ptr", _, "is_null") => {
-                let b = if let Some(ptrs) = args[0].ptrv.gamma() {
-                    AbsBool::alphas(ptrs.iter().map(|ptr| ptr.is_null()).collect())
+                if let Some(ptrs) = args[0].ptrv.gamma() {
+                    let t = ptrs.iter().any(|p| p.is_null());
+                    let f = ptrs.iter().any(|p| !p.is_null());
+                    let args: BTreeSet<_> = ptrs
+                        .iter()
+                        .filter_map(|p| {
+                            if !p.projection.is_empty() {
+                                return None;
+                            }
+                            let AbsBase::Arg(i) = p.base else { return None };
+                            Some(i)
+                        })
+                        .collect();
+                    if args.len() == 1 && !t {
+                        let arg = *args.first().unwrap();
+                        return vec![
+                            (AbsValue::bool_true(), Some(arg)),
+                            (AbsValue::bool_false(), None),
+                        ];
+                    }
+                    match (t, f) {
+                        (true, true) => AbsValue::top_bool(),
+                        (true, false) => AbsValue::bool_true(),
+                        (false, true) => AbsValue::bool_false(),
+                        (false, false) => AbsValue::bot(),
+                    }
                 } else {
-                    AbsBool::Top
-                };
-                AbsValue::boolean(b)
+                    AbsValue::top_bool()
+                }
             }
             ("ptr", "mut_ptr" | "const_ptr", _, "offset_from") => AbsValue::top_int(),
             ("", "", "ptr", "write_volatile") => {
@@ -601,7 +635,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsValue::top_bool()
             }
             _ => todo!("{}", name),
-        }
+        };
+        vec![(v, None)]
     }
 
     fn transfer_rvalue(

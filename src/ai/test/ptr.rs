@@ -472,7 +472,7 @@ fn test_is_null_param() {
         }
     ";
     let result = analyze(code);
-    assert_eq!(result.len(), 1);
+    assert_eq!(result.len(), 2);
     assert_eq!(as_int(ret(&result[0])), vec![1]);
 }
 

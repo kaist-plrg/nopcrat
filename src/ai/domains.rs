@@ -17,6 +17,7 @@ pub struct AbsState {
     pub excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
+    pub nulls: MustPathSet,
 }
 
 impl AbsState {
@@ -25,9 +26,10 @@ impl AbsState {
         Self {
             local: AbsLocal::bot(),
             args: AbsArgs::bot(),
+            excludes: MayPathSet::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
-            excludes: MayPathSet::bot(),
+            nulls: MustPathSet::bot(),
         }
     }
 
@@ -35,9 +37,10 @@ impl AbsState {
         Self {
             local: self.local.join(&other.local),
             args: self.args.join(&other.args),
+            excludes: self.excludes.join(&other.excludes),
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
-            excludes: self.excludes.join(&other.excludes),
+            nulls: self.nulls.join(&other.nulls),
         }
     }
 
@@ -45,18 +48,20 @@ impl AbsState {
         Self {
             local: self.local.widen(&other.local),
             args: self.args.widen(&other.args),
+            excludes: self.excludes.widen(&other.excludes),
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
-            excludes: self.excludes.widen(&other.excludes),
+            nulls: self.nulls.widen(&other.nulls),
         }
     }
 
     pub fn ord(&self, other: &Self) -> bool {
         self.local.ord(&other.local)
             && self.args.ord(&other.args)
+            && self.excludes.ord(&other.excludes)
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
-            && self.excludes.ord(&other.excludes)
+            && self.nulls.ord(&other.nulls)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -100,6 +105,13 @@ impl AbsState {
             }
         }
         res
+    }
+
+    pub fn add_null(&mut self, i: usize) {
+        let path = AbsPath(vec![i]);
+        if !self.reads.contains(&path) && !self.excludes.contains(&path) {
+            self.nulls.insert(path)
+        }
     }
 }
 
