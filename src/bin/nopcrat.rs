@@ -87,11 +87,17 @@ fn main() {
             }
         }
     }
-    println!("{}", analysis_result.len());
-    println!(
-        "{}",
-        analysis_result.values().map(|v| v.len()).sum::<usize>()
-    );
+
+    let fns = analysis_result.len();
+    let musts = analysis_result
+        .values()
+        .map(|v| v.iter().filter(|p| p.must).count())
+        .sum::<usize>();
+    let mays = analysis_result
+        .values()
+        .map(|v| v.iter().filter(|p| !p.must).count())
+        .sum::<usize>();
+    println!("{} {} {}", fns, musts, mays);
 
     if let Some(dump_file) = args.dump_analysis_result {
         let dump_file = File::create(dump_file).unwrap();
