@@ -499,8 +499,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             if !p.projection.is_empty() {
                                 return None;
                             }
-                            let AbsBase::Arg(i) = p.base else { return None };
-                            Some(i)
+                            let (path, _) = AbsPath::from_place(p, &self.ptr_params)?;
+                            Some(path.0[0])
                         })
                         .collect();
                     if args.len() == 1 && !t {

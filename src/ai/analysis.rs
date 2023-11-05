@@ -216,9 +216,14 @@ pub fn analyze(
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
                     let summary = &summaries[def_id];
                     let return_ptrs = analyzer.get_return_ptrs(summary);
-                    let mut output_params =
-                        analyzer.find_output_params(summary, &return_ptrs, *def_id);
                     let result = results.remove(def_id).unwrap();
+                    let nullable_params = analyzer.find_nullable_params(&result);
+                    let mut output_params = analyzer.find_output_params(
+                        summary,
+                        &return_ptrs,
+                        &nullable_params,
+                        *def_id,
+                    );
                     let writes_map = wm_map.remove(def_id).unwrap();
                     let call_args = call_args_map.remove(def_id).unwrap();
                     for p in &mut output_params {
@@ -326,15 +331,49 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
+    fn find_nullable_params(
+        &self,
+        result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+    ) -> BTreeSet<usize> {
+        let mut nonnull_locs = vec![BTreeSet::new(); self.info.inputs];
+        let mut null_locs = vec![BTreeSet::new(); self.info.inputs];
+        for (loc, sts) in result {
+            for (_, nulls) in sts.keys() {
+                for i in 0..self.info.inputs {
+                    let path = AbsPath(vec![i + 1]);
+                    if nulls.contains(&path) {
+                        null_locs[i].insert(*loc);
+                    } else {
+                        nonnull_locs[i].insert(*loc);
+                    }
+                }
+            }
+        }
+        nonnull_locs
+            .into_iter()
+            .zip(null_locs)
+            .enumerate()
+            .filter_map(|(i, (nonnull, null))| {
+                if null.is_subset(&nonnull) {
+                    None
+                } else {
+                    Some(i + 1)
+                }
+            })
+            .collect()
+    }
+
     fn find_output_params(
         &self,
         summary: &FunctionSummary,
         return_ptrs: &BTreeSet<usize>,
+        nullable_ptrs: &BTreeSet<usize>,
         def_id: DefId,
     ) -> Vec<OutputParam> {
-        if self.info.fn_ptr {
+        if self.info.fn_ptr || summary.return_states.values().any(|st| st.writes.is_bot()) {
             return vec![];
         }
+
         let reads: BTreeSet<_> = summary
             .return_states
             .values()
@@ -347,96 +386,89 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .flat_map(|st| st.excludes.as_set())
             .map(|p| p.base())
             .collect();
-        if summary.return_states.values().any(|st| st.writes.is_bot()) {
-            return vec![];
-        }
-        let expanded_map: BTreeMap<_, BTreeSet<_>> = (1..=self.info.inputs)
-            .map(|i| {
-                let expanded = self
-                    .expands_path(&AbsPath(vec![i]))
-                    .into_iter()
-                    .map(|p| p.0)
-                    .collect();
-                (i, expanded)
-            })
-            .collect();
-        let writes: Vec<BTreeMap<_, _>> = summary
-            .return_states
-            .values()
-            .map(|st| {
-                let writes = st.writes.as_set();
-                let mut per_base: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-                for w in writes {
-                    per_base.entry(w.base()).or_default().insert(w.0.clone());
-                }
-                expanded_map
-                    .iter()
-                    .map(|(i, paths)| {
-                        let w = if let Some(ws) = per_base.get(i) {
-                            if ws == paths {
-                                Write::All
-                            } else {
-                                Write::Partial
-                            }
-                        } else {
-                            Write::None
-                        };
-                        (*i, w)
-                    })
-                    .collect()
-            })
-            .collect();
+
         let body = self.tcx.optimized_mir(def_id);
-        let writes: BTreeSet<_> = (1..=self.info.inputs)
-            .filter(|i| {
-                let ws: BTreeSet<_> = writes.iter().map(|map| map[i]).collect();
-                !reads.contains(i)
-                    && !excludes.contains(i)
-                    && !return_ptrs.contains(i)
-                    && self.info.param_tys[*i] != TypeInfo::Union
-                    && ws.contains(&Write::All)
-                    && !ws.contains(&Write::Partial)
-                    && {
-                        let ty = &body.local_decls[Local::from_usize(*i)].ty;
-                        let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() else {
-                            unreachable!("{:?}", ty);
+        let mut writes = vec![];
+        for i in 1..=self.info.inputs {
+            if reads.contains(&i)
+                || excludes.contains(&i)
+                || return_ptrs.contains(&i)
+                || nullable_ptrs.contains(&i)
+                || self.info.param_tys[i] == TypeInfo::Union
+            {
+                continue;
+            }
+
+            let ty = &body.local_decls[Local::from_usize(i)].ty;
+            let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() else {
+                continue;
+            };
+            if ty.is_c_void(self.tcx) {
+                continue;
+            }
+
+            let expanded: BTreeSet<_> = self
+                .expands_path(&AbsPath(vec![i]))
+                .into_iter()
+                .map(|p| p.0)
+                .collect();
+            let wrs: Vec<_> = summary
+                .return_states
+                .values()
+                .filter_map(|st| {
+                    if st.nulls.contains(&AbsPath(vec![i])) {
+                        None
+                    } else {
+                        let writes: BTreeSet<_> = st
+                            .writes
+                            .iter()
+                            .filter_map(|p| {
+                                if p.base() == i {
+                                    Some(p.0.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        let w = if writes.is_empty() {
+                            Write::None
+                        } else if writes == expanded {
+                            Write::All
+                        } else {
+                            Write::Partial
                         };
-                        !ty.is_c_void(self.tcx)
+                        let rv = st.local.get(0).clone();
+                        Some((w, rv))
                     }
-            })
-            .collect();
+                })
+                .collect();
+
+            if wrs.iter().any(|(w, _)| *w == Write::All)
+                && wrs.iter().all(|(w, _)| *w != Write::Partial)
+            {
+                writes.push((i, wrs));
+            }
+        }
         if writes.is_empty() {
             return vec![];
         }
-        let ret_writes: Vec<_> = summary
-            .return_states
-            .values()
-            .map(|st| {
-                let mut writes2: BTreeSet<_> =
-                    st.writes.as_set().iter().map(|w| w.base()).collect();
-                writes2.retain(|w| writes.contains(w));
-                (st.local.get(0).clone(), writes2)
-            })
-            .collect();
+
         let ret_ty = &body.local_decls[Local::from_usize(0)].ty;
         writes
             .into_iter()
-            .map(|index| {
-                let must = ret_writes.iter().all(|(_, writes)| writes.contains(&index));
+            .map(|(index, wrs)| {
+                let must = wrs.iter().all(|(w, _)| *w == Write::All);
                 let return_values = if !must {
-                    let (wst, nwst): (Vec<_>, Vec<_>) = ret_writes
-                        .iter()
-                        .partition(|(_, writes)| writes.contains(&index));
+                    let (wst, nwst): (Vec<_>, Vec<_>) =
+                        wrs.into_iter().partition(|(w, _)| *w == Write::All);
                     let w = wst
                         .into_iter()
-                        .map(|(v, _)| v)
-                        .cloned()
+                        .map(|(_, v)| v)
                         .reduce(|a, b| a.join(&b))
                         .unwrap();
                     let nw = nwst
                         .into_iter()
-                        .map(|(v, _)| v)
-                        .cloned()
+                        .map(|(_, v)| v)
                         .reduce(|a, b| a.join(&b))
                         .unwrap();
                     match ret_ty.kind() {
