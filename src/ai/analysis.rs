@@ -189,6 +189,10 @@ pub fn analyze(
                     );
                 }
                 let nullable_params = analyzer.find_nullable_params(&states);
+                let nullable_paths: Vec<_> = nullable_params
+                    .iter()
+                    .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
+                    .collect();
 
                 let mut return_states = return_location(body)
                     .and_then(|ret| states.get(&ret))
@@ -196,6 +200,7 @@ pub fn analyze(
                     .unwrap_or_default();
                 for st in return_states.values_mut() {
                     st.writes.remove(&nullable_params);
+                    st.add_excludes(nullable_paths.iter().cloned());
                 }
                 let summary = FunctionSummary::new(init_state, return_states);
                 results.insert(*def_id, states);
