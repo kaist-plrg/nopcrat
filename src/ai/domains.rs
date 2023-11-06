@@ -3076,9 +3076,9 @@ impl MustPathSet {
     }
 
     #[inline]
-    pub fn remove(&mut self, place: &AbsPath) {
+    pub fn remove(&mut self, base: &BTreeSet<usize>) {
         if let Self::Set(set) = self {
-            set.remove(place);
+            set.retain(|p| !base.contains(&p.base()));
         }
     }
 

@@ -153,7 +153,7 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        println!("{:.2}s", self.start.elapsed().as_secs_f64());
+        println!("{:.3}s", self.start.elapsed().as_secs_f64());
     }
 }
 

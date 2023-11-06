@@ -188,11 +188,15 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
+                let nullable_params = analyzer.find_nullable_params(&states);
 
-                let return_states = return_location(body)
+                let mut return_states = return_location(body)
                     .and_then(|ret| states.get(&ret))
                     .cloned()
                     .unwrap_or_default();
+                for st in return_states.values_mut() {
+                    st.writes.remove(&nullable_params);
+                }
                 let summary = FunctionSummary::new(init_state, return_states);
                 results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
@@ -216,16 +220,11 @@ pub fn analyze(
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
                     let summary = &summaries[def_id];
                     let return_ptrs = analyzer.get_return_ptrs(summary);
-                    let result = results.remove(def_id).unwrap();
-                    let nullable_params = analyzer.find_nullable_params(&result);
-                    let mut output_params = analyzer.find_output_params(
-                        summary,
-                        &return_ptrs,
-                        &nullable_params,
-                        *def_id,
-                    );
+                    let mut output_params =
+                        analyzer.find_output_params(summary, &return_ptrs, *def_id);
                     let writes_map = wm_map.remove(def_id).unwrap();
                     let call_args = call_args_map.remove(def_id).unwrap();
+                    let result = results.remove(def_id).unwrap();
                     for p in &mut output_params {
                         analyzer.find_complete_write(p, &result, &writes_map, &call_args, *def_id);
                     }
@@ -367,7 +366,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         summary: &FunctionSummary,
         return_ptrs: &BTreeSet<usize>,
-        nullable_ptrs: &BTreeSet<usize>,
         def_id: DefId,
     ) -> Vec<OutputParam> {
         if self.info.fn_ptr || summary.return_states.values().any(|st| st.writes.is_bot()) {
@@ -393,7 +391,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if reads.contains(&i)
                 || excludes.contains(&i)
                 || return_ptrs.contains(&i)
-                || nullable_ptrs.contains(&i)
                 || self.info.param_tys[i] == TypeInfo::Union
             {
                 continue;
