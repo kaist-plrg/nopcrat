@@ -24,6 +24,10 @@ struct Args {
 
     #[arg(short, long)]
     transform: bool,
+    #[arg(short, long)]
+    size: bool,
+    #[arg(long)]
+    time: bool,
 
     #[arg(short, long)]
     print_function: Vec<String>,
@@ -35,8 +39,8 @@ struct Args {
 }
 
 fn main() {
-    let _t = Timer::new();
     let mut args = Args::parse();
+    let _t = Timer::new(args.time);
 
     if let Some(log) = args.log_file {
         let log_file = File::create(log).unwrap();
@@ -65,6 +69,11 @@ fn main() {
     }
     assert!(path.is_file());
 
+    if args.size {
+        size::size_path(path);
+        return;
+    }
+
     let conf = ai::analysis::AnalysisConfig {
         max_loop_head_states: args.max_loop_head_states.unwrap_or(usize::MAX),
         widening: !args.no_widening,
@@ -77,7 +86,6 @@ fn main() {
     } else {
         ai::analysis::analyze_path(path, &conf)
     };
-    // let analysis_result = ai::analysis::analyze_code("");
 
     if args.verbose {
         for (func, params) in &analysis_result {
@@ -140,12 +148,14 @@ fn copy_dir(src: &Path, dst: &Path, root: bool) {
 }
 
 struct Timer {
+    show: bool,
     start: Instant,
 }
 
 impl Timer {
-    fn new() -> Self {
+    fn new(show: bool) -> Self {
         Self {
+            show,
             start: Instant::now(),
         }
     }
@@ -153,7 +163,9 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        println!("{:.3}s", self.start.elapsed().as_secs_f64());
+        if self.show {
+            println!("{:.3}s", self.start.elapsed().as_secs_f64());
+        }
     }
 }
 
