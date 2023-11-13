@@ -28,6 +28,8 @@ struct Args {
     size: bool,
     #[arg(long)]
     time: bool,
+    #[arg(long)]
+    function_times: Option<usize>,
 
     #[arg(short, long)]
     print_function: Vec<String>,
@@ -79,6 +81,7 @@ fn main() {
         widening: !args.no_widening,
         verbose: args.verbose,
         print_functions: args.print_function.into_iter().collect(),
+        function_times: args.function_times,
     };
     let analysis_result = if let Some(dump_file) = args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();

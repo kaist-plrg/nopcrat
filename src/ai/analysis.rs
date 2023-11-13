@@ -32,6 +32,7 @@ pub struct AnalysisConfig {
     pub widening: bool,
     pub verbose: bool,
     pub print_functions: BTreeSet<String>,
+    pub function_times: Option<usize>,
 }
 
 impl Default for AnalysisConfig {
@@ -41,6 +42,7 @@ impl Default for AnalysisConfig {
             widening: true,
             verbose: false,
             print_functions: BTreeSet::new(),
+            function_times: None,
         }
     }
 }
@@ -147,6 +149,7 @@ pub fn analyze(
     let mut results = BTreeMap::new();
     let mut wm_map = BTreeMap::new();
     let mut call_args_map = BTreeMap::new();
+    let mut analysis_times: BTreeMap<_, u128> = BTreeMap::new();
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -165,6 +168,8 @@ pub fn analyze(
 
             let mut need_rerun = false;
             for def_id in def_ids {
+                let start = std::time::Instant::now();
+
                 let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
                 let body = tcx.optimized_mir(*def_id);
                 if conf.verbose {
@@ -217,6 +222,8 @@ pub fn analyze(
                 };
                 summaries.insert(*def_id, summary);
                 need_rerun |= updated;
+
+                *analysis_times.entry(*def_id).or_default() += start.elapsed().as_millis();
             }
 
             if !need_rerun {
@@ -237,6 +244,17 @@ pub fn analyze(
                 }
                 break;
             }
+        }
+    }
+    if let Some(n) = &conf.function_times {
+        let mut analysis_times: Vec<_> = analysis_times.into_iter().collect();
+        analysis_times.sort_by_key(|(_, t)| u128::MAX - *t);
+        for (def_id, t) in analysis_times.iter().take(*n) {
+            let f = tcx.def_path(*def_id).to_string_no_crate_verbose();
+            let body = tcx.optimized_mir(*def_id);
+            let blocks = body.basic_blocks.len();
+            let stmts = body_size(body);
+            println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
     }
 
