@@ -263,9 +263,13 @@ fn transform(
                 }
             } else if let Some(expr) = get_parent_return(hir_id, tcx) {
                 if let Some(func) = curr {
+                    let arm = matches!(tcx.hir().find_parent(expr.hir_id), Some(Node::Arm(_)));
                     ret_call_spans.insert(expr.span);
                     let pre_span = expr.span.with_hi(span.lo());
-                    fix(pre_span, "let mut rv___ =".to_string());
+                    fix(
+                        pre_span,
+                        format!("{}let mut rv___ =", if arm { "{ " } else { "" }),
+                    );
 
                     let pre_span = pre_span.with_lo(pre_span.lo() + BytePos(6));
                     let pre_s = source_map.span_to_snippet(pre_span).unwrap();
@@ -276,7 +280,10 @@ fn transform(
                     let post_span = post_span.with_hi(post_span.hi() + BytePos(1));
                     let rv = format!("{}rv___{}", pre_s, post_s);
                     let rv = func.return_value(Some(rv));
-                    fix(post_span, format!("; return {};", rv));
+                    fix(
+                        post_span,
+                        format!("; return {};{}", rv, if arm { " }" } else { "" }),
+                    );
                 }
             }
 
@@ -316,15 +323,15 @@ fn transform(
                 if param.must {
                     format!(
                         "
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
     let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
                 } else {
                     format!(
                         "
-    let mut {0}___s: bool = false;
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
     let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
