@@ -7,6 +7,7 @@ use std::{
 
 use clap::Parser;
 use nopcrat::*;
+use rand::prelude::*;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,6 +27,12 @@ struct Args {
     transform: bool,
     #[arg(short, long)]
     size: bool,
+    #[arg(long)]
+    sample_negative: bool,
+    #[arg(long)]
+    sample_may: bool,
+    #[arg(long)]
+    sample_must: bool,
     #[arg(long)]
     time: bool,
     #[arg(long)]
@@ -83,7 +90,7 @@ fn main() {
         print_functions: args.print_function.into_iter().collect(),
         function_times: args.function_times,
     };
-    let analysis_result = if let Some(dump_file) = args.use_analysis_result {
+    let analysis_result = if let Some(dump_file) = &args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();
         serde_json::from_reader(dump_file).unwrap()
     } else {
@@ -99,16 +106,38 @@ fn main() {
         }
     }
 
-    let fns = analysis_result.len();
-    let musts = analysis_result
-        .values()
-        .map(|v| v.iter().filter(|p| p.must).count())
-        .sum::<usize>();
-    let mays = analysis_result
-        .values()
-        .map(|v| v.iter().filter(|p| !p.must).count())
-        .sum::<usize>();
-    println!("{} {} {}", fns, musts, mays);
+    if args.sample_negative {
+        let mut fns = sampling::sample_from_path(path, &analysis_result);
+        fns.shuffle(&mut thread_rng());
+        for f in fns.iter().take(10) {
+            println!("{:?}", f);
+        }
+        return;
+    }
+    if args.sample_may || args.sample_must {
+        let mut params: Vec<_> = analysis_result
+            .iter()
+            .filter(|(_, params)| params.iter().any(|p| p.must == args.sample_must))
+            .collect();
+        params.shuffle(&mut thread_rng());
+        for (f, ps) in params.iter().take(10) {
+            println!("{}\n{:?}", f, ps);
+        }
+        return;
+    }
+
+    if args.use_analysis_result.is_none() {
+        let fns = analysis_result.len();
+        let musts = analysis_result
+            .values()
+            .map(|v| v.iter().filter(|p| p.must).count())
+            .sum::<usize>();
+        let mays = analysis_result
+            .values()
+            .map(|v| v.iter().filter(|p| !p.must).count())
+            .sum::<usize>();
+        println!("{} {} {}", fns, musts, mays);
+    }
 
     if let Some(dump_file) = args.dump_analysis_result {
         let dump_file = File::create(dump_file).unwrap();

@@ -55,5 +55,6 @@ extern crate rustc_type_ir;
 pub mod ai;
 pub mod compile_util;
 pub mod graph;
+pub mod sampling;
 pub mod size;
 pub mod transform;
