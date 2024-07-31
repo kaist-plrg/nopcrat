@@ -212,7 +212,10 @@ fn transform(
                     }
 
                     if let Some(expr) = get_parent_return(hir_id, tcx) {
-                        ret_to_ref_spans.entry(expr.span).or_default().push((name, span));
+                        ret_to_ref_spans
+                            .entry(expr.span)
+                            .or_default()
+                            .push((name, span));
                         continue;
                     }
 
@@ -391,23 +394,21 @@ fn transform(
                             param.name, param.ty,
                         )
                     }
+                } else if passes.contains(&param.name) {
+                    format!(
+                        "
+                let mut {0}___s: bool = false; \
+                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
+                let mut {0}: *mut {1} = &mut {0}___v;",
+                        param.name, param.ty,
+                    )
                 } else {
-                    if passes.contains(&param.name) {
-                        format!(
-                            "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-    let mut {0}: *mut {1} = &mut {0}___v;",
-                            param.name, param.ty,
-                        )
-                    } else {
-                        format!(
-                            "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
-                            param.name, param.ty,
-                        )
-                    }
+                    format!(
+                        "
+                let mut {0}___s: bool = false; \
+                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+                        param.name, param.ty,
+                    )
                 }
             })
             .collect();
@@ -432,7 +433,7 @@ fn transform(
             if let Some(spans) = ref_to_spans.get(&param.name) {
                 for span in spans {
                     let assign = format!("{}___v", param.name);
-                    fix(span.clone(), assign);
+                    fix(*span, assign);
                 }
             }
         }
@@ -459,12 +460,12 @@ fn transform(
             let mut rv = format!("{}{}___v{}", pre_s, sorted_ss[0].0, post_s);
 
             for (i, s) in post_spans[1..].iter().enumerate() {
-                let post_s = source_map.span_to_snippet(s.clone()).unwrap();
+                let post_s = source_map.span_to_snippet(*s).unwrap();
                 rv = format!("{}{}___v{}", rv, sorted_ss[i + 1].0, post_s);
             }
             let rv = func.return_value(Some(rv));
 
-            fix(span.clone(), format!("return {}", rv));
+            fix(*span, format!("return {}", rv));
         }
 
         for ret in visitor.returns {
@@ -734,9 +735,9 @@ impl<'tcx> HVisitor<'tcx> for PassVisitor<'tcx> {
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let source_map = self.tcx.sess.source_map();
-        match expr.kind {
-            ExprKind::Path(p) => match source_map.span_to_snippet(p.qself_span()) {
-                Ok(code) => match get_parent(expr.hir_id, self.tcx) {
+        if let ExprKind::Path(p) = expr.kind {
+            if let Ok(code) = source_map.span_to_snippet(p.qself_span()) {
+                match get_parent(expr.hir_id, self.tcx) {
                     Some(e) => {
                         if let ExprKind::Unary(UnOp::Deref, _) = e.kind {
                         } else {
@@ -744,10 +745,8 @@ impl<'tcx> HVisitor<'tcx> for PassVisitor<'tcx> {
                         }
                     }
                     None => self.passes.push(code),
-                },
-                Err(_) => {}
-            },
-            _ => {}
+                }
+            }
         }
         rustc_hir::intravisit::walk_expr(self, expr);
     }
@@ -825,14 +824,11 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let source_map = self.tcx.sess.source_map();
         match expr.kind {
-            ExprKind::Unary(unary, e) => match unary {
-                UnOp::Deref => self.refs.push(Ref {
-                    hir_id: expr.hir_id,
-                    span: expr.span,
-                    name: source_map.span_to_snippet(e.span).unwrap(),
-                }),
-                _ => {}
-            },
+            ExprKind::Unary(UnOp::Deref, e) => self.refs.push(Ref {
+                hir_id: expr.hir_id,
+                span: expr.span,
+                name: source_map.span_to_snippet(e.span).unwrap(),
+            }),
             ExprKind::Ret(e) => self.visit_expr_ret(expr, e),
             ExprKind::Call(callee, args) => self.visit_expr_call(expr, callee, args),
             _ => {}
