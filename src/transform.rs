@@ -14,24 +14,47 @@ use rustc_middle::{
     mir::{BasicBlock, TerminatorKind},
     ty::TyCtxt,
 };
-use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
+use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span, SpanData};
 use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
 
-pub fn transform_path(path: &Path, params: &BTreeMap<String, Vec<OutputParam>>) {
+pub fn transform_path(
+    path: &Path,
+    params: &OutputParams,
+    writes: &BTreeMap<String, Wbrets>,
+) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
-    let suggestions = compile_util::run_compiler(config, |tcx| transform(tcx, params)).unwrap();
+    let suggestions =
+        compile_util::run_compiler(config, |tcx| transform(tcx, params, writes)).unwrap();
     compile_util::apply_suggestions(&suggestions);
 }
 
 fn transform(
     tcx: TyCtxt<'_>,
-    param_map: &BTreeMap<String, Vec<OutputParam>>,
+    param_map: &OutputParams,
+    writes: &BTreeMap<String, Wbrets>,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
+
+    let writes = writes
+        .iter()
+        .map(|(k, v)| {
+            (
+                k,
+                v.iter()
+                    .map(|(k, v)| {
+                        (
+                            unsafe { std::mem::transmute::<i128, SpanData>(*k) }.span(),
+                            v,
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut def_id_ty_map = BTreeMap::new();
     for id in hir.items() {
@@ -48,6 +71,7 @@ fn transform(
     }
 
     let mut funcs = BTreeMap::new();
+    let mut wbrets = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
         let ItemKind::Fn(sig, _, body_id) = item.kind else {
@@ -135,6 +159,24 @@ fn transform(
                 (*index, param)
             })
             .collect();
+        if let Some(write) = writes.get(&name) {
+            wbrets.insert(
+                def_id,
+                write
+                    .clone()
+                    .into_iter()
+                    .map(|(sp, params)| {
+                        (
+                            sp,
+                            params
+                                .iter()
+                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            );
+        }
         let hir_id_map: BTreeMap<_, _> = index_map
             .values()
             .cloned()
@@ -338,7 +380,11 @@ fn transform(
 
                     let post_span = post_span.with_hi(post_span.hi() + BytePos(1));
                     let rv = format!("{}rv___{}", pre_s, post_s);
-                    let rv = func.return_value(Some(rv));
+                    let (_, wbret) = wbrets[&def_id]
+                        .iter()
+                        .find(|(sp, _)| span.contains(**sp))
+                        .unwrap();
+                    let rv = func.return_value(Some(rv), wbret);
                     fix(
                         post_span,
                         format!("; return {};{}", rv, if arm { " }" } else { "" }),
@@ -397,16 +443,16 @@ fn transform(
                 } else if passes.contains(&param.name) {
                     format!(
                         "
-                let mut {0}___s: bool = false; \
-                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-                let mut {0}: *mut {1} = &mut {0}___v;",
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
+    let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
                 } else {
                     format!(
                         "
-                let mut {0}___s: bool = false; \
-                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
                         param.name, param.ty,
                     )
                 }
@@ -463,7 +509,7 @@ fn transform(
                 let post_s = source_map.span_to_snippet(*s).unwrap();
                 rv = format!("{}{}___v{}", rv, sorted_ss[i + 1].0, post_s);
             }
-            let rv = func.return_value(Some(rv));
+            let rv = func.return_value(Some(rv), &[]);
 
             fix(*span, format!("return {}", rv));
         }
@@ -474,14 +520,18 @@ fn transform(
                 continue;
             }
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
-            let ret_v = func.return_value(orig);
+            let (_, wbret) = wbrets[&def_id]
+                .iter()
+                .find(|(sp, _)| span.contains(**sp))
+                .unwrap();
+            let ret_v = func.return_value(orig, wbret);
             fix(span, format!("return {}", ret_v));
         }
 
         if func.is_unit {
             let pos = body.value.span.hi() - BytePos(1);
             let span = body.value.span.with_lo(pos).with_hi(pos);
-            let ret_v = func.return_value(None);
+            let ret_v = func.return_value(None, &[]);
             fix(span, ret_v);
         }
     }
@@ -655,15 +705,19 @@ impl Func {
         }
     }
 
-    fn return_value(&self, orig: Option<String>) -> String {
+    fn return_value(&self, orig: Option<String>, wbret: &[String]) -> String {
         let mut values = vec![];
         if let Some((_, i)) = &self.first_return {
             let orig = orig.unwrap();
             let param = &self.index_map[i];
-            let v = format!(
-                "if {0}___s {{ Ok({0}___v) }} else {{ Err({1}) }}",
-                param.name, orig
-            );
+            let v = if wbret.contains(&param.name) {
+                format!("Ok({}___v)", param.name)
+            } else {
+                format!(
+                    "if {0}___s {{ Ok({0}___v) }} else {{ Err({1}) }}",
+                    param.name, orig
+                )
+            };
             values.push(v);
         } else if let Some(v) = orig {
             values.push(v);
@@ -672,6 +726,8 @@ impl Func {
             let param = &self.index_map[i];
             let v = if param.must {
                 format!("{}___v", param.name)
+            } else if wbret.contains(&param.name) {
+                format!("Some ({}___v)", param.name)
             } else {
                 format!("if {0}___s {{ Some({0}___v) }} else {{ None }}", param.name)
             };

@@ -99,6 +99,13 @@ pub fn span_to_path(span: Span, source_map: &SourceMap) -> Option<PathBuf> {
 pub fn apply_suggestions<P: AsRef<Path>>(suggestions: &BTreeMap<P, Vec<Suggestion>>) {
     for (path, suggestions) in suggestions {
         let code = String::from_utf8(fs::read(path).unwrap()).unwrap();
+        // for suggestion in suggestions {
+        // println!("{:?}", path.as_ref());
+        // println!("{:?}", suggestion.snippets[0].line_range);
+        // println!("{:?}", suggestion.snippets[0].range);
+        // println!("{}", suggestion.solutions[0].replacements[0].replacement);
+        // println!();
+        // }
         let fixed = rustfix::apply_suggestions(&code, suggestions).unwrap();
         fs::write(path, fixed.as_bytes()).unwrap();
     }

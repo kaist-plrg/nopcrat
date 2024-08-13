@@ -98,7 +98,7 @@ fn main() {
     };
 
     if args.verbose {
-        for (func, params) in &analysis_result {
+        for (func, params) in &analysis_result.0 {
             println!("{}", func);
             for param in params {
                 println!("  {:?}", param);
@@ -107,7 +107,7 @@ fn main() {
     }
 
     if args.sample_negative {
-        let mut fns = sampling::sample_from_path(path, &analysis_result);
+        let mut fns = sampling::sample_from_path(path, &analysis_result.0);
         fns.shuffle(&mut thread_rng());
         for f in fns.iter().take(10) {
             println!("{:?}", f);
@@ -116,6 +116,7 @@ fn main() {
     }
     if args.sample_may || args.sample_must {
         let mut params: Vec<_> = analysis_result
+            .0
             .iter()
             .filter(|(_, params)| params.iter().any(|p| p.must == args.sample_must))
             .collect();
@@ -127,12 +128,14 @@ fn main() {
     }
 
     if args.use_analysis_result.is_none() {
-        let fns = analysis_result.len();
+        let fns = analysis_result.0.len();
         let musts = analysis_result
+            .0
             .values()
             .map(|v| v.iter().filter(|p| p.must).count())
             .sum::<usize>();
         let mays = analysis_result
+            .0
             .values()
             .map(|v| v.iter().filter(|p| !p.must).count())
             .sum::<usize>();
@@ -148,7 +151,7 @@ fn main() {
         return;
     }
 
-    transform::transform_path(path, &analysis_result);
+    transform::transform_path(path, &analysis_result.0, &analysis_result.1);
 }
 
 fn clear_dir(path: &Path) {
