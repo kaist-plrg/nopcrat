@@ -48,9 +48,14 @@ impl Default for AnalysisConfig {
 }
 
 pub type OutputParams = BTreeMap<String, Vec<OutputParam>>;
+
+// Write Before RETurn s
 pub type Wbrets = BTreeMap<i128, BTreeSet<usize>>;
 
-pub type AnalysisResult = (OutputParams, BTreeMap<String, Wbrets>);
+// Removable checks for Write s
+pub type Rcfws = BTreeMap<usize, BTreeSet<i128>>;
+
+pub type AnalysisResult = (OutputParams, BTreeMap<String, (Wbrets, Rcfws)>);
 
 pub fn analyze_path(path: &Path, conf: &AnalysisConfig) -> AnalysisResult {
     analyze_input(compile_util::path_to_input(path), conf)
@@ -65,18 +70,18 @@ pub fn analyze_input(input: Input, conf: &AnalysisConfig) -> AnalysisResult {
     compile_util::run_compiler(config, |tcx| {
         analyze(tcx, conf)
             .into_iter()
-            .filter_map(|(def_id, (_, params, writes))| {
+            .filter_map(|(def_id, (_, params, wbret, rcfw))| {
                 if params.is_empty() {
                     None
                 } else {
-                    Some((tcx.def_path_str(def_id), (params, writes)))
+                    Some((tcx.def_path_str(def_id), (params, wbret, rcfw)))
                 }
             })
             .collect::<Vec<_>>()
     })
     .unwrap()
     .into_iter()
-    .map(|(k, (v1, v2))| ((k.clone(), v1), (k, v2)))
+    .map(|(k, (v1, v2, v3))| ((k.clone(), v1), (k.clone(), (v2, v3))))
     .unzip()
 }
 
@@ -90,14 +95,7 @@ enum Write {
 pub fn analyze(
     tcx: TyCtxt<'_>,
     conf: &AnalysisConfig,
-) -> BTreeMap<
-    DefId,
-    (
-        FunctionSummary,
-        Vec<OutputParam>,
-        Wbrets,
-    ),
-> {
+) -> BTreeMap<DefId, (FunctionSummary, Vec<OutputParam>, Wbrets, Rcfws)> {
     let hir = tcx.hir();
 
     let mut call_graph = BTreeMap::new();
@@ -164,6 +162,9 @@ pub fn analyze(
     let mut call_args_map = BTreeMap::new();
     let mut analysis_times: BTreeMap<_, u128> = BTreeMap::new();
     let mut wbrets: BTreeMap<DefId, BTreeMap<i128, BTreeSet<usize>>> = BTreeMap::new();
+    let mut wbbbrets: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
+
+    let mut rcfws = BTreeMap::new();
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -216,11 +217,18 @@ pub fn analyze(
                 let ret_location = return_location(body);
 
                 let mut wbret = BTreeMap::new();
+                let mut wbbbret = BTreeMap::new();
 
                 if let Some(ret_location) = ret_location {
-                    if let Some(ret_loc_assign0) = exists_assign0(body, ret_location.block) {
+                    if let Some((ret_loc_assign0, index)) = exists_assign0(body, ret_location.block)
+                    {
+                        let loc = Location {
+                            block: ret_location.block,
+                            statement_index: index,
+                        };
+
                         let writes: BTreeSet<_> = states
-                            .get(&ret_location)
+                            .get(&loc)
                             .cloned()
                             .unwrap_or_default()
                             .values()
@@ -230,17 +238,18 @@ pub fn analyze(
 
                         wbret.insert(
                             unsafe { std::mem::transmute(ret_loc_assign0.data()) },
-                            writes,
+                            writes.clone(),
                         );
+                        wbbbret.insert(ret_location.block, writes);
                     } else {
                         let preds = body.basic_blocks.predecessors().get(ret_location.block);
 
                         if let Some(v) = preds {
                             for i in v {
-                                if let Some(sp) = exists_assign0(body, *i) {
+                                if let Some((sp, index)) = exists_assign0(body, *i) {
                                     let loc = Location {
                                         block: *i,
-                                        statement_index: body.basic_blocks[*i].statements.len(),
+                                        statement_index: index,
                                     };
 
                                     let writes: BTreeSet<_> = states
@@ -252,7 +261,11 @@ pub fn analyze(
                                         .map(|p| p.base() - 1)
                                         .collect();
 
-                                    wbret.insert(unsafe { std::mem::transmute(sp.data()) }, writes);
+                                    wbret.insert(
+                                        unsafe { std::mem::transmute(sp.data()) },
+                                        writes.clone(),
+                                    );
+                                    wbbbret.insert(*i, writes);
                                 }
                             }
                         }
@@ -280,7 +293,30 @@ pub fn analyze(
                 } else {
                     wbret
                 };
+
+                let wbbbret = if let Some(old) = wbbbrets.get(def_id) {
+                    let keys: BTreeSet<_> = wbbbret.keys().chain(old.keys()).cloned().collect();
+
+                    keys.into_iter()
+                        .map(|bb| {
+                            (
+                                bb,
+                                match (wbbbret.get(&bb), old.get(&bb)) {
+                                    (Some(v1), Some(v2)) => {
+                                        v1.intersection(v2).cloned().collect::<BTreeSet<usize>>()
+                                    }
+                                    (Some(v), None) | (None, Some(v)) => (*v).clone(),
+                                    _ => unreachable!(),
+                                },
+                            )
+                        })
+                        .collect::<BTreeMap<BasicBlock, _>>()
+                } else {
+                    wbbbret
+                };
+
                 wbrets.insert(*def_id, wbret);
+                wbbbrets.insert(*def_id, wbbbret);
 
                 let mut return_states = ret_location
                     .and_then(|ret| states.get(&ret))
@@ -323,6 +359,69 @@ pub fn analyze(
                     for p in &mut output_params {
                         analyzer.find_complete_write(p, &result, &writes_map, &call_args, *def_id);
                     }
+
+                    let body = tcx.optimized_mir(*def_id);
+                    let wbbbret = &wbbbrets[def_id];
+                    let mut rcfw: Rcfws = BTreeMap::new();
+                    for p in output_params.iter() {
+                        let OutputParam {
+                            index,
+                            must: _,
+                            return_values: _,
+                            complete_writes,
+                        } = p;
+                        for complete_write in complete_writes.iter() {
+                            let CompleteWrite {
+                                block,
+                                statement_index,
+                                write_arg: _,
+                            } = complete_write;
+
+                            let mut stack = vec![BasicBlock::from_usize(*block)];
+
+                            let success = loop {
+                                if let Some(block) = stack.pop() {
+                                    match wbbbret.get(&block) {
+                                        Some(ws) => {
+                                            if !ws.contains(index) {
+                                                break false;
+                                            }
+                                        }
+                                        None => (),
+                                    }
+
+                                    let bbd = &body.basic_blocks[block];
+                                    let term = bbd.terminator();
+
+                                    match term.kind {
+                                        TerminatorKind::Return => (),
+                                        _ => {
+                                            for bb in term.successors() {
+                                                stack.push(bb);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    break true;
+                                }
+                            };
+
+                            if success {
+                                let location = Location {
+                                    block: BasicBlock::from_usize(*block),
+                                    statement_index: *statement_index,
+                                };
+                                let span = unsafe {
+                                    std::mem::transmute(body.source_info(location).span.data())
+                                };
+
+                                let entry = rcfw.entry(*index);
+                                entry.or_default().insert(span);
+                            }
+                        }
+                    }
+
+                    rcfws.insert(*def_id, rcfw);
                     output_params_map.insert(*def_id, output_params);
                 }
                 break;
@@ -351,6 +450,7 @@ pub fn analyze(
                     summary,
                     output_params,
                     wbrets.get(&def_id).cloned().unwrap_or_default(),
+                    rcfws.get(&def_id).cloned().unwrap_or_default(),
                 ),
             )
         })
@@ -1152,11 +1252,11 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
     None
 }
 
-fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<Span> {
-    for stmt in body.basic_blocks[bb].statements.iter() {
+fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, usize)> {
+    for (i, stmt) in body.basic_blocks[bb].statements.iter().enumerate() {
         if let StatementKind::Assign(rb) = &stmt.kind {
             if (**rb).0.local.as_u32() == 0u32 {
-                return Some(stmt.source_info.span);
+                return Some((stmt.source_info.span, i));
             }
         }
     }

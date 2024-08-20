@@ -22,39 +22,22 @@ use crate::{ai::analysis::*, compile_util};
 pub fn transform_path(
     path: &Path,
     params: &OutputParams,
-    writes: &BTreeMap<String, Wbrets>,
+    extra_info: &BTreeMap<String, (Wbrets, Rcfws)>,
 ) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
     let suggestions =
-        compile_util::run_compiler(config, |tcx| transform(tcx, params, writes)).unwrap();
+        compile_util::run_compiler(config, |tcx| transform(tcx, params, extra_info)).unwrap();
     compile_util::apply_suggestions(&suggestions);
 }
 
 fn transform(
     tcx: TyCtxt<'_>,
     param_map: &OutputParams,
-    writes: &BTreeMap<String, Wbrets>,
+    extra_info: &BTreeMap<String, (Wbrets, Rcfws)>,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
-
-    let writes = writes
-        .iter()
-        .map(|(k, v)| {
-            (
-                k,
-                v.iter()
-                    .map(|(k, v)| {
-                        (
-                            unsafe { std::mem::transmute::<i128, SpanData>(*k) }.span(),
-                            v,
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
 
     let mut def_id_ty_map = BTreeMap::new();
     for id in hir.items() {
@@ -72,6 +55,7 @@ fn transform(
 
     let mut funcs = BTreeMap::new();
     let mut wbrets = BTreeMap::new();
+    let mut rcfws = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
         let ItemKind::Fn(sig, _, body_id) = item.kind else {
@@ -159,24 +143,46 @@ fn transform(
                 (*index, param)
             })
             .collect();
-        if let Some(write) = writes.get(&name) {
+
+        if let Some((wbret, _)) = extra_info.get(&name) {
             wbrets.insert(
                 def_id,
-                write
+                wbret
                     .clone()
                     .into_iter()
                     .map(|(sp, params)| {
                         (
-                            sp,
+                            unsafe { std::mem::transmute::<i128, SpanData>(sp) }.span(),
                             params
                                 .iter()
                                 .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
                                 .collect::<Vec<_>>(),
                         )
                     })
-                    .collect::<BTreeMap<_, _>>(),
+                    .collect::<Vec<_>>(),
             );
         }
+
+        if let Some((_, rcfw)) = extra_info.get(&name) {
+            rcfws.insert(
+                def_id,
+                rcfw.clone()
+                    .into_iter()
+                    .map(|(index, spans)| {
+                        (
+                            index_map.get(&index).cloned().unwrap().name,
+                            spans
+                                .iter()
+                                .map(|sp| {
+                                    unsafe { std::mem::transmute::<i128, SpanData>(*sp) }.span()
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<BTreeMap<String, Vec<Span>>>(),
+            );
+        }
+
         let hir_id_map: BTreeMap<_, _> = index_map
             .values()
             .cloned()
@@ -298,7 +304,11 @@ fn transform(
             }
 
             let assign_map = curr.map(|c| c.assign_map(span)).unwrap_or_default();
-            let mut mtch = func.call_match(&args, &assign_map);
+
+            let mut mtch = func.first_return.and_then(|(_, first)| {
+                let set_flag = generate_set_flag(&span, &first, &rcfws[&def_id], &assign_map);
+                func.call_match(&args, set_flag)
+            });
 
             if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
                 if let Some(then) = func.cmp(call.op, call.target) {
@@ -310,11 +320,7 @@ fn transform(
                     let fail = "Err(_) => ";
                     let (_, i) = func.first_return.as_ref().unwrap();
                     let arg = &args[*i];
-                    let set_flag = if let Some(arg) = assign_map.get(i) {
-                        format!("{}___s = true;", arg)
-                    } else {
-                        "".to_string()
-                    };
+                    let set_flag = generate_set_flag(&span, i, &rcfws[&def_id], &assign_map);
                     let assign = if arg.code.contains("&mut ") {
                         format!(" *({}) = v___; {}", arg.code, set_flag)
                     } else {
@@ -382,7 +388,7 @@ fn transform(
                     let rv = format!("{}rv___{}", pre_s, post_s);
                     let (_, wbret) = wbrets[&def_id]
                         .iter()
-                        .find(|(sp, _)| span.contains(**sp))
+                        .find(|(sp, _)| span.contains(*sp))
                         .unwrap();
                     let rv = func.return_value(Some(rv), wbret);
                     fix(
@@ -398,7 +404,18 @@ fn transform(
             }
             fix(span.shrink_to_lo(), binding);
 
-            let mut assign = func.call_assign(&args, &assign_map);
+            let set_flags = func
+                .remaining_return
+                .iter()
+                .map(|i| {
+                    (
+                        *i,
+                        generate_set_flag(&span, i, &rcfws[&def_id], &assign_map),
+                    )
+                })
+                .collect();
+
+            let mut assign = func.call_assign(&args, &set_flags);
             if let Some(m) = &mtch {
                 assign += m;
                 assign += ")";
@@ -464,10 +481,18 @@ fn transform(
         fix(span, local_vars);
 
         for param in func.params() {
+            let rcfw = &rcfws[&def_id].get(&param.name);
+
             for span in &param.writes {
                 if call_spans.contains(span) {
                     continue;
                 }
+                if let Some(rcfw) = rcfw {
+                    if rcfw.iter().any(|sp| span.contains(*sp)) {
+                        continue;
+                    }
+                }
+
                 let pos = span.hi() + BytePos(1);
                 let span = span.with_hi(pos).with_lo(pos);
                 let assign = format!("{0}___s = true;", param.name);
@@ -522,7 +547,7 @@ fn transform(
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
             let (_, wbret) = wbrets[&def_id]
                 .iter()
-                .find(|(sp, _)| span.contains(**sp))
+                .find(|(sp, _)| span.contains(*sp))
                 .unwrap();
             let ret_v = func.return_value(orig, wbret);
             fix(span, format!("return {}", ret_v));
@@ -616,34 +641,29 @@ impl Func {
         map
     }
 
-    fn call_assign(&self, args: &[Arg], assign_map: &BTreeMap<usize, String>) -> String {
+    fn call_assign(&self, args: &[Arg], set_flags: &BTreeMap<usize, String>) -> String {
         let mut assigns = vec![];
         for i in &self.remaining_return {
             let arg = &args[*i];
             let param = &self.index_map[i];
-            let set_flag = if let Some(arg) = assign_map.get(i) {
-                format!("{}___s = true;", arg)
-            } else {
-                "".to_string()
-            };
             let assign = if param.must {
                 if arg.code.contains("&mut ") {
-                    format!("*({}) = rv___{}; {}", arg.code, i, set_flag)
+                    format!("*({}) = rv___{}; {}", arg.code, i, set_flags[i])
                 } else {
                     format!(
                         "if !({0}).is_null() {{ *({0}) = rv___{1}; {2} }}",
-                        arg.code, i, set_flag
+                        arg.code, i, set_flags[i]
                     )
                 }
             } else if arg.code.contains("&mut ") {
                 format!(
                     "if let Some(v___) = rv___{} {{ *({}) = v___; {} }}",
-                    i, arg.code, set_flag
+                    i, arg.code, set_flags[i]
                 )
             } else {
                 format!(
                     "if !({0}).is_null() {{ if let Some(v___) = rv___{1} {{ *({0}) = v___; {2} }} }}",
-                    arg.code, i, set_flag
+                    arg.code, i, set_flags[i]
                 )
             };
             assigns.push(assign);
@@ -652,14 +672,9 @@ impl Func {
         mk_string(assigns.iter(), "; ", " ", end)
     }
 
-    fn call_match(&self, args: &[Arg], assign_map: &BTreeMap<usize, String>) -> Option<String> {
+    fn call_match(&self, args: &[Arg], set_flag: String) -> Option<String> {
         let (succ_value, first) = &self.first_return?;
         let arg = &args[*first];
-        let set_flag = if let Some(arg) = assign_map.get(first) {
-            format!("{}___s = true;", arg)
-        } else {
-            "".to_string()
-        };
         let assign = if arg.code.contains("&mut ") {
             format!("*({}) = v___; {}", arg.code, set_flag)
         } else {
@@ -1069,4 +1084,22 @@ fn mk_string<S: AsRef<str>, I: Iterator<Item = S>>(
     }
     s.push_str(end);
     s
+}
+
+fn generate_set_flag(
+    span: &Span,
+    i: &usize,
+    rcfws: &BTreeMap<String, Vec<Span>>,
+    assign_map: &BTreeMap<usize, String>,
+) -> String {
+    if let Some(arg) = assign_map.get(i) {
+        let rcfw = &rcfws.get(arg);
+        if let Some(rcfw) = rcfw {
+            if rcfw.iter().any(|sp| span.contains(*sp)) {
+                return "".to_string();
+            }
+        }
+        return format!("{}___s = true;", arg);
+    }
+    "".to_string()
 }
