@@ -18,7 +18,7 @@ use rustc_middle::{
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
+use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
@@ -50,7 +50,7 @@ impl Default for AnalysisConfig {
 pub type OutputParams = BTreeMap<String, Vec<OutputParam>>;
 
 // Write Before RETurn s
-pub type Wbrets = BTreeMap<i128, BTreeSet<usize>>;
+pub type Wbrets = BTreeMap<i128, (BTreeSet<usize>, BTreeSet<usize>)>;
 
 // Removable checks for Write s
 pub type Rcfws = BTreeMap<usize, BTreeSet<i128>>;
@@ -161,7 +161,8 @@ pub fn analyze(
     let mut wm_map = BTreeMap::new();
     let mut call_args_map = BTreeMap::new();
     let mut analysis_times: BTreeMap<_, u128> = BTreeMap::new();
-    let mut wbrets: BTreeMap<DefId, BTreeMap<i128, BTreeSet<usize>>> = BTreeMap::new();
+
+    let mut wbrets: BTreeMap<DefId, Wbrets> = BTreeMap::new();
     let mut wbbbrets: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
 
     let mut rcfws = BTreeMap::new();
@@ -220,15 +221,61 @@ pub fn analyze(
                 let mut wbbbret = BTreeMap::new();
 
                 if let Some(ret_location) = ret_location {
+                    let mut stack = vec![];
+
                     if let Some((ret_loc_assign0, index)) = exists_assign0(body, ret_location.block)
                     {
-                        let loc = Location {
-                            block: ret_location.block,
-                            statement_index: index,
-                        };
+                        stack.push((
+                            Location {
+                                block: ret_location.block,
+                                statement_index: index,
+                            },
+                            ret_loc_assign0.data(),
+                        ));
+                    } else {
+                        let preds = body.basic_blocks.predecessors().get(ret_location.block);
+                        if let Some(v) = preds {
+                            for i in v {
+                                if let Some((sp, index)) = exists_assign0(body, *i) {
+                                    stack.push((
+                                        Location {
+                                            block: *i,
+                                            statement_index: index,
+                                        },
+                                        sp.data(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
 
-                        let writes: BTreeSet<_> = states
-                            .get(&loc)
+                    if stack.is_empty() {
+                        let span = body.source_info(ret_location).span;
+                        let pos = span.lo() - BytePos(1);
+                        stack.push((ret_location, span.with_lo(pos).with_hi(pos).data()));
+                    }
+
+                    for (loc, sp) in stack.iter() {
+                        let must_writes: BTreeSet<_> = states
+                            .get(loc)
+                            .cloned()
+                            .unwrap_or_default()
+                            .values()
+                            .fold(None, |acc: Option<BTreeSet<_>>, st: &AbsState| {
+                                Some(match acc {
+                                    Some(acc) => {
+                                        acc.intersection(st.writes.as_set()).cloned().collect()
+                                    }
+                                    None => st.writes.as_set().clone(),
+                                })
+                            })
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| p.base() - 1)
+                            .collect();
+
+                        let may_writes: BTreeSet<_> = states
+                            .get(loc)
                             .cloned()
                             .unwrap_or_default()
                             .values()
@@ -237,83 +284,13 @@ pub fn analyze(
                             .collect();
 
                         wbret.insert(
-                            unsafe { std::mem::transmute(ret_loc_assign0.data()) },
-                            writes.clone(),
+                            unsafe { std::mem::transmute(*sp) },
+                            (may_writes, must_writes.clone()),
                         );
-                        wbbbret.insert(ret_location.block, writes);
-                    } else {
-                        let preds = body.basic_blocks.predecessors().get(ret_location.block);
 
-                        if let Some(v) = preds {
-                            for i in v {
-                                if let Some((sp, index)) = exists_assign0(body, *i) {
-                                    let loc = Location {
-                                        block: *i,
-                                        statement_index: index,
-                                    };
-
-                                    let writes: BTreeSet<_> = states
-                                        .get(&loc)
-                                        .cloned()
-                                        .unwrap_or_default()
-                                        .values()
-                                        .flat_map(|st| st.writes.as_set())
-                                        .map(|p| p.base() - 1)
-                                        .collect();
-
-                                    wbret.insert(
-                                        unsafe { std::mem::transmute(sp.data()) },
-                                        writes.clone(),
-                                    );
-                                    wbbbret.insert(*i, writes);
-                                }
-                            }
-                        }
+                        wbbbret.insert(loc.block, must_writes);
                     }
                 }
-
-                let wbret = if let Some(old) = wbrets.get(def_id) {
-                    let spans: BTreeSet<_> = wbret.keys().chain(old.keys()).cloned().collect();
-
-                    spans
-                        .into_iter()
-                        .map(|sp| {
-                            (
-                                sp,
-                                match (wbret.get(&sp), old.get(&sp)) {
-                                    (Some(v1), Some(v2)) => {
-                                        v1.intersection(v2).cloned().collect::<BTreeSet<usize>>()
-                                    }
-                                    (Some(v), None) | (None, Some(v)) => (*v).clone(),
-                                    _ => unreachable!(),
-                                },
-                            )
-                        })
-                        .collect::<BTreeMap<i128, _>>()
-                } else {
-                    wbret
-                };
-
-                let wbbbret = if let Some(old) = wbbbrets.get(def_id) {
-                    let keys: BTreeSet<_> = wbbbret.keys().chain(old.keys()).cloned().collect();
-
-                    keys.into_iter()
-                        .map(|bb| {
-                            (
-                                bb,
-                                match (wbbbret.get(&bb), old.get(&bb)) {
-                                    (Some(v1), Some(v2)) => {
-                                        v1.intersection(v2).cloned().collect::<BTreeSet<usize>>()
-                                    }
-                                    (Some(v), None) | (None, Some(v)) => (*v).clone(),
-                                    _ => unreachable!(),
-                                },
-                            )
-                        })
-                        .collect::<BTreeMap<BasicBlock, _>>()
-                } else {
-                    wbbbret
-                };
 
                 wbrets.insert(*def_id, wbret);
                 wbbbrets.insert(*def_id, wbbbret);
@@ -381,13 +358,10 @@ pub fn analyze(
 
                             let success = loop {
                                 if let Some(block) = stack.pop() {
-                                    match wbbbret.get(&block) {
-                                        Some(ws) => {
-                                            if !ws.contains(index) {
-                                                break false;
-                                            }
+                                    if let Some(ws) =  wbbbret.get(&block) {
+                                        if !ws.contains(index) {
+                                            break false;
                                         }
-                                        None => (),
                                     }
 
                                     let bbd = &body.basic_blocks[block];

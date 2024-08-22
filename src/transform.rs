@@ -150,13 +150,17 @@ fn transform(
                 wbret
                     .clone()
                     .into_iter()
-                    .map(|(sp, params)| {
+                    .map(|(sp, (may, must))| {
                         (
                             unsafe { std::mem::transmute::<i128, SpanData>(sp) }.span(),
-                            params
-                                .iter()
-                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
-                                .collect::<Vec<_>>(),
+                            (
+                                may.iter()
+                                    .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                    .collect::<Vec<_>>(),
+                                must.iter()
+                                    .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                    .collect::<Vec<_>>(),
+                            ),
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -386,11 +390,11 @@ fn transform(
 
                     let post_span = post_span.with_hi(post_span.hi() + BytePos(1));
                     let rv = format!("{}rv___{}", pre_s, post_s);
-                    let (_, wbret) = wbrets[&def_id]
+                    let (_, (may, must)) = wbrets[&def_id]
                         .iter()
                         .find(|(sp, _)| span.contains(*sp))
                         .unwrap();
-                    let rv = func.return_value(Some(rv), wbret);
+                    let rv = func.return_value(Some(rv), may, must);
                     fix(
                         post_span,
                         format!("; return {};{}", rv, if arm { " }" } else { "" }),
@@ -439,10 +443,33 @@ fn transform(
         let ret_ty = func.return_type(orig);
         fix(span, format!("-> {}", ret_ty));
 
+        let mut unremovable = BTreeSet::new();
+        for param in func.params() {
+            let rcfw = &rcfws[&def_id].get(&param.name);
+
+            for span in &param.writes {
+                if call_spans.contains(span) {
+                    continue;
+                }
+                if let Some(rcfw) = rcfw {
+                    if rcfw.iter().any(|sp| span.contains(*sp)) {
+                        continue;
+                    }
+                }
+
+                unremovable.insert(&param.name);
+
+                let pos = span.hi() + BytePos(1);
+                let span = span.with_hi(pos).with_lo(pos);
+                let assign = format!("{0}___s = true;", param.name);
+                fix(span, assign);
+            }
+        }
+
         let local_vars: String = func
             .params()
             .map(|param| {
-                if param.must {
+                if param.must || !unremovable.contains(&param.name) {
                     if passes.contains(&param.name) {
                         format!(
                             "
@@ -481,26 +508,6 @@ fn transform(
         fix(span, local_vars);
 
         for param in func.params() {
-            let rcfw = &rcfws[&def_id].get(&param.name);
-
-            for span in &param.writes {
-                if call_spans.contains(span) {
-                    continue;
-                }
-                if let Some(rcfw) = rcfw {
-                    if rcfw.iter().any(|sp| span.contains(*sp)) {
-                        continue;
-                    }
-                }
-
-                let pos = span.hi() + BytePos(1);
-                let span = span.with_hi(pos).with_lo(pos);
-                let assign = format!("{0}___s = true;", param.name);
-                fix(span, assign);
-            }
-        }
-
-        for param in func.params() {
             if let Some(spans) = ref_to_spans.get(&param.name) {
                 for span in spans {
                     let assign = format!("{}___v", param.name);
@@ -534,7 +541,11 @@ fn transform(
                 let post_s = source_map.span_to_snippet(*s).unwrap();
                 rv = format!("{}{}___v{}", rv, sorted_ss[i + 1].0, post_s);
             }
-            let rv = func.return_value(Some(rv), &[]);
+            let (_, (may, must)) = wbrets[&def_id]
+                .iter()
+                .find(|(sp, _)| span.contains(*sp))
+                .unwrap();
+            let rv = func.return_value(Some(rv), may, must);
 
             fix(*span, format!("return {}", rv));
         }
@@ -545,18 +556,22 @@ fn transform(
                 continue;
             }
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
-            let (_, wbret) = wbrets[&def_id]
+            let (_, (may, must)) = wbrets[&def_id]
                 .iter()
                 .find(|(sp, _)| span.contains(*sp))
                 .unwrap();
-            let ret_v = func.return_value(orig, wbret);
+            let ret_v = func.return_value(orig, may, must);
             fix(span, format!("return {}", ret_v));
         }
 
         if func.is_unit {
             let pos = body.value.span.hi() - BytePos(1);
             let span = body.value.span.with_lo(pos).with_hi(pos);
-            let ret_v = func.return_value(None, &[]);
+            let (_, (may, must)) = wbrets[&def_id]
+                .iter()
+                .find(|(sp, _)| span.contains(*sp))
+                .unwrap();
+            let ret_v = func.return_value(None, may, must);
             fix(span, ret_v);
         }
     }
@@ -720,13 +735,15 @@ impl Func {
         }
     }
 
-    fn return_value(&self, orig: Option<String>, wbret: &[String]) -> String {
+    fn return_value(&self, orig: Option<String>, may: &[String], must: &[String]) -> String {
         let mut values = vec![];
         if let Some((_, i)) = &self.first_return {
             let orig = orig.unwrap();
             let param = &self.index_map[i];
-            let v = if wbret.contains(&param.name) {
+            let v = if must.contains(&param.name) {
                 format!("Ok({}___v)", param.name)
+            } else if !may.contains(&param.name) {
+                format!("Err({})", orig)
             } else {
                 format!(
                     "if {0}___s {{ Ok({0}___v) }} else {{ Err({1}) }}",
@@ -741,8 +758,10 @@ impl Func {
             let param = &self.index_map[i];
             let v = if param.must {
                 format!("{}___v", param.name)
-            } else if wbret.contains(&param.name) {
+            } else if must.contains(&param.name) {
                 format!("Some ({}___v)", param.name)
+            } else if !may.contains(&param.name) {
+                "None".to_string()
             } else {
                 format!("if {0}___s {{ Some({0}___v) }} else {{ None }}", param.name)
             };
