@@ -355,10 +355,11 @@ pub fn analyze(
                             } = complete_write;
 
                             let mut stack = vec![BasicBlock::from_usize(*block)];
+                            let mut visited = BTreeSet::new();
 
                             let success = loop {
                                 if let Some(block) = stack.pop() {
-                                    if let Some(ws) =  wbbbret.get(&block) {
+                                    if let Some(ws) = wbbbret.get(&block) {
                                         if !ws.contains(index) {
                                             break false;
                                         }
@@ -367,11 +368,15 @@ pub fn analyze(
                                     let bbd = &body.basic_blocks[block];
                                     let term = bbd.terminator();
 
+                                    visited.insert(block);
+
                                     match term.kind {
                                         TerminatorKind::Return => (),
                                         _ => {
                                             for bb in term.successors() {
-                                                stack.push(bb);
+                                                if !visited.contains(&bb) {
+                                                    stack.push(bb);
+                                                }
                                             }
                                         }
                                     }
