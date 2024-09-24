@@ -18,7 +18,7 @@ use rustc_middle::{
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
-use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
+use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
@@ -164,6 +164,7 @@ pub fn analyze(
 
     let mut wbrets: BTreeMap<DefId, Wbrets> = BTreeMap::new();
     let mut wbbbrets: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
+    let mut is_units = BTreeMap::new();
 
     let mut rcfws = BTreeMap::new();
     for id in &po {
@@ -220,9 +221,9 @@ pub fn analyze(
                 let mut wbret = BTreeMap::new();
                 let mut wbbbret = BTreeMap::new();
 
-                if let Some(ret_location) = ret_location {
-                    let mut stack = vec![];
+                let mut stack = vec![];
 
+                if let Some(ret_location) = ret_location {
                     if let Some((ret_loc_assign0, index)) = exists_assign0(body, ret_location.block)
                     {
                         stack.push((
@@ -232,27 +233,19 @@ pub fn analyze(
                             },
                             ret_loc_assign0.data(),
                         ));
-                    } else {
-                        let preds = body.basic_blocks.predecessors().get(ret_location.block);
-                        if let Some(v) = preds {
-                            for i in v {
-                                if let Some((sp, index)) = exists_assign0(body, *i) {
-                                    stack.push((
-                                        Location {
-                                            block: *i,
-                                            statement_index: index,
-                                        },
-                                        sp.data(),
-                                    ));
-                                }
+                    } else if let Some(v) = body.basic_blocks.predecessors().get(ret_location.block)
+                    {
+                        for i in v {
+                            if let Some((sp, index)) = exists_assign0(body, *i) {
+                                stack.push((
+                                    Location {
+                                        block: *i,
+                                        statement_index: index,
+                                    },
+                                    sp.data(),
+                                ));
                             }
                         }
-                    }
-
-                    if stack.is_empty() {
-                        let span = body.source_info(ret_location).span;
-                        let pos = span.lo() - BytePos(1);
-                        stack.push((ret_location, span.with_lo(pos).with_hi(pos).data()));
                     }
 
                     for (loc, sp) in stack.iter() {
@@ -294,6 +287,7 @@ pub fn analyze(
 
                 wbrets.insert(*def_id, wbret);
                 wbbbrets.insert(*def_id, wbbbret);
+                is_units.insert(*def_id, stack.is_empty());
 
                 let mut return_states = ret_location
                     .and_then(|ret| states.get(&ret))
@@ -340,62 +334,64 @@ pub fn analyze(
                     let body = tcx.optimized_mir(*def_id);
                     let wbbbret = &wbbbrets[def_id];
                     let mut rcfw: Rcfws = BTreeMap::new();
-                    for p in output_params.iter() {
-                        let OutputParam {
-                            index,
-                            must: _,
-                            return_values: _,
-                            complete_writes,
-                        } = p;
-                        for complete_write in complete_writes.iter() {
-                            let CompleteWrite {
-                                block,
-                                statement_index,
-                                write_arg: _,
-                            } = complete_write;
 
-                            let mut stack = vec![BasicBlock::from_usize(*block)];
-                            let mut visited = BTreeSet::new();
+                    if !is_units[def_id] {
+                        for p in output_params.iter() {
+                            let OutputParam {
+                                index,
+                                must: _,
+                                return_values: _,
+                                complete_writes,
+                            } = p;
+                            for complete_write in complete_writes.iter() {
+                                let CompleteWrite {
+                                    block,
+                                    statement_index,
+                                    write_arg: _,
+                                } = complete_write;
 
-                            let success = loop {
-                                if let Some(block) = stack.pop() {
-                                    if let Some(ws) = wbbbret.get(&block) {
-                                        if !ws.contains(index) {
-                                            break false;
+                                let mut stack = vec![BasicBlock::from_usize(*block)];
+                                let mut visited = BTreeSet::from_iter(stack.clone());
+
+                                let success = loop {
+                                    if let Some(block) = stack.pop() {
+                                        if let Some(ws) = wbbbret.get(&block) {
+                                            if !ws.contains(index) {
+                                                break false;
+                                            }
                                         }
-                                    }
 
-                                    let bbd = &body.basic_blocks[block];
-                                    let term = bbd.terminator();
+                                        let bbd = &body.basic_blocks[block];
+                                        let term = bbd.terminator();
 
-                                    visited.insert(block);
-
-                                    match term.kind {
-                                        TerminatorKind::Return => (),
-                                        _ => {
-                                            for bb in term.successors() {
-                                                if !visited.contains(&bb) {
-                                                    stack.push(bb);
+                                        match term.kind {
+                                            TerminatorKind::Return => (),
+                                            _ => {
+                                                for bb in term.successors() {
+                                                    if !visited.contains(&bb) {
+                                                        visited.insert(bb);
+                                                        stack.push(bb);
+                                                    }
                                                 }
                                             }
                                         }
+                                    } else {
+                                        break true;
                                     }
-                                } else {
-                                    break true;
+                                };
+
+                                if success {
+                                    let location = Location {
+                                        block: BasicBlock::from_usize(*block),
+                                        statement_index: *statement_index,
+                                    };
+                                    let span = unsafe {
+                                        std::mem::transmute(body.source_info(location).span.data())
+                                    };
+
+                                    let entry = rcfw.entry(*index);
+                                    entry.or_default().insert(span);
                                 }
-                            };
-
-                            if success {
-                                let location = Location {
-                                    block: BasicBlock::from_usize(*block),
-                                    statement_index: *statement_index,
-                                };
-                                let span = unsafe {
-                                    std::mem::transmute(body.source_info(location).span.data())
-                                };
-
-                                let entry = rcfw.entry(*index);
-                                entry.or_default().insert(span);
                             }
                         }
                     }
