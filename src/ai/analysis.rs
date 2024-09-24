@@ -1235,6 +1235,12 @@ fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, usize)> {
             }
         }
     }
+    let term = body.basic_blocks[bb].terminator();
+    if let TerminatorKind::Call { func: _, args: _, destination, target: _, unwind: _, call_source: _, fn_span: _ } = term.kind {
+        if destination.local.as_u32() == 0u32 {
+            return Some((term.source_info.span, body.basic_blocks[bb].statements.len()));
+        }
+    }
     None
 }
 
