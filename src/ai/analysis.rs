@@ -224,26 +224,15 @@ pub fn analyze(
                 let mut stack = vec![];
 
                 if let Some(ret_location) = ret_location {
-                    if let Some((ret_loc_assign0, index)) = exists_assign0(body, ret_location.block)
+                    if let Some((ret_loc_assign0, ret_loc)) =
+                        exists_assign0(body, ret_location.block)
                     {
-                        stack.push((
-                            Location {
-                                block: ret_location.block,
-                                statement_index: index,
-                            },
-                            ret_loc_assign0.data(),
-                        ));
+                        stack.push((ret_loc, ret_loc_assign0.data()));
                     } else if let Some(v) = body.basic_blocks.predecessors().get(ret_location.block)
                     {
                         for i in v {
-                            if let Some((sp, index)) = exists_assign0(body, *i) {
-                                stack.push((
-                                    Location {
-                                        block: *i,
-                                        statement_index: index,
-                                    },
-                                    sp.data(),
-                                ));
+                            if let Some((sp, ret_loc)) = exists_assign0(body, *i) {
+                                stack.push((ret_loc, sp.data()));
                             }
                         }
                     }
@@ -1227,18 +1216,39 @@ fn return_location(body: &Body<'_>) -> Option<Location> {
     None
 }
 
-fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, usize)> {
+fn exists_assign0(body: &Body<'_>, bb: BasicBlock) -> Option<(Span, Location)> {
     for (i, stmt) in body.basic_blocks[bb].statements.iter().enumerate() {
         if let StatementKind::Assign(rb) = &stmt.kind {
             if (**rb).0.local.as_u32() == 0u32 {
-                return Some((stmt.source_info.span, i));
+                return Some((
+                    stmt.source_info.span,
+                    Location {
+                        block: bb,
+                        statement_index: i,
+                    },
+                ));
             }
         }
     }
     let term = body.basic_blocks[bb].terminator();
-    if let TerminatorKind::Call { func: _, args: _, destination, target: _, unwind: _, call_source: _, fn_span: _ } = term.kind {
+    if let TerminatorKind::Call {
+        func: _,
+        args: _,
+        destination,
+        target,
+        unwind: _,
+        call_source: _,
+        fn_span: _,
+    } = term.kind
+    {
         if destination.local.as_u32() == 0u32 {
-            return Some((term.source_info.span, body.basic_blocks[bb].statements.len()));
+            return Some((
+                term.source_info.span,
+                Location {
+                    block: target.unwrap(),
+                    statement_index: 0,
+                },
+            ));
         }
     }
     None
