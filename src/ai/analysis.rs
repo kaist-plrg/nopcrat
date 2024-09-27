@@ -198,11 +198,14 @@ pub fn analyze(
                     );
                 }
 
-                let AnalyzedBody {
-                    states,
-                    writes_map,
-                    init_state,
-                } = analyzer.analyze_body(body);
+                let (
+                    AnalyzedBody {
+                        states,
+                        writes_map,
+                        init_state,
+                    },
+                    restarted,
+                ) = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",
@@ -235,6 +238,10 @@ pub fn analyze(
                                 stack.push((ret_loc, sp.data()));
                             }
                         }
+                    }
+
+                    if restarted {
+                        stack.clear();
                     }
 
                     for (loc, sp) in stack.iter() {
@@ -737,8 +744,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
     }
 
-    fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
+    fn analyze_body(&mut self, body: &Body<'tcx>) -> (AnalyzedBody, bool) {
         let mut start_state = AbsState::bot();
+        let mut restarted = false;
         start_state.writes = MustPathSet::top();
         start_state.nulls = MustPathSet::top();
 
@@ -902,17 +910,21 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     }
                 }
                 if restart {
+                    restarted = true;
                     continue 'analysis_loop;
                 }
             }
             break (states, writes_map);
         };
 
-        AnalyzedBody {
-            states,
-            writes_map,
-            init_state,
-        }
+        (
+            AnalyzedBody {
+                states,
+                writes_map,
+                init_state,
+            },
+            restarted,
+        )
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
