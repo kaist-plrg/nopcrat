@@ -167,6 +167,9 @@ pub fn analyze(
     let mut is_units = BTreeMap::new();
 
     let mut rcfws = BTreeMap::new();
+
+    let mut has_restarted = false;
+
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -206,6 +209,7 @@ pub fn analyze(
                     },
                     restarted,
                 ) = analyzer.analyze_body(body);
+                has_restarted |= restarted;
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",
@@ -238,10 +242,6 @@ pub fn analyze(
                                 stack.push((ret_loc, sp.data()));
                             }
                         }
-                    }
-
-                    if restarted {
-                        stack.clear();
                     }
 
                     for (loc, sp) in stack.iter() {
@@ -409,6 +409,11 @@ pub fn analyze(
             let stmts = body_size(body);
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
+    }
+
+    if has_restarted {
+        wbrets.clear();
+        rcfws.clear();
     }
 
     summaries
