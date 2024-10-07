@@ -19,6 +19,12 @@ use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
 
+static mut N_MUST: usize = 0;
+static mut N_MAY: usize = 0;
+static mut N_DIRECT_RETURNS: usize = 0;
+static mut N_REMOVED_CHECKS: usize = 0;
+static mut N_REMOVED_POINTERS: usize = 0;
+
 pub fn transform_path(
     path: &Path,
     params: &OutputParams,
@@ -276,7 +282,7 @@ fn transform(
             }
         }
 
-        for call in visitor.calls {
+        for call in visitor.calls.clone() {
             let Call {
                 hir_id,
                 span,
@@ -458,6 +464,8 @@ fn transform(
                     continue;
                 }
 
+                unsafe { N_REMOVED_CHECKS += 1; }
+
                 let pos = span.hi() + BytePos(1);
                 let span = span.with_hi(pos).with_lo(pos);
                 let assign = format!("{0}___s = true;", param.name);
@@ -521,6 +529,9 @@ fn transform(
                     value: _,
                     span: sp,
                 } = assign;
+                if visitor.calls.iter().any(|call| call.span.overlaps(*sp)) {
+                    continue;
+                }
                 let sp2 = sp.between(*span);
                 if source_map
                     .span_to_snippet(sp2)
@@ -566,6 +577,7 @@ fn transform(
             if let Some(spans) = ref_to_spans.get(&param.name) {
                 for span in spans {
                     let assign = format!("{}___v", param.name);
+                    unsafe { N_REMOVED_POINTERS += 1; }
                     fix(*span, assign);
                 }
             }
@@ -640,6 +652,13 @@ fn transform(
             )
         });
     }
+
+    println!("Number of must write before return simplifications : {}", unsafe { N_MUST });
+    println!("Number of must not write before return simplifications : {}", unsafe { N_MAY });
+    println!("Number of direct return simplifications : {}", unsafe { N_DIRECT_RETURNS });
+    println!("Number of removed checks: {}", unsafe { N_REMOVED_CHECKS });
+    println!("Number of removed pointers: {}", unsafe { N_REMOVED_POINTERS });
+
     suggestions
 }
 
@@ -803,6 +822,7 @@ impl Func {
             let name = lit_map
                 .and_then(|(n, v)| {
                     if *n == param.name {
+                        unsafe { N_DIRECT_RETURNS += 1; }
                         Some((*v).clone())
                     } else {
                         None
@@ -811,8 +831,10 @@ impl Func {
                 .unwrap_or(format!("{}___v", param.name));
             let v = if let Some((may, must)) = wbret {
                 if must.contains(&param.name) {
+                    unsafe { N_MUST += 1; }
                     format!("Ok({})", name)
                 } else if !may.contains(&param.name) {
+                    unsafe { N_MAY += 1; }
                     format!("Err({})", orig)
                 } else {
                     format!(
@@ -835,6 +857,7 @@ impl Func {
             let name = lit_map
                 .and_then(|(n, v)| {
                     if *n == param.name {
+                        unsafe { N_DIRECT_RETURNS += 1; }
                         Some((*v).clone())
                     } else {
                         None
@@ -845,8 +868,10 @@ impl Func {
                 name
             } else if let Some((may, must)) = wbret {
                 if must.contains(&param.name) {
+                    unsafe { N_MUST += 1; }
                     format!("Some ({})", name)
                 } else if !may.contains(&param.name) {
+                    unsafe { N_MAY += 1; }
                     "None".to_string()
                 } else {
                     format!(
@@ -876,7 +901,7 @@ struct Return {
     value: Option<Span>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Call {
     hir_id: HirId,
     span: Span,
@@ -1001,13 +1026,11 @@ impl<'tcx> BodyVisitor<'tcx> {
     ) {
         let source_map = self.tcx.sess.source_map();
         if let ExprKind::Unary(UnOp::Deref, e) = lhs.kind {
-            if let ExprKind::Lit(_) = rhs.kind {
-                self.assigns.push(Assign {
-                    name: source_map.span_to_snippet(e.span).unwrap(),
-                    value: source_map.span_to_snippet(rhs.span).unwrap(),
-                    span: expr.span.with_hi(expr.span.hi() + BytePos(1)),
-                });
-            }
+            self.assigns.push(Assign {
+                name: source_map.span_to_snippet(e.span).unwrap(),
+                value: source_map.span_to_snippet(rhs.span).unwrap(),
+                span: expr.span.with_hi(expr.span.hi() + BytePos(1)),
+            });
         }
     }
 }
@@ -1220,10 +1243,12 @@ fn generate_set_flag(
         let rcfw = &rcfws.get(arg);
         if let Some(rcfw) = rcfw {
             if rcfw.iter().any(|sp| span.contains(*sp)) {
+                unsafe { N_REMOVED_CHECKS += 1; }
                 return "".to_string();
             }
         }
         return format!("{}___s = true;", arg);
     }
+    unsafe { N_REMOVED_CHECKS += 1; }
     "".to_string()
 }

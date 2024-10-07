@@ -168,8 +168,6 @@ pub fn analyze(
 
     let mut rcfws = BTreeMap::new();
 
-    let mut has_restarted = false;
-
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -201,15 +199,11 @@ pub fn analyze(
                     );
                 }
 
-                let (
-                    AnalyzedBody {
-                        states,
-                        writes_map,
-                        init_state,
-                    },
-                    restarted,
-                ) = analyzer.analyze_body(body);
-                has_restarted |= restarted;
+                let AnalyzedBody {
+                    states,
+                    writes_map,
+                    init_state,
+                } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
                         "{:?}\n{}",
@@ -399,6 +393,11 @@ pub fn analyze(
             }
         }
     }
+
+    if conf.max_loop_head_states <= 1 {
+        wbrets.clear();
+    }
+
     if let Some(n) = &conf.function_times {
         let mut analysis_times: Vec<_> = analysis_times.into_iter().collect();
         analysis_times.sort_by_key(|(_, t)| u128::MAX - *t);
@@ -409,11 +408,6 @@ pub fn analyze(
             let stmts = body_size(body);
             println!("{:?} {} {} {:.3}", f, blocks, stmts, *t as f32 / 1000.0);
         }
-    }
-
-    if has_restarted {
-        wbrets.clear();
-        rcfws.clear();
     }
 
     summaries
@@ -749,9 +743,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
     }
 
-    fn analyze_body(&mut self, body: &Body<'tcx>) -> (AnalyzedBody, bool) {
+    fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
         let mut start_state = AbsState::bot();
-        let mut restarted = false;
         start_state.writes = MustPathSet::top();
         start_state.nulls = MustPathSet::top();
 
@@ -915,21 +908,17 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     }
                 }
                 if restart {
-                    restarted = true;
                     continue 'analysis_loop;
                 }
             }
             break (states, writes_map);
         };
 
-        (
-            AnalyzedBody {
-                states,
-                writes_map,
-                init_state,
-            },
-            restarted,
-        )
+        AnalyzedBody {
+            states,
+            writes_map,
+            init_state,
+        }
     }
 
     pub fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
