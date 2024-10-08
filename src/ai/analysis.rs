@@ -396,6 +396,7 @@ pub fn analyze(
 
     if conf.max_loop_head_states <= 1 {
         wbrets.clear();
+        rcfws.clear();
     }
 
     if let Some(n) = &conf.function_times {
