@@ -23,20 +23,29 @@ static mut N_MUST: usize = 0;
 static mut N_MAY: usize = 0;
 static mut N_DIRECT_RETURNS: usize = 0;
 static mut N_REMOVED_CHECKS: usize = 0;
-static mut N_REMOVED_POINTERS: usize = 0;
 
-pub fn transform_path(path: &Path, analysis_result: &AnalysisResult) {
+#[derive(Default, Clone, Copy)]
+struct Counter {
+    removed_pointer_defs: usize,
+    removed_pointer_uses: usize,
+}
+
+pub fn transform_path(path: &Path, analysis_result: &AnalysisResult, simplify: bool) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
     let suggestions =
-        compile_util::run_compiler(config, |tcx| transform(tcx, analysis_result)).unwrap();
+        compile_util::run_compiler(config, |tcx| transform(tcx, analysis_result, simplify))
+            .unwrap();
     compile_util::apply_suggestions(&suggestions);
 }
 
 fn transform(
     tcx: TyCtxt<'_>,
     analysis_result: &AnalysisResult,
+    simplify: bool,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
+    let mut counter = Counter::default();
+
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
@@ -237,38 +246,42 @@ fn transform(
         // in deref expression, pointer name to expression span
         let mut ref_to_spans: BTreeMap<String, Vec<Span>> = BTreeMap::new();
 
+        // in deref expression in return, return span to pointer name and deref span
         let mut ret_to_ref_spans: BTreeMap<Span, Vec<(String, Span)>> = BTreeMap::new();
 
+        // in deref expression in call, pointer name and deref span
         let mut ref_and_call_spans = vec![];
 
-        if let Some(func) = curr {
-            let hirids = BTreeSet::from_iter(
-                visitor
-                    .calls
-                    .iter()
-                    .filter_map(|c| funcs.get(&c.callee).map(|_| c.hir_id)),
-            );
-            let params = BTreeSet::from_iter(func.params().map(|p| p.name.clone()));
+        if simplify {
+            if let Some(func) = curr {
+                let hirids = BTreeSet::from_iter(
+                    visitor
+                        .calls
+                        .iter()
+                        .filter_map(|c| funcs.get(&c.callee).map(|_| c.hir_id)),
+                );
+                let params = BTreeSet::from_iter(func.params().map(|p| p.name.clone()));
 
-            for rf in visitor.refs {
-                let Ref { hir_id, span, name } = rf;
-                if params.contains(&name) && !passes.contains(&name) {
-                    if let Some(expr) = get_parent_call(hir_id, tcx) {
-                        if hirids.contains(&expr.hir_id) {
-                            ref_and_call_spans.push((name, span));
+                for rf in visitor.refs {
+                    let Ref { hir_id, span, name } = rf;
+                    if params.contains(&name) && !passes.contains(&name) {
+                        if let Some(expr) = get_parent_call(hir_id, tcx) {
+                            if hirids.contains(&expr.hir_id) {
+                                ref_and_call_spans.push((name, span));
+                                continue;
+                            }
+                        }
+
+                        if let Some(expr) = get_parent_return(hir_id, tcx) {
+                            ret_to_ref_spans
+                                .entry(expr.span)
+                                .or_default()
+                                .push((name, span));
                             continue;
                         }
-                    }
 
-                    if let Some(expr) = get_parent_return(hir_id, tcx) {
-                        ret_to_ref_spans
-                            .entry(expr.span)
-                            .or_default()
-                            .push((name, span));
-                        continue;
+                        ref_to_spans.entry(name.clone()).or_default().push(span);
                     }
-
-                    ref_to_spans.entry(name.clone()).or_default().push(span);
                 }
             }
         }
@@ -286,7 +299,7 @@ fn transform(
             let mut args = args.clone();
 
             for arg in args.iter_mut() {
-                for (name, span) in ref_and_call_spans.iter() {
+                for (name, span) in &ref_and_call_spans {
                     if arg.span.contains(*span) {
                         let pre_span = arg.span.with_hi(span.lo());
                         let post_span = arg.span.with_lo(span.hi());
@@ -295,6 +308,7 @@ fn transform(
                         let post_s = source_map.span_to_snippet(post_span).unwrap();
 
                         arg.code = format!("{}{}___v{}", pre_s, name, post_s);
+                        counter.removed_pointer_uses += 1;
                     }
                 }
             }
@@ -470,7 +484,7 @@ fn transform(
             .params()
             .map(|param| {
                 if param.must || (!unremovable.contains(&param.name)) {
-                    if passes.contains(&param.name) {
+                    if passes.contains(&param.name) || !simplify {
                         format!(
                             "
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
@@ -478,13 +492,14 @@ fn transform(
                             param.name, param.ty,
                         )
                     } else {
+                        counter.removed_pointer_defs += 1;
                         format!(
                             "
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
                             param.name, param.ty,
                         )
                     }
-                } else if passes.contains(&param.name) {
+                } else if passes.contains(&param.name) || !simplify {
                     format!(
                         "
     let mut {0}___s: bool = false; \
@@ -493,6 +508,7 @@ fn transform(
                         param.name, param.ty,
                     )
                 } else {
+                    counter.removed_pointer_defs += 1;
                     format!(
                         "
     let mut {0}___s: bool = false; \
@@ -570,26 +586,23 @@ fn transform(
             if let Some(spans) = ref_to_spans.get(&param.name) {
                 for span in spans {
                     let assign = format!("{}___v", param.name);
-                    unsafe {
-                        N_REMOVED_POINTERS += 1;
-                    }
+                    counter.removed_pointer_uses += 1;
                     fix(*span, assign);
                 }
             }
         }
 
-        for (span, ss) in ret_to_ref_spans.iter() {
+        for (span, mut ss) in ret_to_ref_spans {
             let mut post_spans = vec![];
 
-            let mut sorted_ss = ss.clone();
-            sorted_ss.sort_by_key(|x| x.1);
+            ss.sort_by_key(|x| x.1);
 
-            let s = sorted_ss[0].1;
+            let s = ss[0].1;
 
             let pre_span = span.with_hi(s.lo()).with_lo(span.lo() + BytePos(6));
             post_spans.push(span.with_lo(s.hi()));
 
-            for (i, (_, s)) in sorted_ss[1..].iter().enumerate() {
+            for (i, (_, s)) in ss[1..].iter().enumerate() {
                 post_spans[i] = post_spans[i].with_hi(s.lo());
                 post_spans.push(span.with_lo(s.hi()));
             }
@@ -597,11 +610,15 @@ fn transform(
             let pre_s = source_map.span_to_snippet(pre_span).unwrap();
             let post_s = source_map.span_to_snippet(post_spans[0]).unwrap();
 
-            let mut rv = format!("{}{}___v{}", pre_s, sorted_ss[0].0, post_s);
+            let mut rv = format!("{}{}___v{}", pre_s, ss[0].0, post_s);
+            counter.removed_pointer_uses += 1;
 
             for (i, s) in post_spans[1..].iter().enumerate() {
                 let post_s = source_map.span_to_snippet(*s).unwrap();
-                rv = format!("{}{}___v{}", rv, sorted_ss[i + 1].0, post_s);
+                rv.push_str(&ss[i + 1].0);
+                rv.push_str("___v");
+                rv.push_str(&post_s);
+                counter.removed_pointer_uses += 1;
             }
             let rv = func.return_value(
                 Some(rv),
@@ -612,7 +629,7 @@ fn transform(
                 None,
             );
 
-            fix(*span, format!("return {}", rv));
+            fix(span, format!("return {}", rv));
         }
 
         if func.is_unit {
@@ -648,21 +665,19 @@ fn transform(
         });
     }
 
+    println!("Removed pointer defs: {}", counter.removed_pointer_defs);
+    println!("Removed pointer uses: {}", counter.removed_pointer_uses);
+    println!("Must write before return simplifications : {}", unsafe {
+        N_MUST
+    });
     println!(
-        "Number of must write before return simplifications : {}",
-        unsafe { N_MUST }
-    );
-    println!(
-        "Number of must not write before return simplifications : {}",
+        "Must not write before return simplifications : {}",
         unsafe { N_MAY }
     );
-    println!("Number of direct return simplifications : {}", unsafe {
+    println!("Direct return simplifications : {}", unsafe {
         N_DIRECT_RETURNS
     });
-    println!("Number of removed checks: {}", unsafe { N_REMOVED_CHECKS });
-    println!("Number of removed pointers: {}", unsafe {
-        N_REMOVED_POINTERS
-    });
+    println!("Removed checks: {}", unsafe { N_REMOVED_CHECKS });
 
     suggestions
 }
@@ -1267,9 +1282,6 @@ fn generate_set_flag(
             }
         }
         return format!("{}___s = true;", arg);
-    }
-    unsafe {
-        N_REMOVED_CHECKS += 1;
     }
     "".to_string()
 }

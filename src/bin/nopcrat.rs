@@ -25,6 +25,8 @@ struct Args {
 
     #[arg(short, long)]
     transform: bool,
+    #[arg(long)]
+    simplify: bool,
     #[arg(short, long)]
     size: bool,
     #[arg(long)]
@@ -148,7 +150,7 @@ fn main() {
         return;
     }
 
-    transform::transform_path(path, &analysis_result);
+    transform::transform_path(path, &analysis_result, args.simplify);
 }
 
 fn clear_dir(path: &Path) {
