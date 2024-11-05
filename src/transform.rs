@@ -19,17 +19,37 @@ use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
 
-pub fn transform_path(path: &Path, params: &BTreeMap<String, Vec<OutputParam>>) {
+#[derive(Default, Clone, Copy)]
+struct Counter {
+    simplify: bool,
+    removed_pointer_defs: usize,
+    removed_pointer_uses: usize,
+    direct_returns: usize,
+    success_returns: usize,
+    failure_returns: usize,
+    removed_flag_sets: usize,
+    removed_flag_defs: usize,
+}
+
+pub fn transform_path(path: &Path, analysis_result: &AnalysisResult, simplify: bool) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
-    let suggestions = compile_util::run_compiler(config, |tcx| transform(tcx, params)).unwrap();
+    let suggestions =
+        compile_util::run_compiler(config, |tcx| transform(tcx, analysis_result, simplify))
+            .unwrap();
     compile_util::apply_suggestions(&suggestions);
 }
 
 fn transform(
     tcx: TyCtxt<'_>,
-    param_map: &BTreeMap<String, Vec<OutputParam>>,
+    analysis_result: &AnalysisResult,
+    simplify: bool,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
+    let mut counter = Counter {
+        simplify,
+        ..Counter::default()
+    };
+
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
@@ -48,6 +68,8 @@ fn transform(
     }
 
     let mut funcs = BTreeMap::new();
+    let mut wbrs = BTreeMap::new();
+    let mut rcfws = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
         let ItemKind::Fn(sig, _, body_id) = item.kind else {
@@ -55,10 +77,11 @@ fn transform(
         };
         let def_id = id.owner_id.to_def_id();
         let name = tcx.def_path_str(def_id);
-        let params = some_or!(param_map.get(&name), continue);
+        let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let body = hir.body(body_id);
         let mir_body = tcx.optimized_mir(def_id);
-        let index_map: BTreeMap<_, _> = params
+        let index_map: BTreeMap<_, _> = fn_analysis_result
+            .output_params
             .iter()
             .map(|param| {
                 let OutputParam {
@@ -135,13 +158,51 @@ fn transform(
                 (*index, param)
             })
             .collect();
+
+        wbrs.insert(
+            def_id,
+            fn_analysis_result
+                .wbrs
+                .iter()
+                .map(|wbr| {
+                    (
+                        wbr.span.to_span(),
+                        (
+                            wbr.mays
+                                .iter()
+                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                .collect::<Vec<_>>(),
+                            wbr.musts
+                                .iter()
+                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        rcfws.insert(
+            def_id,
+            fn_analysis_result
+                .rcfws
+                .iter()
+                .map(|(index, spans)| {
+                    (
+                        index_map.get(index).cloned().unwrap().name,
+                        spans.iter().map(|sp| sp.to_span()).collect(),
+                    )
+                })
+                .collect::<BTreeMap<String, Vec<Span>>>(),
+        );
+
         let hir_id_map: BTreeMap<_, _> = index_map
             .values()
             .cloned()
             .map(|param| (param.hir_id, param))
             .collect();
         let mut remaining_return: Vec<_> = index_map.keys().copied().collect();
-        let first_return = SuccValue::find(params);
+        let first_return = SuccValue::find(&fn_analysis_result.output_params);
         if let Some((_, first)) = &first_return {
             remaining_return.retain(|i| i != first);
         }
@@ -175,56 +236,61 @@ fn transform(
         let body = hir.body(body_id);
         let curr = funcs.get(&def_id);
 
+        let default = BTreeMap::new();
+        let rcfw = rcfws.get(&def_id).unwrap_or(&default);
+
         let mut visitor = BodyVisitor::new(tcx);
         visitor.visit_body(body);
 
-        let mut pass_visitor = PassVisitor::new(tcx);
-        pass_visitor.visit_body(body);
-
-        let passes = BTreeSet::from_iter(pass_visitor.passes.iter());
+        let passes = BTreeSet::from_iter(visitor.passes.iter());
 
         let mut ret_call_spans = BTreeSet::new();
         let mut call_spans = BTreeSet::new();
 
+        // in deref expression, pointer name to expression span
         let mut ref_to_spans: BTreeMap<String, Vec<Span>> = BTreeMap::new();
 
+        // in deref expression in return, return span to pointer name and deref span
         let mut ret_to_ref_spans: BTreeMap<Span, Vec<(String, Span)>> = BTreeMap::new();
 
+        // in deref expression in call, pointer name and deref span
         let mut ref_and_call_spans = vec![];
 
-        if let Some(func) = curr {
-            let hirids = BTreeSet::from_iter(
-                visitor
-                    .calls
-                    .iter()
-                    .filter_map(|c| funcs.get(&c.callee).map(|_| c.hir_id)),
-            );
-            let params = BTreeSet::from_iter(func.params().map(|p| p.name.clone()));
+        if simplify {
+            if let Some(func) = curr {
+                let hirids = BTreeSet::from_iter(
+                    visitor
+                        .calls
+                        .iter()
+                        .filter_map(|c| funcs.get(&c.callee).map(|_| c.hir_id)),
+                );
+                let params = BTreeSet::from_iter(func.params().map(|p| p.name.clone()));
 
-            for rf in visitor.refs {
-                let Ref { hir_id, span, name } = rf;
-                if params.contains(&name) && !passes.contains(&name) {
-                    if let Some(expr) = get_parent_call(hir_id, tcx) {
-                        if hirids.contains(&expr.hir_id) {
-                            ref_and_call_spans.push((name, span));
+                for rf in visitor.refs {
+                    let Ref { hir_id, span, name } = rf;
+                    if params.contains(&name) && !passes.contains(&name) {
+                        if let Some(expr) = get_parent_call(hir_id, tcx) {
+                            if hirids.contains(&expr.hir_id) {
+                                ref_and_call_spans.push((name, span));
+                                continue;
+                            }
+                        }
+
+                        if let Some(expr) = get_parent_return(hir_id, tcx) {
+                            ret_to_ref_spans
+                                .entry(expr.span)
+                                .or_default()
+                                .push((name, span));
                             continue;
                         }
-                    }
 
-                    if let Some(expr) = get_parent_return(hir_id, tcx) {
-                        ret_to_ref_spans
-                            .entry(expr.span)
-                            .or_default()
-                            .push((name, span));
-                        continue;
+                        ref_to_spans.entry(name.clone()).or_default().push(span);
                     }
-
-                    ref_to_spans.entry(name.clone()).or_default().push(span);
                 }
             }
         }
 
-        for call in visitor.calls {
+        for call in visitor.calls.clone() {
             let Call {
                 hir_id,
                 span,
@@ -237,7 +303,7 @@ fn transform(
             let mut args = args.clone();
 
             for arg in args.iter_mut() {
-                for (name, span) in ref_and_call_spans.iter() {
+                for (name, span) in &ref_and_call_spans {
                     if arg.span.contains(*span) {
                         let pre_span = arg.span.with_hi(span.lo());
                         let post_span = arg.span.with_lo(span.hi());
@@ -246,6 +312,7 @@ fn transform(
                         let post_s = source_map.span_to_snippet(post_span).unwrap();
 
                         arg.code = format!("{}{}___v{}", pre_s, name, post_s);
+                        counter.removed_pointer_uses += 1;
                     }
                 }
             }
@@ -256,7 +323,11 @@ fn transform(
             }
 
             let assign_map = curr.map(|c| c.assign_map(span)).unwrap_or_default();
-            let mut mtch = func.call_match(&args, &assign_map);
+
+            let mut mtch = func.first_return.and_then(|(_, first)| {
+                let set_flag = generate_set_flag(&span, &first, rcfw, &assign_map, &mut counter);
+                func.call_match(&args, set_flag)
+            });
 
             if let Some(call) = get_if_cmp_call(hir_id, span, tcx) {
                 if let Some(then) = func.cmp(call.op, call.target) {
@@ -268,11 +339,7 @@ fn transform(
                     let fail = "Err(_) => ";
                     let (_, i) = func.first_return.as_ref().unwrap();
                     let arg = &args[*i];
-                    let set_flag = if let Some(arg) = assign_map.get(i) {
-                        format!("{}___s = true;", arg)
-                    } else {
-                        "".to_string()
-                    };
+                    let set_flag = generate_set_flag(&span, i, rcfw, &assign_map, &mut counter);
                     let assign = if arg.code.contains("&mut ") {
                         format!(" *({}) = v___; {}", arg.code, set_flag)
                     } else {
@@ -338,7 +405,15 @@ fn transform(
 
                     let post_span = post_span.with_hi(post_span.hi() + BytePos(1));
                     let rv = format!("{}rv___{}", pre_s, post_s);
-                    let rv = func.return_value(Some(rv));
+                    let rv = func.return_value(
+                        Some(rv),
+                        wbrs[&def_id]
+                            .iter()
+                            .find(|(sp, _)| span.contains(*sp))
+                            .map(|r| &r.1),
+                        None,
+                        &mut counter,
+                    );
                     fix(
                         post_span,
                         format!("; return {};{}", rv, if arm { " }" } else { "" }),
@@ -352,7 +427,18 @@ fn transform(
             }
             fix(span.shrink_to_lo(), binding);
 
-            let mut assign = func.call_assign(&args, &assign_map);
+            let set_flags = func
+                .remaining_return
+                .iter()
+                .map(|i| {
+                    (
+                        *i,
+                        generate_set_flag(&span, i, rcfw, &assign_map, &mut counter),
+                    )
+                })
+                .collect();
+
+            let mut assign = func.call_assign(&args, &set_flags);
             if let Some(m) = &mtch {
                 assign += m;
                 assign += ")";
@@ -376,11 +462,39 @@ fn transform(
         let ret_ty = func.return_type(orig);
         fix(span, format!("-> {}", ret_ty));
 
+        let mut unremovable = BTreeSet::new();
+        for param in func.params() {
+            let rcfw = rcfw.get(&param.name);
+
+            for span in &param.writes {
+                if let Some(rcfw) = rcfw {
+                    if rcfw.iter().any(|sp| span.contains(*sp)) && simplify {
+                        counter.removed_flag_sets += 1;
+                        continue;
+                    }
+                }
+
+                unremovable.insert(&param.name);
+
+                if call_spans.contains(span) {
+                    continue;
+                }
+
+                let pos = span.hi() + BytePos(1);
+                let span = span.with_hi(pos).with_lo(pos);
+                let assign = format!("{0}___s = true;", param.name);
+                fix(span, assign);
+            }
+        }
+
         let local_vars: String = func
             .params()
             .map(|param| {
-                if param.must {
-                    if passes.contains(&param.name) {
+                if param.must || (!unremovable.contains(&param.name) && simplify) {
+                    if !param.must {
+                        counter.removed_flag_defs += 1;
+                    }
+                    if passes.contains(&param.name) || !simplify {
                         format!(
                             "
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
@@ -388,25 +502,27 @@ fn transform(
                             param.name, param.ty,
                         )
                     } else {
+                        counter.removed_pointer_defs += 1;
                         format!(
                             "
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
                             param.name, param.ty,
                         )
                     }
-                } else if passes.contains(&param.name) {
+                } else if passes.contains(&param.name) || !simplify {
                     format!(
                         "
-                let mut {0}___s: bool = false; \
-                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-                let mut {0}: *mut {1} = &mut {0}___v;",
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
+    let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
                     )
                 } else {
+                    counter.removed_pointer_defs += 1;
                     format!(
                         "
-                let mut {0}___s: bool = false; \
-                let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
                         param.name, param.ty,
                     )
                 }
@@ -417,39 +533,83 @@ fn transform(
         let span = body.value.span.with_lo(pos).with_hi(pos);
         fix(span, local_vars);
 
-        for param in func.params() {
-            for span in &param.writes {
-                if call_spans.contains(span) {
+        for ret in visitor.returns.iter() {
+            let Return { span, value } = ret;
+            if ret_call_spans.contains(span) || ret_to_ref_spans.contains_key(span) {
+                continue;
+            }
+
+            let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
+
+            let mut assign_before_ret = None;
+            for assign in visitor.assigns.iter() {
+                if visitor
+                    .calls
+                    .iter()
+                    .any(|call| call.span.overlaps(assign.span))
+                {
                     continue;
                 }
-                let pos = span.hi() + BytePos(1);
-                let span = span.with_hi(pos).with_lo(pos);
-                let assign = format!("{0}___s = true;", param.name);
-                fix(span, assign);
+                if source_map
+                    .span_to_snippet(assign.span.between(*span))
+                    .unwrap()
+                    .chars()
+                    .all(|c| c.is_whitespace())
+                {
+                    assign_before_ret = Some(assign);
+                    break;
+                }
             }
+
+            let mut lit_map = None;
+
+            if let Some(assign_before_ret) = assign_before_ret {
+                let Assign {
+                    name,
+                    value,
+                    span: sp,
+                } = assign_before_ret;
+
+                if let Some(spans) = ref_to_spans.get_mut(name) {
+                    spans.retain(|span| !sp.contains(*span));
+                    lit_map = Some((name, value));
+                    fix(*sp, "".to_string());
+                }
+            }
+
+            let ret_v = func.return_value(
+                orig,
+                wbrs[&def_id]
+                    .iter()
+                    .find(|(sp, _)| span.contains(*sp))
+                    .map(|r| &r.1),
+                lit_map,
+                &mut counter,
+            );
+            fix(*span, format!("return {}", ret_v));
         }
 
         for param in func.params() {
             if let Some(spans) = ref_to_spans.get(&param.name) {
                 for span in spans {
                     let assign = format!("{}___v", param.name);
+                    counter.removed_pointer_uses += 1;
                     fix(*span, assign);
                 }
             }
         }
 
-        for (span, ss) in ret_to_ref_spans.iter() {
+        for (span, mut ss) in ret_to_ref_spans {
             let mut post_spans = vec![];
 
-            let mut sorted_ss = ss.clone();
-            sorted_ss.sort_by_key(|x| x.1);
+            ss.sort_by_key(|x| x.1);
 
-            let s = sorted_ss[0].1;
+            let s = ss[0].1;
 
             let pre_span = span.with_hi(s.lo()).with_lo(span.lo() + BytePos(6));
             post_spans.push(span.with_lo(s.hi()));
 
-            for (i, (_, s)) in sorted_ss[1..].iter().enumerate() {
+            for (i, (_, s)) in ss[1..].iter().enumerate() {
                 post_spans[i] = post_spans[i].with_hi(s.lo());
                 post_spans.push(span.with_lo(s.hi()));
             }
@@ -457,32 +617,49 @@ fn transform(
             let pre_s = source_map.span_to_snippet(pre_span).unwrap();
             let post_s = source_map.span_to_snippet(post_spans[0]).unwrap();
 
-            let mut rv = format!("{}{}___v{}", pre_s, sorted_ss[0].0, post_s);
+            let mut rv = format!("{}{}___v{}", pre_s, ss[0].0, post_s);
+            counter.removed_pointer_uses += 1;
 
             for (i, s) in post_spans[1..].iter().enumerate() {
                 let post_s = source_map.span_to_snippet(*s).unwrap();
-                rv = format!("{}{}___v{}", rv, sorted_ss[i + 1].0, post_s);
+                rv.push_str(&ss[i + 1].0);
+                rv.push_str("___v");
+                rv.push_str(&post_s);
+                counter.removed_pointer_uses += 1;
             }
-            let rv = func.return_value(Some(rv));
+            let rv = func.return_value(
+                Some(rv),
+                wbrs[&def_id]
+                    .iter()
+                    .find(|(sp, _)| span.contains(*sp))
+                    .map(|r| &r.1),
+                None,
+                &mut counter,
+            );
 
-            fix(*span, format!("return {}", rv));
-        }
-
-        for ret in visitor.returns {
-            let Return { span, value } = ret;
-            if ret_call_spans.contains(&span) || ret_to_ref_spans.contains_key(&span) {
-                continue;
-            }
-            let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
-            let ret_v = func.return_value(orig);
-            fix(span, format!("return {}", ret_v));
+            fix(span, format!("return {}", rv));
         }
 
         if func.is_unit {
             let pos = body.value.span.hi() - BytePos(1);
             let span = body.value.span.with_lo(pos).with_hi(pos);
-            let ret_v = func.return_value(None);
-            fix(span, ret_v);
+            let pos = pos - BytePos(3);
+            let prev = span.with_lo(pos).with_hi(pos);
+
+            let mut skip = false;
+
+            for ret in visitor.returns {
+                let Return { span, value: _ } = ret;
+                if span.overlaps(prev) {
+                    skip = true;
+                    break;
+                }
+            }
+
+            if !skip {
+                let ret_v = func.return_value(None, None, None, &mut counter);
+                fix(span, format!("\t{}\n", ret_v));
+            }
         }
     }
     suggestions.retain(|_, v| !v.is_empty());
@@ -495,6 +672,15 @@ fn transform(
             )
         });
     }
+
+    println!("Removed pointer defs: {}", counter.removed_pointer_defs);
+    println!("Removed pointer uses: {}", counter.removed_pointer_uses);
+    println!("Direct returns: {}", counter.direct_returns);
+    println!("Success returns: {}", counter.success_returns);
+    println!("Failure returns: {}", counter.failure_returns);
+    println!("Removed flag sets: {}", counter.removed_flag_sets);
+    println!("Removed flag defs: {}", counter.removed_flag_defs);
+
     suggestions
 }
 
@@ -566,34 +752,29 @@ impl Func {
         map
     }
 
-    fn call_assign(&self, args: &[Arg], assign_map: &BTreeMap<usize, String>) -> String {
+    fn call_assign(&self, args: &[Arg], set_flags: &BTreeMap<usize, String>) -> String {
         let mut assigns = vec![];
         for i in &self.remaining_return {
             let arg = &args[*i];
             let param = &self.index_map[i];
-            let set_flag = if let Some(arg) = assign_map.get(i) {
-                format!("{}___s = true;", arg)
-            } else {
-                "".to_string()
-            };
             let assign = if param.must {
                 if arg.code.contains("&mut ") {
-                    format!("*({}) = rv___{}; {}", arg.code, i, set_flag)
+                    format!("*({}) = rv___{}; {}", arg.code, i, set_flags[i])
                 } else {
                     format!(
                         "if !({0}).is_null() {{ *({0}) = rv___{1}; {2} }}",
-                        arg.code, i, set_flag
+                        arg.code, i, set_flags[i]
                     )
                 }
             } else if arg.code.contains("&mut ") {
                 format!(
                     "if let Some(v___) = rv___{} {{ *({}) = v___; {} }}",
-                    i, arg.code, set_flag
+                    i, arg.code, set_flags[i]
                 )
             } else {
                 format!(
                     "if !({0}).is_null() {{ if let Some(v___) = rv___{1} {{ *({0}) = v___; {2} }} }}",
-                    arg.code, i, set_flag
+                    arg.code, i, set_flags[i]
                 )
             };
             assigns.push(assign);
@@ -602,14 +783,9 @@ impl Func {
         mk_string(assigns.iter(), "; ", " ", end)
     }
 
-    fn call_match(&self, args: &[Arg], assign_map: &BTreeMap<usize, String>) -> Option<String> {
+    fn call_match(&self, args: &[Arg], set_flag: String) -> Option<String> {
         let (succ_value, first) = &self.first_return?;
         let arg = &args[*first];
-        let set_flag = if let Some(arg) = assign_map.get(first) {
-            format!("{}___s = true;", arg)
-        } else {
-            "".to_string()
-        };
         let assign = if arg.code.contains("&mut ") {
             format!("*({}) = v___; {}", arg.code, set_flag)
         } else {
@@ -655,25 +831,82 @@ impl Func {
         }
     }
 
-    fn return_value(&self, orig: Option<String>) -> String {
+    fn return_value(
+        &self,
+        orig: Option<String>,
+        wbr: Option<&(Vec<String>, Vec<String>)>,
+        lit_map: Option<(&String, &String)>,
+        counter: &mut Counter,
+    ) -> String {
         let mut values = vec![];
         if let Some((_, i)) = &self.first_return {
             let orig = orig.unwrap();
             let param = &self.index_map[i];
-            let v = format!(
-                "if {0}___s {{ Ok({0}___v) }} else {{ Err({1}) }}",
-                param.name, orig
-            );
+            let name = lit_map
+                .and_then(|(n, v)| {
+                    if *n == param.name && counter.simplify {
+                        counter.direct_returns += 1;
+                        Some((*v).clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(format!("{}___v", param.name));
+            let v = if let Some((may, must)) = wbr {
+                if must.contains(&param.name) && counter.simplify {
+                    counter.success_returns += 1;
+                    format!("Ok({})", name)
+                } else if !may.contains(&param.name) && counter.simplify {
+                    counter.failure_returns += 1;
+                    format!("Err({})", orig)
+                } else {
+                    format!(
+                        "if {0}___s {{ Ok({1}) }} else {{ Err({2}) }}",
+                        param.name, name, orig
+                    )
+                }
+            } else {
+                format!(
+                    "if {0}___s {{ Ok({1}) }} else {{ Err({2}) }}",
+                    param.name, name, orig
+                )
+            };
             values.push(v);
         } else if let Some(v) = orig {
             values.push(v);
         }
         for i in &self.remaining_return {
             let param = &self.index_map[i];
+            let name = lit_map
+                .and_then(|(n, v)| {
+                    if *n == param.name && counter.simplify {
+                        counter.direct_returns += 1;
+                        Some((*v).clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(format!("{}___v", param.name));
             let v = if param.must {
-                format!("{}___v", param.name)
+                name
+            } else if let Some((may, must)) = wbr {
+                if must.contains(&param.name) && counter.simplify {
+                    counter.success_returns += 1;
+                    format!("Some({})", name)
+                } else if !may.contains(&param.name) && counter.simplify {
+                    counter.failure_returns += 1;
+                    "None".to_string()
+                } else {
+                    format!(
+                        "if {0}___s {{ Some({1}) }} else {{ None }}",
+                        param.name, name
+                    )
+                }
             } else {
-                format!("if {0}___s {{ Some({0}___v) }} else {{ None }}", param.name)
+                format!(
+                    "if {0}___s {{ Some({1}) }} else {{ None }}",
+                    param.name, name
+                )
             };
             values.push(v);
         }
@@ -685,13 +918,13 @@ impl Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Return {
     span: Span,
     value: Option<Span>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Call {
     hir_id: HirId,
     span: Span,
@@ -712,44 +945,11 @@ struct Ref {
     name: String,
 }
 
-struct PassVisitor<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    passes: Vec<String>,
-}
-
-impl<'tcx> PassVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>) -> Self {
-        Self {
-            tcx,
-            passes: vec![],
-        }
-    }
-}
-
-impl<'tcx> HVisitor<'tcx> for PassVisitor<'tcx> {
-    type NestedFilter = nested_filter::OnlyBodies;
-
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
-    }
-
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        let source_map = self.tcx.sess.source_map();
-        if let ExprKind::Path(p) = expr.kind {
-            if let Ok(code) = source_map.span_to_snippet(p.qself_span()) {
-                match get_parent(expr.hir_id, self.tcx) {
-                    Some(e) => {
-                        if let ExprKind::Unary(UnOp::Deref, _) = e.kind {
-                        } else {
-                            self.passes.push(code)
-                        }
-                    }
-                    None => self.passes.push(code),
-                }
-            }
-        }
-        rustc_hir::intravisit::walk_expr(self, expr);
-    }
+#[derive(Debug)]
+struct Assign {
+    name: String,
+    value: String,
+    span: Span,
 }
 
 struct BodyVisitor<'tcx> {
@@ -757,6 +957,8 @@ struct BodyVisitor<'tcx> {
     returns: Vec<Return>,
     calls: Vec<Call>,
     refs: Vec<Ref>,
+    passes: Vec<String>,
+    assigns: Vec<Assign>,
 }
 
 impl<'tcx> BodyVisitor<'tcx> {
@@ -766,6 +968,8 @@ impl<'tcx> BodyVisitor<'tcx> {
             returns: vec![],
             calls: vec![],
             refs: vec![],
+            passes: vec![],
+            assigns: vec![],
         }
     }
 }
@@ -812,6 +1016,46 @@ impl<'tcx> BodyVisitor<'tcx> {
         };
         self.calls.push(call);
     }
+
+    fn visit_expr_path(&mut self, expr: &'tcx Expr<'tcx>, path: QPath<'tcx>) {
+        let source_map = self.tcx.sess.source_map();
+        if let Ok(code) = source_map.span_to_snippet(path.qself_span()) {
+            match get_parent(expr.hir_id, self.tcx) {
+                Some(e) => {
+                    if let ExprKind::Unary(UnOp::Deref, _) = e.kind {
+                    } else {
+                        self.passes.push(code)
+                    }
+                }
+                None => self.passes.push(code),
+            }
+        }
+    }
+
+    fn visit_expr_unary(&mut self, expr: &'tcx Expr<'tcx>, e: &'tcx Expr<'tcx>) {
+        let source_map = self.tcx.sess.source_map();
+        self.refs.push(Ref {
+            hir_id: expr.hir_id,
+            span: expr.span,
+            name: source_map.span_to_snippet(e.span).unwrap(),
+        })
+    }
+
+    fn visit_expr_assign(
+        &mut self,
+        expr: &'tcx Expr<'tcx>,
+        lhs: &'tcx Expr<'tcx>,
+        rhs: &'tcx Expr<'tcx>,
+    ) {
+        let source_map = self.tcx.sess.source_map();
+        if let ExprKind::Unary(UnOp::Deref, e) = lhs.kind {
+            self.assigns.push(Assign {
+                name: source_map.span_to_snippet(e.span).unwrap(),
+                value: source_map.span_to_snippet(rhs.span).unwrap(),
+                span: expr.span.with_hi(expr.span.hi() + BytePos(1)),
+            });
+        }
+    }
 }
 
 impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
@@ -822,15 +1066,12 @@ impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        let source_map = self.tcx.sess.source_map();
         match expr.kind {
-            ExprKind::Unary(UnOp::Deref, e) => self.refs.push(Ref {
-                hir_id: expr.hir_id,
-                span: expr.span,
-                name: source_map.span_to_snippet(e.span).unwrap(),
-            }),
             ExprKind::Ret(e) => self.visit_expr_ret(expr, e),
             ExprKind::Call(callee, args) => self.visit_expr_call(expr, callee, args),
+            ExprKind::Path(path) => self.visit_expr_path(expr, path),
+            ExprKind::Unary(UnOp::Deref, e) => self.visit_expr_unary(expr, e),
+            ExprKind::Assign(lhs, rhs, _) => self.visit_expr_assign(expr, lhs, rhs),
             _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
@@ -1013,4 +1254,24 @@ fn mk_string<S: AsRef<str>, I: Iterator<Item = S>>(
     }
     s.push_str(end);
     s
+}
+
+fn generate_set_flag(
+    span: &Span,
+    i: &usize,
+    rcfws: &BTreeMap<String, Vec<Span>>,
+    assign_map: &BTreeMap<usize, String>,
+    counter: &mut Counter,
+) -> String {
+    if let Some(arg) = assign_map.get(i) {
+        let rcfw = &rcfws.get(arg);
+        if let Some(rcfw) = rcfw {
+            if rcfw.iter().any(|sp| span.contains(*sp)) && counter.simplify {
+                counter.removed_flag_sets += 1;
+                return "".to_string();
+            }
+        }
+        return format!("{}___s = true;", arg);
+    }
+    "".to_string()
 }

@@ -25,6 +25,8 @@ struct Args {
 
     #[arg(short, long)]
     transform: bool,
+    #[arg(long)]
+    simplify: bool,
     #[arg(short, long)]
     size: bool,
     #[arg(long)]
@@ -98,9 +100,9 @@ fn main() {
     };
 
     if args.verbose {
-        for (func, params) in &analysis_result {
+        for (func, res) in &analysis_result {
             println!("{}", func);
-            for param in params {
+            for param in &res.output_params {
                 println!("  {:?}", param);
             }
         }
@@ -117,7 +119,7 @@ fn main() {
     if args.sample_may || args.sample_must {
         let mut params: Vec<_> = analysis_result
             .iter()
-            .filter(|(_, params)| params.iter().any(|p| p.must == args.sample_must))
+            .filter(|(_, res)| res.output_params.iter().any(|p| p.must == args.sample_must))
             .collect();
         params.shuffle(&mut thread_rng());
         for (f, ps) in params.iter().take(10) {
@@ -130,11 +132,11 @@ fn main() {
         let fns = analysis_result.len();
         let musts = analysis_result
             .values()
-            .map(|v| v.iter().filter(|p| p.must).count())
+            .map(|res| res.output_params.iter().filter(|p| p.must).count())
             .sum::<usize>();
         let mays = analysis_result
             .values()
-            .map(|v| v.iter().filter(|p| !p.must).count())
+            .map(|res| res.output_params.iter().filter(|p| !p.must).count())
             .sum::<usize>();
         println!("{} {} {}", fns, musts, mays);
     }
@@ -148,7 +150,7 @@ fn main() {
         return;
     }
 
-    transform::transform_path(path, &analysis_result);
+    transform::transform_path(path, &analysis_result, args.simplify);
 }
 
 fn clear_dir(path: &Path) {
