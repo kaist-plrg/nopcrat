@@ -22,9 +22,57 @@ use rustc_session::{
 use rustc_span::{
     edition::Edition,
     source_map::{FileName, SourceMap},
-    RealFileName, Span,
+    BytePos, RealFileName, Span, SpanData, SyntaxContext,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LoHi {
+    lo: u32,
+    hi: u32,
+}
+
+impl LoHi {
+    #[inline]
+    fn new(lo: u32, hi: u32) -> Self {
+        Self { lo, hi }
+    }
+
+    #[inline]
+    pub fn from_span(span: Span) -> Self {
+        assert!(span.ctxt().is_root());
+        assert!(span.parent().is_none());
+        Self::new(span.lo().0, span.hi().0)
+    }
+
+    #[inline]
+    pub fn from_span_data(span: SpanData) -> Self {
+        assert!(span.ctxt.is_root());
+        assert!(span.parent.is_none());
+        Self::new(span.lo.0, span.hi.0)
+    }
+
+    #[inline]
+    pub fn to_span(self) -> Span {
+        Span::new(
+            BytePos(self.lo),
+            BytePos(self.hi),
+            SyntaxContext::root(),
+            None,
+        )
+    }
+
+    #[inline]
+    pub fn to_span_data(self) -> SpanData {
+        SpanData {
+            lo: BytePos(self.lo),
+            hi: BytePos(self.hi),
+            ctxt: SyntaxContext::root(),
+            parent: None,
+        }
+    }
+}
 
 pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
     rustc_driver::catch_fatal_errors(|| {

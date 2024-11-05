@@ -98,16 +98,16 @@ fn main() {
     };
 
     if args.verbose {
-        for (func, params) in &analysis_result.0 {
+        for (func, res) in &analysis_result {
             println!("{}", func);
-            for param in params {
+            for param in &res.output_params {
                 println!("  {:?}", param);
             }
         }
     }
 
     if args.sample_negative {
-        let mut fns = sampling::sample_from_path(path, &analysis_result.0);
+        let mut fns = sampling::sample_from_path(path, &analysis_result);
         fns.shuffle(&mut thread_rng());
         for f in fns.iter().take(10) {
             println!("{:?}", f);
@@ -116,9 +116,8 @@ fn main() {
     }
     if args.sample_may || args.sample_must {
         let mut params: Vec<_> = analysis_result
-            .0
             .iter()
-            .filter(|(_, params)| params.iter().any(|p| p.must == args.sample_must))
+            .filter(|(_, res)| res.output_params.iter().any(|p| p.must == args.sample_must))
             .collect();
         params.shuffle(&mut thread_rng());
         for (f, ps) in params.iter().take(10) {
@@ -128,16 +127,14 @@ fn main() {
     }
 
     if args.use_analysis_result.is_none() {
-        let fns = analysis_result.0.len();
+        let fns = analysis_result.len();
         let musts = analysis_result
-            .0
             .values()
-            .map(|v| v.iter().filter(|p| p.must).count())
+            .map(|res| res.output_params.iter().filter(|p| p.must).count())
             .sum::<usize>();
         let mays = analysis_result
-            .0
             .values()
-            .map(|v| v.iter().filter(|p| !p.must).count())
+            .map(|res| res.output_params.iter().filter(|p| !p.must).count())
             .sum::<usize>();
         println!("{} {} {}", fns, musts, mays);
     }
@@ -151,7 +148,7 @@ fn main() {
         return;
     }
 
-    transform::transform_path(path, &analysis_result.0, &analysis_result.1);
+    transform::transform_path(path, &analysis_result);
 }
 
 fn clear_dir(path: &Path) {

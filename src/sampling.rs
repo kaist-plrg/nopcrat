@@ -8,17 +8,17 @@ use rustc_middle::{
 };
 use rustc_session::config::Input;
 
-use crate::{ai::analysis::OutputParams, compile_util};
+use crate::{ai::analysis::AnalysisResult, compile_util};
 
-pub fn sample_from_path(path: &Path, res: &OutputParams) -> Vec<String> {
+pub fn sample_from_path(path: &Path, res: &AnalysisResult) -> Vec<String> {
     sample_from_input(compile_util::path_to_input(path), res)
 }
 
-pub fn sample_from_code(code: &str, res: &OutputParams) -> Vec<String> {
+pub fn sample_from_code(code: &str, res: &AnalysisResult) -> Vec<String> {
     sample_from_input(compile_util::str_to_input(code), res)
 }
 
-fn sample_from_input(input: Input, res: &OutputParams) -> Vec<String> {
+fn sample_from_input(input: Input, res: &AnalysisResult) -> Vec<String> {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
         let hir = tcx.hir();

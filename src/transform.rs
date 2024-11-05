@@ -14,7 +14,7 @@ use rustc_middle::{
     mir::{BasicBlock, TerminatorKind},
     ty::TyCtxt,
 };
-use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span, SpanData};
+use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
 use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
@@ -25,22 +25,17 @@ static mut N_DIRECT_RETURNS: usize = 0;
 static mut N_REMOVED_CHECKS: usize = 0;
 static mut N_REMOVED_POINTERS: usize = 0;
 
-pub fn transform_path(
-    path: &Path,
-    params: &OutputParams,
-    extra_info: &BTreeMap<String, (Wbrets, Rcfws)>,
-) {
+pub fn transform_path(path: &Path, analysis_result: &AnalysisResult) {
     let input = compile_util::path_to_input(path);
     let config = compile_util::make_config(input);
     let suggestions =
-        compile_util::run_compiler(config, |tcx| transform(tcx, params, extra_info)).unwrap();
+        compile_util::run_compiler(config, |tcx| transform(tcx, analysis_result)).unwrap();
     compile_util::apply_suggestions(&suggestions);
 }
 
 fn transform(
     tcx: TyCtxt<'_>,
-    param_map: &OutputParams,
-    extra_info: &BTreeMap<String, (Wbrets, Rcfws)>,
+    analysis_result: &AnalysisResult,
 ) -> BTreeMap<PathBuf, Vec<Suggestion>> {
     let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
@@ -60,7 +55,7 @@ fn transform(
     }
 
     let mut funcs = BTreeMap::new();
-    let mut wbrets = BTreeMap::new();
+    let mut wbrs = BTreeMap::new();
     let mut rcfws = BTreeMap::new();
     for id in hir.items() {
         let item = hir.item(id);
@@ -69,10 +64,11 @@ fn transform(
         };
         let def_id = id.owner_id.to_def_id();
         let name = tcx.def_path_str(def_id);
-        let params = some_or!(param_map.get(&name), continue);
+        let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
         let body = hir.body(body_id);
         let mir_body = tcx.optimized_mir(def_id);
-        let index_map: BTreeMap<_, _> = params
+        let index_map: BTreeMap<_, _> = fn_analysis_result
+            .output_params
             .iter()
             .map(|param| {
                 let OutputParam {
@@ -150,48 +146,42 @@ fn transform(
             })
             .collect();
 
-        if let Some((wbret, _)) = extra_info.get(&name) {
-            wbrets.insert(
-                def_id,
-                wbret
-                    .clone()
-                    .into_iter()
-                    .map(|(sp, (may, must))| {
+        wbrs.insert(
+            def_id,
+            fn_analysis_result
+                .wbrs
+                .iter()
+                .map(|wbr| {
+                    (
+                        wbr.span.to_span(),
                         (
-                            unsafe { std::mem::transmute::<i128, SpanData>(sp) }.span(),
-                            (
-                                may.iter()
-                                    .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
-                                    .collect::<Vec<_>>(),
-                                must.iter()
-                                    .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
-                                    .collect::<Vec<_>>(),
-                            ),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        }
-
-        if let Some((_, rcfw)) = extra_info.get(&name) {
-            rcfws.insert(
-                def_id,
-                rcfw.clone()
-                    .into_iter()
-                    .map(|(index, spans)| {
-                        (
-                            index_map.get(&index).cloned().unwrap().name,
-                            spans
+                            wbr.mays
                                 .iter()
-                                .map(|sp| {
-                                    unsafe { std::mem::transmute::<i128, SpanData>(*sp) }.span()
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect::<BTreeMap<String, Vec<Span>>>(),
-            );
-        }
+                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                .collect::<Vec<_>>(),
+                            wbr.musts
+                                .iter()
+                                .filter_map(|i| index_map.get(i).map(|p| p.name.clone()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        rcfws.insert(
+            def_id,
+            fn_analysis_result
+                .rcfws
+                .iter()
+                .map(|(index, spans)| {
+                    (
+                        index_map.get(index).cloned().unwrap().name,
+                        spans.iter().map(|sp| sp.to_span()).collect(),
+                    )
+                })
+                .collect::<BTreeMap<String, Vec<Span>>>(),
+        );
 
         let hir_id_map: BTreeMap<_, _> = index_map
             .values()
@@ -199,7 +189,7 @@ fn transform(
             .map(|param| (param.hir_id, param))
             .collect();
         let mut remaining_return: Vec<_> = index_map.keys().copied().collect();
-        let first_return = SuccValue::find(params);
+        let first_return = SuccValue::find(&fn_analysis_result.output_params);
         if let Some((_, first)) = &first_return {
             remaining_return.retain(|i| i != first);
         }
@@ -244,6 +234,7 @@ fn transform(
         let mut ret_call_spans = BTreeSet::new();
         let mut call_spans = BTreeSet::new();
 
+        // in deref expression, pointer name to expression span
         let mut ref_to_spans: BTreeMap<String, Vec<Span>> = BTreeMap::new();
 
         let mut ret_to_ref_spans: BTreeMap<Span, Vec<(String, Span)>> = BTreeMap::new();
@@ -398,7 +389,7 @@ fn transform(
                     let rv = format!("{}rv___{}", pre_s, post_s);
                     let rv = func.return_value(
                         Some(rv),
-                        wbrets[&def_id]
+                        wbrs[&def_id]
                             .iter()
                             .find(|(sp, _)| span.contains(*sp))
                             .map(|r| &r.1),
@@ -449,7 +440,7 @@ fn transform(
 
         let mut unremovable = BTreeSet::new();
         for param in func.params() {
-            let rcfw = &rcfw.get(&param.name);
+            let rcfw = rcfw.get(&param.name);
 
             for span in &param.writes {
                 if let Some(rcfw) = rcfw {
@@ -566,7 +557,7 @@ fn transform(
 
             let ret_v = func.return_value(
                 orig,
-                wbrets[&def_id]
+                wbrs[&def_id]
                     .iter()
                     .find(|(sp, _)| span.contains(*sp))
                     .map(|r| &r.1),
@@ -614,7 +605,7 @@ fn transform(
             }
             let rv = func.return_value(
                 Some(rv),
-                wbrets[&def_id]
+                wbrs[&def_id]
                     .iter()
                     .find(|(sp, _)| span.contains(*sp))
                     .map(|r| &r.1),
@@ -826,7 +817,7 @@ impl Func {
     fn return_value(
         &self,
         orig: Option<String>,
-        wbret: Option<&(Vec<String>, Vec<String>)>,
+        wbr: Option<&(Vec<String>, Vec<String>)>,
         lit_map: Option<(&String, &String)>,
     ) -> String {
         let mut values = vec![];
@@ -845,7 +836,7 @@ impl Func {
                     }
                 })
                 .unwrap_or(format!("{}___v", param.name));
-            let v = if let Some((may, must)) = wbret {
+            let v = if let Some((may, must)) = wbr {
                 if must.contains(&param.name) {
                     unsafe {
                         N_MUST += 1;
@@ -888,7 +879,7 @@ impl Func {
                 .unwrap_or(format!("{}___v", param.name));
             let v = if param.must {
                 name
-            } else if let Some((may, must)) = wbret {
+            } else if let Some((may, must)) = wbr {
                 if must.contains(&param.name) {
                     unsafe {
                         N_MUST += 1;

@@ -4,6 +4,7 @@ use std::{
     path::Path,
 };
 
+use compile_util::LoHi;
 use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
@@ -47,15 +48,24 @@ impl Default for AnalysisConfig {
     }
 }
 
-pub type OutputParams = BTreeMap<String, Vec<OutputParam>>;
+pub type AnalysisResult = BTreeMap<String, FnAnalysisRes>;
 
-// Write Before RETurn s
-pub type Wbrets = BTreeMap<i128, (BTreeSet<usize>, BTreeSet<usize>)>;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FnAnalysisRes {
+    pub output_params: Vec<OutputParam>,
+    pub wbrs: Vec<WriteBeforeReturn>,
+    pub rcfws: Rcfws,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WriteBeforeReturn {
+    pub span: LoHi,
+    pub mays: BTreeSet<usize>,
+    pub musts: BTreeSet<usize>,
+}
 
 // Removable checks for Write s
-pub type Rcfws = BTreeMap<usize, BTreeSet<i128>>;
-
-pub type AnalysisResult = (OutputParams, BTreeMap<String, (Wbrets, Rcfws)>);
+pub type Rcfws = BTreeMap<usize, BTreeSet<LoHi>>;
 
 pub fn analyze_path(path: &Path, conf: &AnalysisConfig) -> AnalysisResult {
     analyze_input(compile_util::path_to_input(path), conf)
@@ -70,19 +80,18 @@ pub fn analyze_input(input: Input, conf: &AnalysisConfig) -> AnalysisResult {
     compile_util::run_compiler(config, |tcx| {
         analyze(tcx, conf)
             .into_iter()
-            .filter_map(|(def_id, (_, params, wbret, rcfw))| {
-                if params.is_empty() {
+            .filter_map(|(def_id, (_, res))| {
+                if res.output_params.is_empty() {
                     None
                 } else {
-                    Some((tcx.def_path_str(def_id), (params, wbret, rcfw)))
+                    Some((tcx.def_path_str(def_id), res))
                 }
             })
             .collect::<Vec<_>>()
     })
     .unwrap()
     .into_iter()
-    .map(|(k, (v1, v2, v3))| ((k.clone(), v1), (k.clone(), (v2, v3))))
-    .unzip()
+    .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -95,7 +104,7 @@ enum Write {
 pub fn analyze(
     tcx: TyCtxt<'_>,
     conf: &AnalysisConfig,
-) -> BTreeMap<DefId, (FunctionSummary, Vec<OutputParam>, Wbrets, Rcfws)> {
+) -> BTreeMap<DefId, (FunctionSummary, FnAnalysisRes)> {
     let hir = tcx.hir();
 
     let mut call_graph = BTreeMap::new();
@@ -162,8 +171,8 @@ pub fn analyze(
     let mut call_args_map = BTreeMap::new();
     let mut analysis_times: BTreeMap<_, u128> = BTreeMap::new();
 
-    let mut wbrets: BTreeMap<DefId, Wbrets> = BTreeMap::new();
-    let mut wbbbrets: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
+    let mut wbrs: BTreeMap<DefId, Vec<WriteBeforeReturn>> = BTreeMap::new();
+    let mut bb_musts: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
     let mut is_units = BTreeMap::new();
 
     let mut rcfws = BTreeMap::new();
@@ -219,8 +228,8 @@ pub fn analyze(
 
                 let ret_location = return_location(body);
 
-                let mut wbret = BTreeMap::new();
-                let mut wbbbret = BTreeMap::new();
+                let mut wbr = vec![];
+                let mut bb_must = BTreeMap::new();
 
                 let mut stack = vec![];
 
@@ -228,55 +237,47 @@ pub fn analyze(
                     if let Some((ret_loc_assign0, ret_loc)) =
                         exists_assign0(body, ret_location.block)
                     {
-                        stack.push((ret_loc, ret_loc_assign0.data()));
+                        stack.push((ret_loc, ret_loc_assign0));
                     } else if let Some(v) = body.basic_blocks.predecessors().get(ret_location.block)
                     {
                         for i in v {
                             if let Some((sp, ret_loc)) = exists_assign0(body, *i) {
-                                stack.push((ret_loc, sp.data()));
+                                stack.push((ret_loc, sp));
                             }
                         }
                     }
 
+                    let empty_map = BTreeMap::new();
                     for (loc, sp) in stack.iter() {
-                        let must_writes: BTreeSet<_> = states
+                        let writes: Vec<_> = states
                             .get(loc)
-                            .cloned()
-                            .unwrap_or_default()
+                            .unwrap_or(&empty_map)
                             .values()
-                            .fold(None, |acc: Option<BTreeSet<_>>, st: &AbsState| {
+                            .map(|st| st.writes.as_set())
+                            .collect();
+                        let musts: BTreeSet<_> = writes
+                            .iter()
+                            .copied()
+                            .fold(None, |acc: Option<BTreeSet<_>>, ws| {
                                 Some(match acc {
-                                    Some(acc) => {
-                                        acc.intersection(st.writes.as_set()).cloned().collect()
-                                    }
-                                    None => st.writes.as_set().clone(),
+                                    Some(acc) => acc.intersection(ws).cloned().collect(),
+                                    None => ws.clone(),
                                 })
                             })
                             .unwrap_or_default()
                             .iter()
                             .map(|p| p.base() - 1)
                             .collect();
-
-                        let may_writes: BTreeSet<_> = states
-                            .get(loc)
-                            .cloned()
-                            .unwrap_or_default()
-                            .values()
-                            .flat_map(|st| st.writes.as_set())
-                            .map(|p| p.base() - 1)
-                            .collect();
-
-                        wbret.insert(
-                            unsafe { std::mem::transmute(*sp) },
-                            (may_writes, must_writes.clone()),
-                        );
-
-                        wbbbret.insert(loc.block, must_writes);
+                        let mays: BTreeSet<_> =
+                            writes.into_iter().flatten().map(|p| p.base() - 1).collect();
+                        let span = LoHi::from_span(*sp);
+                        bb_must.insert(loc.block, musts.clone());
+                        wbr.push(WriteBeforeReturn { span, mays, musts });
                     }
                 }
 
-                wbrets.insert(*def_id, wbret);
-                wbbbrets.insert(*def_id, wbbbret);
+                wbrs.insert(*def_id, wbr);
+                bb_musts.insert(*def_id, bb_must);
                 is_units.insert(*def_id, stack.is_empty());
 
                 let mut return_states = ret_location
@@ -322,47 +323,39 @@ pub fn analyze(
                     }
 
                     let body = tcx.optimized_mir(*def_id);
-                    let wbbbret = &wbbbrets[def_id];
+                    let bb_must = &bb_musts[def_id];
                     let mut rcfw: Rcfws = BTreeMap::new();
 
                     if !is_units[def_id] {
-                        for p in output_params.iter() {
+                        for p in &output_params {
                             let OutputParam {
                                 index,
-                                must: _,
-                                return_values: _,
                                 complete_writes,
+                                ..
                             } = p;
-                            for complete_write in complete_writes.iter() {
+                            for complete_write in complete_writes {
                                 let CompleteWrite {
                                     block,
                                     statement_index,
-                                    write_arg: _,
+                                    ..
                                 } = complete_write;
 
                                 let mut stack = vec![BasicBlock::from_usize(*block)];
-                                let mut visited = BTreeSet::from_iter(stack.clone());
+                                let mut visited: BTreeSet<_> = stack.iter().cloned().collect();
 
-                                let success = loop {
-                                    if let Some(block) = stack.pop() {
-                                        if let Some(ws) = wbbbret.get(&block) {
-                                            if !ws.contains(index) {
+                                let always_write = loop {
+                                    if let Some(bb) = stack.pop() {
+                                        if let Some(musts) = bb_must.get(&bb) {
+                                            if !musts.contains(index) {
                                                 break false;
                                             }
                                         }
 
-                                        let bbd = &body.basic_blocks[block];
-                                        let term = bbd.terminator();
-
-                                        match term.kind {
-                                            TerminatorKind::Return => (),
-                                            _ => {
-                                                for bb in term.successors() {
-                                                    if !visited.contains(&bb) {
-                                                        visited.insert(bb);
-                                                        stack.push(bb);
-                                                    }
-                                                }
+                                        let term = body.basic_blocks[bb].terminator();
+                                        for bb in term.successors() {
+                                            if !visited.contains(&bb) {
+                                                visited.insert(bb);
+                                                stack.push(bb);
                                             }
                                         }
                                     } else {
@@ -370,15 +363,12 @@ pub fn analyze(
                                     }
                                 };
 
-                                if success {
+                                if always_write {
                                     let location = Location {
                                         block: BasicBlock::from_usize(*block),
                                         statement_index: *statement_index,
                                     };
-                                    let span = unsafe {
-                                        std::mem::transmute(body.source_info(location).span.data())
-                                    };
-
+                                    let span = LoHi::from_span(body.source_info(location).span);
                                     let entry = rcfw.entry(*index);
                                     entry.or_default().insert(span);
                                 }
@@ -395,7 +385,7 @@ pub fn analyze(
     }
 
     if conf.max_loop_head_states <= 1 {
-        wbrets.clear();
+        wbrs.clear();
         rcfws.clear();
     }
 
@@ -415,15 +405,14 @@ pub fn analyze(
         .into_iter()
         .map(|(def_id, summary)| {
             let output_params = output_params_map.remove(&def_id).unwrap();
-            (
-                def_id,
-                (
-                    summary,
-                    output_params,
-                    wbrets.get(&def_id).cloned().unwrap_or_default(),
-                    rcfws.get(&def_id).cloned().unwrap_or_default(),
-                ),
-            )
+            let wbrs = wbrs.remove(&def_id).unwrap_or_default();
+            let rcfws = rcfws.remove(&def_id).unwrap_or_default();
+            let res = FnAnalysisRes {
+                output_params,
+                wbrs,
+                rcfws,
+            };
+            (def_id, (summary, res))
         })
         .collect()
 }
