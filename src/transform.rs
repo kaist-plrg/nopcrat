@@ -487,52 +487,6 @@ fn transform(
             }
         }
 
-        let local_vars: String = func
-            .params()
-            .map(|param| {
-                if param.must || (!unremovable.contains(&param.name) && simplify) {
-                    if !param.must {
-                        counter.removed_flag_defs += 1;
-                    }
-                    if passes.contains(&param.name) || !simplify {
-                        format!(
-                            "
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-    let mut {0}: *mut {1} = &mut {0}___v;",
-                            param.name, param.ty,
-                        )
-                    } else {
-                        counter.removed_pointer_defs += 1;
-                        format!(
-                            "
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
-                            param.name, param.ty,
-                        )
-                    }
-                } else if passes.contains(&param.name) || !simplify {
-                    format!(
-                        "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-    let mut {0}: *mut {1} = &mut {0}___v;",
-                        param.name, param.ty,
-                    )
-                } else {
-                    counter.removed_pointer_defs += 1;
-                    format!(
-                        "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
-                        param.name, param.ty,
-                    )
-                }
-            })
-            .collect();
-
-        let pos = body.value.span.lo() + BytePos(1);
-        let span = body.value.span.with_lo(pos).with_hi(pos);
-        fix(span, local_vars);
-
         for ret in visitor.returns.iter() {
             let Return { span, value } = ret;
             if ret_call_spans.contains(span) || ret_to_ref_spans.contains_key(span) {
@@ -639,6 +593,53 @@ fn transform(
 
             fix(span, format!("return {}", rv));
         }
+
+        // Add definitions of additional local variables
+        let local_vars: String = func
+            .params()
+            .map(|param| {
+                if param.must || (!unremovable.contains(&param.name) && simplify) {
+                    if !param.must {
+                        counter.removed_flag_defs += 1;
+                    }
+                    if passes.contains(&param.name) || !simplify {
+                        format!(
+                            "
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
+    let mut {0}: *mut {1} = &mut {0}___v;",
+                            param.name, param.ty,
+                        )
+                    } else {
+                        counter.removed_pointer_defs += 1;
+                        format!(
+                            "
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+                            param.name, param.ty,
+                        )
+                    }
+                } else if passes.contains(&param.name) || !simplify {
+                    format!(
+                        "
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
+    let mut {0}: *mut {1} = &mut {0}___v;",
+                        param.name, param.ty,
+                    )
+                } else {
+                    counter.removed_pointer_defs += 1;
+                    format!(
+                        "
+    let mut {0}___s: bool = false; \
+    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
+                        param.name, param.ty,
+                    )
+                }
+            })
+            .collect();
+
+        let pos = body.value.span.lo() + BytePos(1);
+        let span = body.value.span.with_lo(pos).with_hi(pos);
+        fix(span, local_vars);
 
         if func.is_unit {
             let pos = body.value.span.hi() - BytePos(1);
