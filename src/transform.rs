@@ -308,17 +308,19 @@ fn transform(
 
             let mut args = args.clone();
 
-            for arg in args.iter_mut() {
-                for (name, span) in &ref_and_call_spans {
-                    if arg.span.contains(*span) {
-                        let pre_span = arg.span.with_hi(span.lo());
-                        let post_span = arg.span.with_lo(span.hi());
+            if simplify {
+                for arg in args.iter_mut() {
+                    for (name, span) in &ref_and_call_spans {
+                        if arg.span.contains(*span) {
+                            let pre_span = arg.span.with_hi(span.lo());
+                            let post_span = arg.span.with_lo(span.hi());
 
-                        let pre_s = source_map.span_to_snippet(pre_span).unwrap();
-                        let post_s = source_map.span_to_snippet(post_span).unwrap();
+                            let pre_s = source_map.span_to_snippet(pre_span).unwrap();
+                            let post_s = source_map.span_to_snippet(post_span).unwrap();
 
-                        arg.code = format!("{}{}___v{}", pre_s, name, post_s);
-                        counter.removed_pointer_uses += 1;
+                            arg.code = format!("{}{}___v{}", pre_s, name, post_s);
+                            counter.removed_pointer_uses += 1;
+                        }
                     }
                 }
             }
@@ -500,40 +502,43 @@ fn transform(
             }
 
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
-
-            let mut assign_before_ret = None;
-            for assign in visitor.assigns.iter() {
-                if visitor
-                    .calls
-                    .iter()
-                    .any(|call| call.span.overlaps(assign.span))
-                {
-                    continue;
-                }
-                if source_map
-                    .span_to_snippet(assign.span.between(*span))
-                    .unwrap()
-                    .chars()
-                    .all(|c| c.is_whitespace())
-                {
-                    assign_before_ret = Some(assign);
-                    break;
-                }
-            }
-
             let mut lit_map = None;
 
-            if let Some(assign_before_ret) = assign_before_ret {
-                let Assign {
-                    name,
-                    value,
-                    span: sp,
-                } = assign_before_ret;
 
-                if let Some(spans) = ref_to_spans.get_mut(name) {
-                    spans.retain(|span| !sp.contains(*span));
-                    lit_map = Some((name, value));
-                    fix(*sp, "".to_string());
+            if simplify {
+                let mut assign_before_ret = None;
+
+                for assign in visitor.assigns.iter() {
+                    if visitor
+                        .calls
+                        .iter()
+                        .any(|call| call.span.overlaps(assign.span))
+                    {
+                        continue;
+                    }
+                    if source_map
+                        .span_to_snippet(assign.span.between(*span))
+                        .unwrap()
+                        .chars()
+                        .all(|c| c.is_whitespace())
+                    {
+                        assign_before_ret = Some(assign);
+                        break;
+                    }
+                }
+
+                if let Some(assign_before_ret) = assign_before_ret {
+                    let Assign {
+                        name,
+                        value,
+                        span: sp,
+                    } = assign_before_ret;
+
+                    if let Some(spans) = ref_to_spans.get_mut(name) {
+                        spans.retain(|span| !sp.contains(*span));
+                        lit_map = Some((name, value));
+                        fix(*sp, "".to_string());
+                    }
                 }
             }
 
@@ -550,63 +555,66 @@ fn transform(
         }
 
         let mut value_simplifiable = BTreeSet::new();
-        for param in func.params() {
-            if passes.contains(&param.name) {
-                continue;
-            }
 
-            if let Some(spans) = ref_to_spans.get(&param.name) {
-                if spans.is_empty() && !ref_call_or_ret.contains(&param.name) {
-                    value_simplifiable.insert(param.name.clone());
+        if simplify {
+            for param in func.params() {
+                if passes.contains(&param.name) {
                     continue;
                 }
-                for span in spans {
-                    let assign = format!("{}___v", param.name);
-                    counter.removed_pointer_uses += 1;
-                    fix(*span, assign);
+
+                if let Some(spans) = ref_to_spans.get(&param.name) {
+                    if spans.is_empty() && !ref_call_or_ret.contains(&param.name) {
+                        value_simplifiable.insert(param.name.clone());
+                        continue;
+                    }
+                    for span in spans {
+                        let assign = format!("{}___v", param.name);
+                        counter.removed_pointer_uses += 1;
+                        fix(*span, assign);
+                    }
                 }
             }
-        }
 
-        for (span, mut ss) in ret_to_ref_spans {
-            let mut post_spans = vec![];
+            for (span, mut ss) in ret_to_ref_spans {
+                let mut post_spans = vec![];
 
-            ss.sort_by_key(|x| x.1);
+                ss.sort_by_key(|x| x.1);
 
-            let s = ss[0].1;
+                let s = ss[0].1;
 
-            let pre_span = span.with_hi(s.lo()).with_lo(span.lo() + BytePos(6));
-            post_spans.push(span.with_lo(s.hi()));
-
-            for (i, (_, s)) in ss[1..].iter().enumerate() {
-                post_spans[i] = post_spans[i].with_hi(s.lo());
+                let pre_span = span.with_hi(s.lo()).with_lo(span.lo() + BytePos(6));
                 post_spans.push(span.with_lo(s.hi()));
-            }
 
-            let pre_s = source_map.span_to_snippet(pre_span).unwrap();
-            let post_s = source_map.span_to_snippet(post_spans[0]).unwrap();
+                for (i, (_, s)) in ss[1..].iter().enumerate() {
+                    post_spans[i] = post_spans[i].with_hi(s.lo());
+                    post_spans.push(span.with_lo(s.hi()));
+                }
 
-            let mut rv = format!("{}{}___v{}", pre_s, ss[0].0, post_s);
-            counter.removed_pointer_uses += 1;
+                let pre_s = source_map.span_to_snippet(pre_span).unwrap();
+                let post_s = source_map.span_to_snippet(post_spans[0]).unwrap();
 
-            for (i, s) in post_spans[1..].iter().enumerate() {
-                let post_s = source_map.span_to_snippet(*s).unwrap();
-                rv.push_str(&ss[i + 1].0);
-                rv.push_str("___v");
-                rv.push_str(&post_s);
+                let mut rv = format!("{}{}___v{}", pre_s, ss[0].0, post_s);
                 counter.removed_pointer_uses += 1;
-            }
-            let rv = func.return_value(
-                Some(rv),
-                wbrs[&def_id]
-                    .iter()
-                    .find(|(sp, _)| span.contains(*sp))
-                    .map(|r| &r.1),
-                None,
-                &mut counter,
-            );
 
-            fix(span, format!("return {}", rv));
+                for (i, s) in post_spans[1..].iter().enumerate() {
+                    let post_s = source_map.span_to_snippet(*s).unwrap();
+                    rv.push_str(&ss[i + 1].0);
+                    rv.push_str("___v");
+                    rv.push_str(&post_s);
+                    counter.removed_pointer_uses += 1;
+                }
+                let rv = func.return_value(
+                    Some(rv),
+                    wbrs[&def_id]
+                        .iter()
+                        .find(|(sp, _)| span.contains(*sp))
+                        .map(|r| &r.1),
+                    None,
+                    &mut counter,
+                );
+
+                fix(span, format!("return {}", rv));
+            }
         }
 
         // Add definitions of additional local variables
