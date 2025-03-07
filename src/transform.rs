@@ -22,6 +22,7 @@ use crate::{ai::analysis::*, compile_util};
 #[derive(Default, Clone, Copy)]
 struct Counter {
     simplify: bool,
+    removed_value_defs: usize,
     removed_pointer_defs: usize,
     removed_pointer_uses: usize,
     direct_returns: usize,
@@ -256,6 +257,9 @@ fn transform(
         // in deref expression in call, pointer name and deref span
         let mut ref_and_call_spans = vec![];
 
+        // name of pointers in the return or call
+        let mut ref_call_or_ret = BTreeSet::new();
+
         if simplify {
             if let Some(func) = curr {
                 let hirids = BTreeSet::from_iter(
@@ -271,12 +275,14 @@ fn transform(
                     if params.contains(&name) && !passes.contains(&name) {
                         if let Some(expr) = get_parent_call(hir_id, tcx) {
                             if hirids.contains(&expr.hir_id) {
+                                ref_call_or_ret.insert(name.clone());
                                 ref_and_call_spans.push((name, span));
                                 continue;
                             }
                         }
 
                         if let Some(expr) = get_parent_return(hir_id, tcx) {
+                            ref_call_or_ret.insert(name.clone());
                             ret_to_ref_spans
                                 .entry(expr.span)
                                 .or_default()
@@ -543,8 +549,17 @@ fn transform(
             fix(*span, format!("return {}", ret_v));
         }
 
+        let mut value_simplifiable = BTreeSet::new();
         for param in func.params() {
+            if passes.contains(&param.name) {
+                continue;
+            }
+
             if let Some(spans) = ref_to_spans.get(&param.name) {
+                if spans.is_empty() && !ref_call_or_ret.contains(&param.name) {
+                    value_simplifiable.insert(param.name.clone());
+                    continue;
+                }
                 for span in spans {
                     let assign = format!("{}___v", param.name);
                     counter.removed_pointer_uses += 1;
@@ -602,6 +617,7 @@ fn transform(
                     if !param.must {
                         counter.removed_flag_defs += 1;
                     }
+
                     if passes.contains(&param.name) || !simplify {
                         format!(
                             "
@@ -609,6 +625,10 @@ fn transform(
     let mut {0}: *mut {1} = &mut {0}___v;",
                             param.name, param.ty,
                         )
+                    } else if value_simplifiable.contains(&param.name) {
+                        counter.removed_pointer_defs += 1;
+                        counter.removed_value_defs += 1;
+                        String::new()
                     } else {
                         counter.removed_pointer_defs += 1;
                         format!(
@@ -624,6 +644,14 @@ fn transform(
     let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
     let mut {0}: *mut {1} = &mut {0}___v;",
                         param.name, param.ty,
+                    )
+                } else if value_simplifiable.contains(&param.name) {
+                    counter.removed_pointer_defs += 1;
+                    counter.removed_value_defs += 1;
+                    format!(
+                        "
+    let mut {0}___s: bool = false;",
+                        param.name,
                     )
                 } else {
                     counter.removed_pointer_defs += 1;
@@ -674,13 +702,16 @@ fn transform(
         });
     }
 
-    println!("Removed pointer defs: {}", counter.removed_pointer_defs);
-    println!("Removed pointer uses: {}", counter.removed_pointer_uses);
-    println!("Direct returns: {}", counter.direct_returns);
-    println!("Success returns: {}", counter.success_returns);
-    println!("Failure returns: {}", counter.failure_returns);
-    println!("Removed flag sets: {}", counter.removed_flag_sets);
-    println!("Removed flag defs: {}", counter.removed_flag_defs);
+    if simplify {
+        println!("Removed value defs: {}", counter.removed_value_defs);
+        println!("Removed pointer defs: {}", counter.removed_pointer_defs);
+        println!("Removed pointer uses: {}", counter.removed_pointer_uses);
+        println!("Direct returns: {}", counter.direct_returns);
+        println!("Success returns: {}", counter.success_returns);
+        println!("Failure returns: {}", counter.failure_returns);
+        println!("Removed flag sets: {}", counter.removed_flag_sets);
+        println!("Removed flag defs: {}", counter.removed_flag_defs);
+    }
 
     suggestions
 }
