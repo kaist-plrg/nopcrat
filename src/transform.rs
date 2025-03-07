@@ -504,7 +504,6 @@ fn transform(
             let orig = value.map(|value| source_map.span_to_snippet(value).unwrap());
             let mut lit_map = None;
 
-
             if simplify {
                 let mut assign_before_ret = None;
 
@@ -621,55 +620,32 @@ fn transform(
         let local_vars: String = func
             .params()
             .map(|param| {
-                if param.must || (!unremovable.contains(&param.name) && simplify) {
-                    if !param.must {
-                        counter.removed_flag_defs += 1;
-                    }
+                let mut defs = String::from("\n    ");
+                let value_decl = format!("let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);", param.name, param.ty);
+                let ref_decl = format!("let mut {0}: *mut {1} = &mut {0}___v;", param.name, param.ty);
+                let flag_decl = format!("let mut {}___s: bool = false;", param.name);
 
-                    if passes.contains(&param.name) || !simplify {
-                        format!(
-                            "
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-    let mut {0}: *mut {1} = &mut {0}___v;",
-                            param.name, param.ty,
-                        )
-                    } else if value_simplifiable.contains(&param.name) {
-                        counter.removed_pointer_defs += 1;
-                        counter.removed_value_defs += 1;
-                        String::new()
-                    } else {
-                        counter.removed_pointer_defs += 1;
-                        format!(
-                            "
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
-                            param.name, param.ty,
-                        )
-                    }
-                } else if passes.contains(&param.name) || !simplify {
-                    format!(
-                        "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]); \
-    let mut {0}: *mut {1} = &mut {0}___v;",
-                        param.name, param.ty,
-                    )
+                if !param.must && (unremovable.contains(&param.name) || !simplify) {
+                    defs.push_str(&flag_decl);
+                    defs.push(' ');
+                } else if !param.must {
+                    counter.removed_flag_defs += 1;
+                }
+
+                if passes.contains(&param.name) || !simplify {
+                    defs.push_str(&value_decl);
+                    defs.push(' ');
+                    defs.push_str(&ref_decl);
                 } else if value_simplifiable.contains(&param.name) {
-                    counter.removed_pointer_defs += 1;
                     counter.removed_value_defs += 1;
-                    format!(
-                        "
-    let mut {0}___s: bool = false;",
-                        param.name,
-                    )
+                    counter.removed_pointer_defs += 1;
+                    defs = String::new();
                 } else {
                     counter.removed_pointer_defs += 1;
-                    format!(
-                        "
-    let mut {0}___s: bool = false; \
-    let mut {0}___v: {1} = std::mem::transmute([0u8; std::mem::size_of::<{1}>()]);",
-                        param.name, param.ty,
-                    )
+                    defs.push_str(&value_decl);
                 }
+
+                defs
             })
             .collect();
 
