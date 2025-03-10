@@ -470,7 +470,7 @@ fn transform(
         let ret_ty = func.return_type(orig);
         fix(span, format!("-> {}", ret_ty));
 
-        let mut unremovable = BTreeSet::new();
+        let mut flag_unsimplifiable = BTreeSet::new();
         for param in func.params() {
             let rcfw = rcfw.get(&param.name);
 
@@ -482,7 +482,7 @@ fn transform(
                     }
                 }
 
-                unremovable.insert(&param.name);
+                flag_unsimplifiable.insert(&param.name);
 
                 if call_spans.contains(span) {
                     continue;
@@ -625,13 +625,15 @@ fn transform(
                 let ref_decl = format!("let mut {0}: *mut {1} = &mut {0}___v;", param.name, param.ty);
                 let flag_decl = format!("let mut {}___s: bool = false;", param.name);
 
-                if !param.must && (unremovable.contains(&param.name) || !simplify) {
+                // Decide whether add the flag or not
+                if !param.must && (flag_unsimplifiable.contains(&param.name) || !simplify) {
                     defs.push_str(&flag_decl);
                     defs.push(' ');
                 } else if !param.must {
                     counter.removed_flag_defs += 1;
                 }
 
+                // Decide whether add the value and the reference
                 if passes.contains(&param.name) || !simplify {
                     defs.push_str(&value_decl);
                     defs.push(' ');
