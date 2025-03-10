@@ -626,11 +626,13 @@ fn transform(
                 let flag_decl = format!("let mut {}___s: bool = false;", param.name);
 
                 // Decide whether add the flag or not
-                if !param.must && (flag_unsimplifiable.contains(&param.name) || !simplify) {
-                    defs.push_str(&flag_decl);
-                    defs.push(' ');
-                } else if !param.must {
-                    counter.removed_flag_defs += 1;
+                if !param.must {
+                    if flag_unsimplifiable.contains(&param.name) || !simplify {
+                        defs.push_str(&flag_decl);
+                        defs.push(' ');
+                    } else {
+                        counter.removed_flag_defs += 1;
+                    }
                 }
 
                 // Decide whether add the value and the reference
