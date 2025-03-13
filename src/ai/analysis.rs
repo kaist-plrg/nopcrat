@@ -529,7 +529,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
                 let diff = &nonnull - &null;
-                let unremovable = if !null.is_subset(&nonnull) { true } else {
+                let unremovable = !null.is_subset(&nonnull) ||
                     diff.iter().any(|loc| {
                         if *loc == Location::START {
                             return false;
@@ -552,8 +552,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 !paths.contains(&path)
                             }
                         }
-                    })
-                };
+                    });
                 if unremovable { Some (i + 1) } else { None }
             })
             .collect()
