@@ -15,7 +15,7 @@ use rustc_hir::{
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, StatementKind, TerminatorKind, Terminator},
+    mir::{BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -529,31 +529,37 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
                 let diff = &nonnull - &null;
-                let unremovable = !null.is_subset(&nonnull) ||
-                    diff.iter().any(|loc| {
-                        if *loc == Location::START {
+                if !null.is_subset(&nonnull) {
+                    Some(i + 1)
+                } else if diff.iter().any(|loc| {
+                    if *loc == Location::START {
+                        return false;
+                    }
+                    let Location {
+                        block,
+                        statement_index,
+                    } = loc;
+
+                    let bbd = &body.basic_blocks[*block];
+                    let is_terminator = *statement_index == bbd.statements.len();
+                    if is_terminator {
+                        if is_simple_terminator(bbd.terminator()) {
                             return false;
                         }
-                        let Location {
-                            block,
-                            statement_index
-                        } = loc;
+                    }
 
-                        let bbd = &body.basic_blocks[*block];
-                        let is_terminator = *statement_index == bbd.statements.len();
-                        if is_terminator {
-                            if is_simple_terminator(bbd.terminator()) { return false; }
+                    match writes_map.get(loc) {
+                        None => true,
+                        Some(paths) => {
+                            let path = AbsPath(vec![i + 1]);
+                            !paths.contains(&path)
                         }
-
-                        match writes_map.get(loc) {
-                            None => true,
-                            Some(paths) => {
-                                let path = AbsPath(vec![i + 1]);
-                                !paths.contains(&path)
-                            }
-                        }
-                    });
-                if unremovable { Some (i + 1) } else { None }
+                    }
+                }) {
+                    Some(i + 1)
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -1416,7 +1422,7 @@ fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
         TerminatorKind::Call { .. } => false,
         TerminatorKind::Return => false,
         TerminatorKind::InlineAsm { .. } => false,
-        _ => true
+        _ => true,
     }
 }
 
