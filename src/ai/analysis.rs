@@ -1419,7 +1419,10 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
 fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
     !matches!(
         &terminator.kind,
-        TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. }
+        TerminatorKind::Call { .. }
+            | TerminatorKind::InlineAsm { .. }
+            | TerminatorKind::Assert { .. }
+            | TerminatorKind::SwitchInt { .. }
     )
 }
 
