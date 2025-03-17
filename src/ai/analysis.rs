@@ -529,34 +529,35 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
                 let diff = &nonnull - &null;
-                if !null.is_subset(&nonnull)
-                    || diff.iter().any(|loc| {
-                        if *loc == Location::START {
-                            return false;
-                        }
-                        let Location {
-                            block,
-                            statement_index,
-                        } = loc;
-
-                        let bbd = &body.basic_blocks[*block];
-                        let is_terminator = *statement_index == bbd.statements.len();
-                        if is_terminator && is_simple_terminator(bbd.terminator()) {
-                            return false;
-                        }
-
-                        match writes_map.get(loc) {
-                            None => true,
-                            Some(paths) => {
-                                let path = AbsPath(vec![i + 1]);
-                                !paths.contains(&path)
+                if null.is_empty()
+                    || null.is_subset(&nonnull)
+                        && diff.iter().all(|loc| {
+                            if *loc == Location::START {
+                                return true;
                             }
-                        }
-                    })
+                            let Location {
+                                block,
+                                statement_index,
+                            } = loc;
+
+                            let bbd = &body.basic_blocks[*block];
+                            let is_terminator = *statement_index == bbd.statements.len();
+                            if is_terminator && is_simple_terminator(bbd.terminator()) {
+                                return true;
+                            }
+
+                            match writes_map.get(loc) {
+                                None => false,
+                                Some(paths) => {
+                                    let path = AbsPath(vec![i + 1]);
+                                    paths.contains(&path)
+                                }
+                            }
+                        })
                 {
-                    Some(i + 1)
-                } else {
                     None
+                } else {
+                    Some(i + 1)
                 }
             })
             .collect()
@@ -1418,7 +1419,7 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
 fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
     !matches!(
         &terminator.kind,
-        TerminatorKind::Call { .. } | TerminatorKind::Return | TerminatorKind::InlineAsm { .. }
+        TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. }
     )
 }
 
