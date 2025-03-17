@@ -477,6 +477,60 @@ fn test_is_null_param() {
 }
 
 #[test]
+fn test_nullable_empty() {
+    let code = "
+        unsafe fn f(p: *mut i32) -> i32 {
+            *p = 1;
+            return 0;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].writes.len(), 1);
+    assert_eq!(result[0].excludes.len(), 0);
+}
+
+#[test]
+fn test_nullable_write() {
+    let code = "
+        unsafe fn f(p: *mut i32) -> i32 {
+            if !p.is_null() {
+                *p = 1;
+            }
+            return 0;
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].excludes.len(), 0);
+    assert_eq!(result[1].writes.len(), 1);
+    assert_eq!(result[0].excludes.len(), 0);
+}
+
+#[test]
+fn test_nullable_call() {
+    let code = "
+        unsafe fn f(p: *mut i32) -> i32 {
+            if !p.is_null() {
+                g();
+                *p = 1;
+            }
+            return 0;
+        }
+        fn g() -> i32 {
+            0
+        }
+    ";
+    let result = analyze(code);
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].writes.len(), 0);
+    assert_eq!(result[0].excludes.len(), 1);
+    assert_eq!(result[1].writes.len(), 0);
+    assert_eq!(result[1].excludes.len(), 1);
+}
+
+#[test]
 fn test_malloc() {
     let code = "
         extern crate libc;
