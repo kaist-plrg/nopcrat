@@ -21,6 +21,7 @@ pub struct TransferedTerminator {
     pub next_states: Vec<AbsState>,
     pub next_locations: Vec<Location>,
     pub writes: BTreeSet<AbsPath>,
+    pub null_check: Option<usize>,
 }
 
 impl TransferedTerminator {
@@ -29,27 +30,29 @@ impl TransferedTerminator {
         next_states: Vec<AbsState>,
         next_locations: Vec<Location>,
         writes: BTreeSet<AbsPath>,
+        null_check: Option<usize>,
     ) -> Self {
         Self {
             next_states,
             next_locations,
             writes,
+            null_check,
         }
     }
 
     #[inline]
     fn empty() -> Self {
-        Self::new(vec![], vec![], BTreeSet::new())
+        Self::new(vec![], vec![], BTreeSet::new(), None)
     }
 
     #[inline]
     fn state_location(st: AbsState, loc: Location) -> Self {
-        Self::new(vec![st], vec![loc], BTreeSet::new())
+        Self::new(vec![st], vec![loc], BTreeSet::new(), None)
     }
 
     #[inline]
     fn state_locations(st: AbsState, locs: Vec<Location>) -> Self {
-        Self::new(vec![st], locs, BTreeSet::new())
+        Self::new(vec![st], locs, BTreeSet::new(), None)
     }
 }
 
@@ -123,11 +126,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 for reads2 in readss {
                     reads.extend(reads2);
                 }
-                let (new_states, writes) = if let Some(fns) = func.fnv.gamma() {
+
+                let (new_states, writes, null_check) = if let Some(fns) = func.fnv.gamma() {
                     let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
                     let mut ret_writes = BTreeSet::new();
+                    let mut null_check = None;
                     for def_id in fns {
-                        let (states, writes) = self.transfer_call(
+                        let (states, writes, null) = self.transfer_call(
                             *def_id,
                             &args,
                             destination,
@@ -136,6 +141,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             reads.clone(),
                         );
                         ret_writes.extend(writes);
+
+                        if null.is_some() {
+                            null_check = null;
+                        }
+
                         for state in states {
                             let wn = (state.writes.clone(), state.nulls.clone());
                             new_states_map.entry(wn).or_default().push(state);
@@ -145,7 +155,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .into_values()
                         .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
                         .collect();
-                    (new_states, ret_writes)
+                    (new_states, ret_writes, null_check)
                 } else {
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
                     let reads2 = args
@@ -157,7 +167,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
-                    (vec![new_state], writes)
+                    (vec![new_state], writes, None)
                 };
                 let locations = if new_states.is_empty() {
                     vec![]
@@ -167,7 +177,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .map(|target| vec![target.start_location()])
                         .unwrap_or(vec![])
                 };
-                TransferedTerminator::new(new_states, locations, writes)
+                TransferedTerminator::new(new_states, locations, writes, null_check)
             }
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
@@ -197,14 +207,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         location: Location,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
-    ) -> (Vec<AbsState>, BTreeSet<AbsPath>) {
+    ) -> (Vec<AbsState>, BTreeSet<AbsPath>, Option<usize>) {
         let mut offsets = vec![];
         let mut writes = vec![];
+        let mut null_check = None;
         let name = self.def_id_to_string(callee);
         let vns = if callee.is_local() {
             let v = if let Some(summary) = self.summaries.get(&callee) {
-                return self
-                    .transfer_intra_call(callee, summary, args, dst, state, location, reads);
+                let (new_states, writes) =
+                    self.transfer_intra_call(callee, summary, args, dst, state, location, reads);
+                return (new_states, writes, None);
             } else if name.contains("{extern#0}") {
                 self.transfer_c_call(callee, args, &state, &mut reads)
             } else if name.contains("{impl#") {
@@ -232,12 +244,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
                 if let Some(null) = null {
                     new_state.add_null(null);
+                    null_check = Some(null);
                 }
                 (new_state, writes)
             })
             .unzip();
         let writes = writess.into_iter().flatten().collect();
-        (new_states, writes)
+        (new_states, writes, null_check)
     }
 
     #[allow(clippy::too_many_arguments)]

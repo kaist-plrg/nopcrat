@@ -212,6 +212,7 @@ pub fn analyze(
                     states,
                     writes_map,
                     init_state,
+                    null_checks_map,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
@@ -220,7 +221,8 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
-                let nullable_params = analyzer.find_nullable_params(&states, body, &writes_map);
+                let nullable_params =
+                    analyzer.find_nullable_params(&states, body, &writes_map, null_checks_map);
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
@@ -472,6 +474,7 @@ struct AnalyzedBody {
     states: BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
+    null_checks_map: BTreeMap<Location, usize>,
 }
 
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
@@ -508,6 +511,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
         body: &Body<'_>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
+        null_checks_map: BTreeMap<Location, usize>,
     ) -> BTreeSet<usize> {
         let mut nonnull_locs = vec![BTreeSet::new(); self.info.inputs];
         let mut null_locs = vec![BTreeSet::new(); self.info.inputs];
@@ -529,6 +533,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
                 let diff = &nonnull - &null;
+                let param = i + 1;
                 if null.is_empty()
                     || null.is_subset(&nonnull)
                         && diff.iter().all(|loc| {
@@ -541,15 +546,21 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             } = loc;
 
                             let bbd = &body.basic_blocks[*block];
-                            let is_terminator = *statement_index == bbd.statements.len();
-                            if is_terminator && is_simple_terminator(bbd.terminator()) {
-                                return true;
+                            if *statement_index == bbd.statements.len() {
+                                if is_simple_terminator(bbd.terminator()) {
+                                    return true;
+                                }
+                                if let Some(arg) = null_checks_map.get(loc) {
+                                    if *arg == param {
+                                        return true;
+                                    }
+                                }
                             }
 
                             match writes_map.get(loc) {
                                 None => false,
                                 Some(paths) => {
-                                    let path = AbsPath(vec![i + 1]);
+                                    let path = AbsPath(vec![param]);
                                     paths.contains(&path)
                                 }
                             }
@@ -800,7 +811,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             BTreeSet::new()
         };
 
-        let (states, writes_map) = 'analysis_loop: loop {
+        let (states, writes_map, null_checks_map) = 'analysis_loop: loop {
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -810,6 +821,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 start_state.clone(),
             );
             let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+            let mut null_checks_map: BTreeMap<_, usize> = BTreeMap::new();
 
             self.call_args.clear();
             while let Some(label) = work_list.pop() {
@@ -822,7 +834,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     statement_index,
                 } = label.location;
                 let bbd = &body.basic_blocks[block];
-                let (new_next_states, next_locations, writes) =
+                let (new_next_states, next_locations, writes, null_check) =
                     if statement_index < bbd.statements.len() {
                         let stmt = &bbd.statements[statement_index];
                         let (new_next_state, writes) = self.transfer_statement(stmt, state);
@@ -830,16 +842,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             block,
                             statement_index: statement_index + 1,
                         };
-                        (vec![new_next_state], vec![next_location], writes)
+                        (vec![new_next_state], vec![next_location], writes, None)
                     } else {
                         let TransferedTerminator {
                             next_states,
                             next_locations,
                             writes,
+                            null_check,
                         } = self.transfer_terminator(bbd.terminator(), state, label.location);
-                        (next_states, next_locations, writes)
+                        (next_states, next_locations, writes, null_check)
                     };
                 writes_map.entry(label.location).or_default().extend(writes);
+                if let Some(arg) = null_check {
+                    null_checks_map.insert(label.location, arg);
+                }
                 for location in &next_locations {
                     let dead_locals = &self.info.dead_locals[location.block.as_usize()];
                     if merging_blocks.contains(&location.block) {
@@ -929,13 +945,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     continue 'analysis_loop;
                 }
             }
-            break (states, writes_map);
+            break (states, writes_map, null_checks_map);
         };
 
         AnalyzedBody {
             states,
             writes_map,
             init_state,
+            null_checks_map,
         }
     }
 
@@ -1419,10 +1436,7 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
 fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
     !matches!(
         &terminator.kind,
-        TerminatorKind::Call { .. }
-            | TerminatorKind::InlineAsm { .. }
-            | TerminatorKind::Assert { .. }
-            | TerminatorKind::SwitchInt { .. }
+        TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. }
     )
 }
 
