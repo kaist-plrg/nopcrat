@@ -513,31 +513,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         null_checks_map: BTreeMap<Location, usize>,
     ) -> BTreeSet<usize> {
-        let mut nonnull_locs = vec![BTreeSet::new(); self.info.inputs];
-        let mut null_locs = vec![BTreeSet::new(); self.info.inputs];
-        for (loc, sts) in result {
-            for (_, nulls) in sts.keys() {
-                for i in 0..self.info.inputs {
-                    let path = AbsPath(vec![i + 1]);
-                    if nulls.contains(&path) {
-                        null_locs[i].insert(*loc);
-                    } else {
-                        nonnull_locs[i].insert(*loc);
-                    }
-                }
-            }
-        }
+        let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
+        let write_spans = compute_write_spans(body, writes_map, self.info.inputs);
+
         nonnull_locs
             .into_iter()
             .zip(null_locs)
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
                 let diff = &nonnull - &null;
-                let param = i + 1;
-                if null.is_empty()
-                    || null.is_subset(&nonnull)
+                if let (Some(first), Some(last)) = (null.first(), null.last()) {
+                    let param = i + 1;
+                    if null.is_subset(&nonnull)
                         && diff.iter().all(|loc| {
-                            if *loc == Location::START {
+                            if loc < first || last < loc {
                                 return true;
                             }
                             let Location {
@@ -555,20 +544,21 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                         return true;
                                     }
                                 }
-                            }
-
-                            match writes_map.get(loc) {
-                                None => false,
-                                Some(paths) => {
-                                    let path = AbsPath(vec![param]);
-                                    paths.contains(&path)
-                                }
+                                false
+                            } else {
+                                let stmt = &bbd.statements[*statement_index];
+                                return write_spans[param]
+                                    .iter()
+                                    .any(|sp| sp.overlaps(stmt.source_info.span));
                             }
                         })
-                {
-                    None
+                    {
+                        None
+                    } else {
+                        Some(i + 1)
+                    }
                 } else {
-                    Some(i + 1)
+                    None
                 }
             })
             .collect()
@@ -1431,6 +1421,54 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
             })
             .collect()
     }
+}
+
+fn compute_nonnull_null_locs(
+    result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+    inputs: usize,
+) -> (Vec<BTreeSet<Location>>, Vec<BTreeSet<Location>>) {
+    let mut nonnull_locs = vec![BTreeSet::new(); inputs];
+    let mut null_locs = vec![BTreeSet::new(); inputs];
+    for (loc, sts) in result {
+        for (_, nulls) in sts.keys() {
+            for i in 0..inputs {
+                let path = AbsPath(vec![i + 1]);
+                if nulls.contains(&path) {
+                    null_locs[i].insert(*loc);
+                } else {
+                    nonnull_locs[i].insert(*loc);
+                }
+            }
+        }
+    }
+    (nonnull_locs, null_locs)
+}
+
+fn compute_write_spans(
+    body: &Body<'_>,
+    writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
+    inputs: usize,
+) -> Vec<BTreeSet<Span>> {
+    // Store write spans (partial or full) for the input
+    let mut write_spans = vec![BTreeSet::new(); inputs + 1];
+    for (loc, writes) in writes_map {
+        for path in writes {
+            let base = path.base();
+            let Location {
+                block,
+                statement_index,
+            } = loc;
+            let bbd = &body.basic_blocks[*block];
+            if *statement_index == bbd.statements.len() {
+                let span = bbd.terminator().source_info.span;
+                write_spans[base].insert(span);
+            } else {
+                let span = bbd.statements[*statement_index].source_info.span;
+                write_spans[base].insert(span);
+            }
+        }
+    }
+    write_spans
 }
 
 fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
