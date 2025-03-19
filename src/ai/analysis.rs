@@ -521,44 +521,35 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .zip(null_locs)
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
+                let (Some(first), Some(last)) = (null.first(), null.last()) else {
+                    return None;
+                };
+                let param = i + 1;
                 let diff = &nonnull - &null;
-                if let (Some(first), Some(last)) = (null.first(), null.last()) {
-                    let param = i + 1;
-                    if null.is_subset(&nonnull)
-                        && diff.iter().all(|loc| {
-                            if loc < first || last < loc {
-                                return true;
-                            }
-                            let Location {
-                                block,
-                                statement_index,
-                            } = loc;
-
-                            let bbd = &body.basic_blocks[*block];
-                            if *statement_index == bbd.statements.len() {
-                                if is_simple_terminator(bbd.terminator()) {
-                                    return true;
-                                }
-                                if let Some(arg) = null_checks_map.get(loc) {
-                                    if *arg == param {
-                                        return true;
-                                    }
-                                }
-                                false
-                            } else {
-                                let stmt = &bbd.statements[*statement_index];
-                                return write_spans[param]
-                                    .iter()
-                                    .any(|sp| sp.overlaps(stmt.source_info.span));
-                            }
-                        })
-                    {
-                        None
-                    } else {
-                        Some(i + 1)
+                let check_nonnull = |loc| {
+                    if loc < first || last < loc {
+                        return true;
                     }
-                } else {
+                    let Location {
+                        block,
+                        statement_index,
+                    } = loc;
+
+                    let bbd = &body.basic_blocks[*block];
+                    if *statement_index == bbd.statements.len() {
+                        is_simple_terminator(bbd.terminator())
+                            || null_checks_map.get(loc).map_or(false, |arg| *arg == param)
+                    } else {
+                        let stmt = &bbd.statements[*statement_index];
+                        write_spans[param]
+                            .iter()
+                            .any(|sp| sp.overlaps(stmt.source_info.span))
+                    }
+                };
+                if null.is_subset(&nonnull) && diff.iter().all(check_nonnull) {
                     None
+                } else {
+                    Some(param)
                 }
             })
             .collect()
