@@ -22,7 +22,10 @@ use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
-use super::{domains::*, semantics::TransferedTerminator};
+use super::{
+    domains::*,
+    semantics::{CallKind, TransferedTerminator},
+};
 use crate::{
     rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
 };
@@ -213,6 +216,7 @@ pub fn analyze(
                     writes_map,
                     init_state,
                     null_checks_map,
+                    call_info_map,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
@@ -221,8 +225,13 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
-                let nullable_params =
-                    analyzer.find_nullable_params(&states, body, &writes_map, null_checks_map);
+                let nullable_params = analyzer.find_nullable_params(
+                    &states,
+                    body,
+                    &writes_map,
+                    null_checks_map,
+                    call_info_map,
+                );
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
@@ -474,7 +483,8 @@ struct AnalyzedBody {
     states: BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
-    null_checks_map: BTreeMap<Location, usize>,
+    null_checks_map: BTreeMap<usize, BTreeMap<Location, AbsState>>,
+    call_info_map: BTreeMap<Location, Vec<CallKind>>,
 }
 
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
@@ -506,12 +516,53 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
+    fn check_terminator_pure(
+        &self,
+        loc: &Location,
+        param: usize,
+        outer_state: &AbsState,
+        writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
+        call_info_map: &BTreeMap<Location, Vec<CallKind>>,
+        term: &Terminator<'_>,
+    ) -> bool {
+        match &term.kind {
+            TerminatorKind::Call { destination, .. } => {
+                let idx = destination.local.index();
+                let call_info = call_info_map.get(loc).unwrap();
+                (outer_state.local.get(idx).is_bot()
+                    || self.info.dead_locals[loc.block.as_usize()].contains(destination.local))
+                    && call_info.iter().all(|kind| match kind {
+                        CallKind::C => false,
+                        CallKind::Method | CallKind::TOP | CallKind::RustPure => true,
+                        CallKind::RustEffect | CallKind::Intra(_) => {
+                            let writes = writes_map.get(loc).unwrap();
+                            writes
+                                .iter()
+                                .all(|p| !self.ptr_params.contains(&p.base()) || p.base() == param)
+                        }
+                    })
+            }
+            TerminatorKind::InlineAsm { .. } => false,
+            _ => true,
+        }
+    }
+
+    fn check_assign_pure(&self, outer_state: &AbsState, stmt: &StatementKind<'_>) -> bool {
+        if let StatementKind::Assign(box (place, _)) = stmt {
+            let idx = place.local.index();
+            outer_state.local.get(idx).is_bot()
+        } else {
+            unreachable!("{:?}", stmt)
+        }
+    }
+
     fn find_nullable_params(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
         body: &Body<'_>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
-        null_checks_map: BTreeMap<Location, usize>,
+        null_checks_map: BTreeMap<usize, BTreeMap<Location, AbsState>>,
+        call_info_map: BTreeMap<Location, Vec<CallKind>>,
     ) -> BTreeSet<usize> {
         let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
         let write_spans = compute_write_spans(body, writes_map, self.info.inputs);
@@ -521,32 +572,39 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .zip(null_locs)
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
-                let (Some(first), Some(last)) = (null.first(), null.last()) else {
+                if null.is_empty() {
                     return None;
-                };
+                }
                 let param = i + 1;
-                let diff = &nonnull - &null;
-                let check_nonnull = |loc| {
-                    if loc < first || last < loc {
-                        return true;
-                    }
+                let diff = compute_reachable_locs(body, &null_checks_map, &nonnull - &null, param);
+                let check = |(loc, state)| {
                     let Location {
                         block,
                         statement_index,
                     } = loc;
-
-                    let bbd = &body.basic_blocks[*block];
-                    if *statement_index == bbd.statements.len() {
-                        is_simple_terminator(bbd.terminator())
-                            || null_checks_map.get(loc).map_or(false, |arg| *arg == param)
-                    } else {
-                        let stmt = &bbd.statements[*statement_index];
+                    let bbd = &body.basic_blocks[block];
+                    if statement_index == bbd.statements.len() {
+                        let term = bbd.terminator();
                         write_spans[param]
                             .iter()
-                            .any(|sp| sp.overlaps(stmt.source_info.span))
+                            .any(|span| span.overlaps(term.source_info.span))
+                            || self.check_terminator_pure(
+                                &loc,
+                                param,
+                                &state,
+                                writes_map,
+                                &call_info_map,
+                                term,
+                            )
+                    } else {
+                        let stmt = &bbd.statements[statement_index];
+                        write_spans[param]
+                            .iter()
+                            .any(|span| span.overlaps(stmt.source_info.span))
+                            || self.check_assign_pure(&state, &stmt.kind)
                     }
                 };
-                if null.is_subset(&nonnull) && diff.iter().all(check_nonnull) {
+                if null.is_subset(&nonnull) && diff.into_iter().all(check) {
                     None
                 } else {
                     Some(param)
@@ -792,7 +850,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             BTreeSet::new()
         };
 
-        let (states, writes_map, null_checks_map) = 'analysis_loop: loop {
+        let (states, writes_map, null_checks_map, call_info_map) = 'analysis_loop: loop {
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -802,7 +860,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 start_state.clone(),
             );
             let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-            let mut null_checks_map: BTreeMap<_, usize> = BTreeMap::new();
+            let mut null_checks_map: BTreeMap<usize, BTreeMap<_, _>> = BTreeMap::new();
+            let mut call_info_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
             self.call_args.clear();
             while let Some(label) = work_list.pop() {
@@ -815,7 +874,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     statement_index,
                 } = label.location;
                 let bbd = &body.basic_blocks[block];
-                let (new_next_states, next_locations, writes, null_check) =
+                let (new_next_states, next_locations, writes) =
                     if statement_index < bbd.statements.len() {
                         let stmt = &bbd.statements[statement_index];
                         let (new_next_state, writes) = self.transfer_statement(stmt, state);
@@ -823,20 +882,30 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             block,
                             statement_index: statement_index + 1,
                         };
-                        (vec![new_next_state], vec![next_location], writes, None)
+                        (vec![new_next_state], vec![next_location], writes)
                     } else {
                         let TransferedTerminator {
                             next_states,
                             next_locations,
                             writes,
-                            null_check,
+                            null_check_state,
+                            call_info,
                         } = self.transfer_terminator(bbd.terminator(), state, label.location);
-                        (next_states, next_locations, writes, null_check)
+                        // Information needed for nullable checks
+                        if let Some((arg, state)) = null_check_state {
+                            null_checks_map
+                                .entry(arg)
+                                .or_default()
+                                .insert(label.location, state);
+                        }
+                        call_info_map
+                            .entry(label.location)
+                            .or_default()
+                            .extend(call_info);
+                        (next_states, next_locations, writes)
                     };
                 writes_map.entry(label.location).or_default().extend(writes);
-                if let Some(arg) = null_check {
-                    null_checks_map.insert(label.location, arg);
-                }
+
                 for location in &next_locations {
                     let dead_locals = &self.info.dead_locals[location.block.as_usize()];
                     if merging_blocks.contains(&location.block) {
@@ -926,7 +995,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     continue 'analysis_loop;
                 }
             }
-            break (states, writes_map, null_checks_map);
+            break (states, writes_map, null_checks_map, call_info_map);
         };
 
         AnalyzedBody {
@@ -934,6 +1003,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             writes_map,
             init_state,
             null_checks_map,
+            call_info_map,
         }
     }
 
@@ -1440,7 +1510,6 @@ fn compute_write_spans(
     writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
     inputs: usize,
 ) -> Vec<BTreeSet<Span>> {
-    // Store write spans (partial or full) for the input
     let mut write_spans = vec![BTreeSet::new(); inputs + 1];
     for (loc, writes) in writes_map {
         for path in writes {
@@ -1462,11 +1531,23 @@ fn compute_write_spans(
     write_spans
 }
 
-fn is_simple_terminator(terminator: &Terminator<'_>) -> bool {
-    !matches!(
-        &terminator.kind,
-        TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. }
-    )
+fn compute_reachable_locs(
+    body: &Body<'_>,
+    null_checks_map: &BTreeMap<usize, BTreeMap<Location, AbsState>>,
+    nonnull_locs: BTreeSet<Location>,
+    param: usize,
+) -> BTreeMap<Location, AbsState> {
+    let mut reachable_locs = BTreeMap::new();
+    if let Some(null_checks) = null_checks_map.get(&param) {
+        for loc in nonnull_locs {
+            null_checks.iter().rev().for_each(|(check_loc, state)| {
+                if check_loc.is_predecessor_of(loc, body) {
+                    reachable_locs.insert(loc, state.clone());
+                }
+            });
+        }
+    }
+    reachable_locs
 }
 
 #[allow(unused)]
