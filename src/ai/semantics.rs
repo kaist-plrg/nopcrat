@@ -25,11 +25,11 @@ pub struct TransferedTerminator {
     pub call_info: Vec<CallKind>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallKind {
-    Intra(DefId),
+    Intra(Vec<AbsBase>),
     Method,
-    RustEffect,
+    RustEffect(Vec<AbsBase>),
     RustPure,
     C,
     TOP,
@@ -286,7 +286,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         mut reads: Vec<AbsPath>,
     ) -> (Vec<AbsState>, BTreeSet<AbsPath>, Option<usize>, CallKind) {
         if summary.return_states.is_empty() {
-            return (vec![], BTreeSet::new(), None, CallKind::Intra(callee));
+            return (vec![], BTreeSet::new(), None, CallKind::Intra(vec![]));
         }
 
         let mut ptr_maps = BTreeMap::new();
@@ -305,6 +305,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         let mut states = vec![];
         let mut ret_writes = BTreeSet::new();
+        let mut bases = vec![];
         for return_state in summary.return_states.values() {
             let mut state = state.clone();
             let ret_v = return_state.local.get(0);
@@ -358,17 +359,23 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     continue;
                 }
                 let ptr = ptrs.first().unwrap();
-                let (mut path, array_access) =
-                    some_or!(AbsPath::from_place(ptr, &self.ptr_params), continue);
-                if array_access {
-                    continue;
+
+                match AbsPath::from_place(ptr, &self.ptr_params) {
+                    None => {
+                        bases.push(ptr.base);
+                    }
+                    Some((mut path, array_access)) => {
+                        if array_access {
+                            continue;
+                        }
+                        path.0.extend(write.0[1..].to_owned());
+                        callee_writes.push(path.clone());
+                        self.call_args
+                            .entry(location)
+                            .or_default()
+                            .insert(path.base() - 1, idx);
+                    }
                 }
-                path.0.extend(write.0[1..].to_owned());
-                callee_writes.push(path.clone());
-                self.call_args
-                    .entry(location)
-                    .or_default()
-                    .insert(path.base() - 1, idx);
             }
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
@@ -377,7 +384,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ret_writes.extend(writes);
             states.push(state)
         }
-        (states, ret_writes, None, CallKind::Intra(callee))
+        (states, ret_writes, None, CallKind::Intra(bases))
     }
 
     fn transfer_method_call(
@@ -563,7 +570,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 self.indirect_assign(&args[0].ptrv, &args[1], &[], state);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                call_kind = CallKind::RustEffect;
+                let bases = self
+                    .get_write_bases_of_ptr(&args[0].ptrv)
+                    .unwrap_or_default();
+                call_kind = CallKind::RustEffect(bases);
                 AbsValue::top()
             }
             ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") => {
@@ -600,7 +610,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | ("", "num", _, "count_ones" | "trailing_zeros" | "leading_zeros")
             | ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
             ("", "", "panicking", "panic" | "begin_panic") => {
-                call_kind = CallKind::RustEffect;
+                call_kind = CallKind::RustEffect(vec![]);
                 AbsValue::bot()
             }
             ("", "vec", _, "leak")
@@ -637,7 +647,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads.extend(reads2);
                 let writes2 = self.get_write_paths_of_ptr(&args[0].ptrv, &[]);
                 writes.extend(writes2);
-                call_kind = CallKind::RustEffect;
+                let bases = self
+                    .get_write_bases_of_ptr(&args[0].ptrv)
+                    .unwrap_or_default();
+                call_kind = CallKind::RustEffect(bases);
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
@@ -1191,6 +1204,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
         }
         vec![]
+    }
+
+    fn get_write_bases_of_ptr(&self, ptr: &AbsPtr) -> Option<Vec<AbsBase>> {
+        if let AbsPtr::Set(ptrs) = ptr {
+            if ptrs.len() == 1 {
+                let ptr = ptrs.first().unwrap().clone();
+                return Some(vec![ptr.base]);
+            }
+        }
+        None
     }
 
     fn update_value(

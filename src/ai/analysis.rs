@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
     path::Path,
 };
@@ -529,18 +529,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             TerminatorKind::Call { destination, .. } => {
                 let idx = destination.local.index();
                 let call_info = call_info_map.get(loc).unwrap();
-                (outer_state.local.get(idx).is_bot()
-                    || self.info.dead_locals[loc.block.as_usize()].contains(destination.local))
+                let res = outer_state.local.get(idx).is_bot()
                     && call_info.iter().all(|kind| match kind {
                         CallKind::C => false,
                         CallKind::Method | CallKind::TOP | CallKind::RustPure => true,
-                        CallKind::RustEffect | CallKind::Intra(_) => {
+                        CallKind::RustEffect(bases) | CallKind::Intra(bases) => {
                             let writes = writes_map.get(loc).unwrap();
-                            writes
-                                .iter()
-                                .all(|p| !self.ptr_params.contains(&p.base()) || p.base() == param)
+                            bases.iter().all(|p| match p {
+                                AbsBase::Local(idx) => outer_state.local.get(*idx).is_bot(),
+                                AbsBase::Heap => false,
+                                AbsBase::Null | AbsBase::Arg(_) => true,
+                            }) && writes.iter().all(|p| p.base() == param)
                         }
-                    })
+                    });
+                res
             }
             TerminatorKind::InlineAsm { .. } => false,
             _ => true,
@@ -549,11 +551,60 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(&self, outer_state: &AbsState, stmt: &StatementKind<'_>) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            let idx = place.local.index();
-            outer_state.local.get(idx).is_bot()
+            outer_state.local.get(place.local.index()).is_bot()
         } else {
             unreachable!("{:?}", stmt)
         }
+    }
+
+    fn is_strict_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
+        if check.block == loc.block {
+            return check.statement_index < loc.statement_index;
+        }
+
+        let dominators = body.basic_blocks.dominators();
+
+        if dominators.dominates(check.block, loc.block) {
+            return true;
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut work_list = VecDeque::from(vec![check.block]);
+        while let Some(bb) = work_list.pop_front() {
+            if bb == loc.block {
+                return true;
+            }
+            if self.info.loop_blocks.contains_key(&bb) {
+                continue;
+            }
+            if visited.insert(bb) {
+                work_list.extend(body.basic_blocks.successors(bb));
+            }
+        }
+        false
+    }
+
+    fn compute_reachable_locs(
+        &self,
+        body: &Body<'_>,
+        null_checks_map: &BTreeMap<usize, BTreeMap<Location, AbsState>>,
+        nonnull_locs: BTreeSet<Location>,
+        param: usize,
+    ) -> BTreeMap<Location, AbsState> {
+        let mut reachable_locs: BTreeMap<Location, AbsState> = BTreeMap::new();
+        if let Some(null_checks) = null_checks_map.get(&param) {
+            for loc in nonnull_locs {
+                null_checks.iter().for_each(|(check_loc, state)| {
+                    if self.is_strict_reachable_from(&loc, check_loc, body) {
+                        reachable_locs
+                            .entry(loc)
+                            .and_modify(|s| *s = s.join(state))
+                            .or_insert(state.clone());
+                    }
+                });
+            }
+        }
+        reachable_locs
     }
 
     fn find_nullable_params(
@@ -576,7 +627,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     return None;
                 }
                 let param = i + 1;
-                let diff = compute_reachable_locs(body, &null_checks_map, &nonnull - &null, param);
+                let diff =
+                    self.compute_reachable_locs(body, &null_checks_map, &nonnull - &null, param);
                 let check = |(loc, state)| {
                     let Location {
                         block,
@@ -607,7 +659,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 if null.is_subset(&nonnull) && diff.into_iter().all(check) {
                     None
                 } else {
-                    Some(param)
+                    Some(i + 1)
                 }
             })
             .collect()
@@ -1529,25 +1581,6 @@ fn compute_write_spans(
         }
     }
     write_spans
-}
-
-fn compute_reachable_locs(
-    body: &Body<'_>,
-    null_checks_map: &BTreeMap<usize, BTreeMap<Location, AbsState>>,
-    nonnull_locs: BTreeSet<Location>,
-    param: usize,
-) -> BTreeMap<Location, AbsState> {
-    let mut reachable_locs = BTreeMap::new();
-    if let Some(null_checks) = null_checks_map.get(&param) {
-        for loc in nonnull_locs {
-            null_checks.iter().rev().for_each(|(check_loc, state)| {
-                if check_loc.is_predecessor_of(loc, body) {
-                    reachable_locs.insert(loc, state.clone());
-                }
-            });
-        }
-    }
-    reachable_locs
 }
 
 #[allow(unused)]
