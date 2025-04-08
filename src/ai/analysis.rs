@@ -529,7 +529,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             TerminatorKind::Call { destination, .. } => {
                 let idx = destination.local.index();
                 let call_info = call_info_map.get(loc).unwrap();
-                let res = outer_state.local.get(idx).is_bot()
+                outer_state.local.get(idx).is_bot()
                     && call_info.iter().all(|kind| match kind {
                         CallKind::C => false,
                         CallKind::Method | CallKind::TOP | CallKind::RustPure => true,
@@ -541,8 +541,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 AbsBase::Null | AbsBase::Arg(_) => true,
                             }) && writes.iter().all(|p| p.base() == param)
                         }
-                    });
-                res
+                    })
             }
             TerminatorKind::InlineAsm { .. } => false,
             _ => true,
@@ -551,14 +550,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(&self, outer_state: &AbsState, stmt: &StatementKind<'_>) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            outer_state.local.get(place.local.index()).is_bot()
+            place.local.index() != 0 && outer_state.local.get(place.local.index()).is_bot()
         } else {
             unreachable!("{:?}", stmt)
         }
     }
 
-    fn is_strict_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
+    fn is_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
         if check.block == loc.block {
+            // loc and check should be different
             return check.statement_index < loc.statement_index;
         }
 
@@ -574,7 +574,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if bb == loc.block {
                 return true;
             }
-            if self.info.loop_blocks.contains_key(&bb) {
+            // If we reach a loop head, stop searching that path
+            if self.info.loop_blocks.contains_key(&bb)
+                && self.info.loop_blocks[&bb].contains(&check.block)
+            {
                 continue;
             }
             if visited.insert(bb) {
@@ -584,6 +587,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         false
     }
 
+    // To derive the set of non-null locations, we check the location is reachable from
+    // any null check (is_null) location
     fn compute_reachable_locs(
         &self,
         body: &Body<'_>,
@@ -594,12 +599,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut reachable_locs: BTreeMap<Location, AbsState> = BTreeMap::new();
         if let Some(null_checks) = null_checks_map.get(&param) {
             for loc in nonnull_locs {
-                null_checks.iter().for_each(|(check_loc, state)| {
-                    if self.is_strict_reachable_from(&loc, check_loc, body) {
-                        reachable_locs
-                            .entry(loc)
-                            .and_modify(|s| *s = s.join(state))
-                            .or_insert(state.clone());
+                null_checks.iter().rev().any(|(check_loc, state)| {
+                    if self.is_reachable_from(&loc, check_loc, body) {
+                        reachable_locs.insert(loc, state.clone());
+                        true
+                    } else {
+                        false
                     }
                 });
             }
@@ -607,6 +612,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         reachable_locs
     }
 
+    // We consider a parameter to be nullable if below sets are not the same:
+    // 1. The set of locations that are reachable when x is non-null and have side-effects
+    // 2. The set of locations that are reachable when x is null and have side-effects
     fn find_nullable_params(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
@@ -627,8 +635,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     return None;
                 }
                 let param = i + 1;
-                let diff =
+                let nonnull_diff =
                     self.compute_reachable_locs(body, &null_checks_map, &nonnull - &null, param);
+                let null_diff =
+                    self.compute_reachable_locs(body, &null_checks_map, &null - &nonnull, param);
+
                 let check = |(loc, state)| {
                     let Location {
                         block,
@@ -656,7 +667,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             || self.check_assign_pure(&state, &stmt.kind)
                     }
                 };
-                if null.is_subset(&nonnull) && diff.into_iter().all(check) {
+                if nonnull_diff.into_iter().all(check) && null_diff.into_iter().all(check) {
                     None
                 } else {
                     Some(i + 1)
@@ -943,13 +954,16 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             null_check_state,
                             call_info,
                         } = self.transfer_terminator(bbd.terminator(), state, label.location);
-                        // Information needed for nullable checks
+                        // Record locations and states of is_null checks
                         if let Some((arg, state)) = null_check_state {
                             null_checks_map
                                 .entry(arg)
                                 .or_default()
-                                .insert(label.location, state);
+                                .entry(label.location)
+                                .and_modify(|s: &mut AbsState| *s = s.join(&state))
+                                .or_insert(state.clone());
                         }
+                        // Record locations and call info of function calls
                         call_info_map
                             .entry(label.location)
                             .or_default()
@@ -1536,6 +1550,7 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
     }
 }
 
+// Compute locations where the parameters are non-null or null
 fn compute_nonnull_null_locs(
     result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
     inputs: usize,
@@ -1557,6 +1572,7 @@ fn compute_nonnull_null_locs(
     (nonnull_locs, null_locs)
 }
 
+// Compute spans where writes to the parameters happen
 fn compute_write_spans(
     body: &Body<'_>,
     writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
