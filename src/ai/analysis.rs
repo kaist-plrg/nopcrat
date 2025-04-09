@@ -229,8 +229,8 @@ pub fn analyze(
                     &states,
                     body,
                     &writes_map,
-                    null_checks_map,
-                    call_info_map,
+                    &null_checks_map,
+                    &call_info_map,
                 );
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
@@ -531,8 +531,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let call_info = call_info_map.get(loc).unwrap();
                 outer_state.local.get(idx).is_bot()
                     && call_info.iter().all(|kind| match kind {
-                        CallKind::C => false,
-                        CallKind::Method | CallKind::TOP | CallKind::RustPure => true,
+                        CallKind::C | CallKind::TOP => false,
+                        CallKind::Method| CallKind::RustPure => true,
                         CallKind::RustEffect(bases) | CallKind::Intra(bases) => {
                             let writes = writes_map.get(loc).unwrap();
                             bases.iter().all(|p| match p {
@@ -592,22 +592,25 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_reachable_locs(
         &self,
         body: &Body<'_>,
-        null_checks_map: &BTreeMap<usize, BTreeMap<Location, AbsState>>,
+        null_checks_map: &'a BTreeMap<usize, BTreeMap<Location, AbsState>>,
         nonnull_locs: BTreeSet<Location>,
         param: usize,
-    ) -> BTreeMap<Location, AbsState> {
-        let mut reachable_locs: BTreeMap<Location, AbsState> = BTreeMap::new();
+    ) -> BTreeMap<Location, &AbsState> {
+        let mut reachable_locs: BTreeMap<Location, &AbsState> = BTreeMap::new();
         if let Some(null_checks) = null_checks_map.get(&param) {
             for loc in nonnull_locs {
-                null_checks.iter().rev().any(|(check_loc, state)| {
+                let check_state = null_checks.iter().rev().find_map(|(check_loc, state)| {
                     if self.is_reachable_from(&loc, check_loc, body) {
-                        reachable_locs.insert(loc, state.clone());
-                        true
+                        Some(state)
                     } else {
-                        false
+                        None
                     }
                 });
+                if let Some(state) = check_state {
+                    reachable_locs.insert(loc, state);
+                }
             }
+
         }
         reachable_locs
     }
@@ -620,8 +623,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
         body: &Body<'_>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
-        null_checks_map: BTreeMap<usize, BTreeMap<Location, AbsState>>,
-        call_info_map: BTreeMap<Location, Vec<CallKind>>,
+        null_checks_map: &BTreeMap<usize, BTreeMap<Location, AbsState>>,
+        call_info_map: &BTreeMap<Location, Vec<CallKind>>,
     ) -> BTreeSet<usize> {
         let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
         let write_spans = compute_write_spans(body, writes_map, self.info.inputs);
@@ -636,9 +639,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 }
                 let param = i + 1;
                 let nonnull_diff =
-                    self.compute_reachable_locs(body, &null_checks_map, &nonnull - &null, param);
+                    self.compute_reachable_locs(body, null_checks_map, &nonnull - &null, param);
                 let null_diff =
-                    self.compute_reachable_locs(body, &null_checks_map, &null - &nonnull, param);
+                    self.compute_reachable_locs(body, null_checks_map, &null - &nonnull, param);
 
                 let check = |(loc, state)| {
                     let Location {
@@ -654,9 +657,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             || self.check_terminator_pure(
                                 &loc,
                                 param,
-                                &state,
+                                state,
                                 writes_map,
-                                &call_info_map,
+                                call_info_map,
                                 term,
                             )
                     } else {
@@ -664,13 +667,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         write_spans[param]
                             .iter()
                             .any(|span| span.overlaps(stmt.source_info.span))
-                            || self.check_assign_pure(&state, &stmt.kind)
+                            || self.check_assign_pure(state, &stmt.kind)
                     }
                 };
                 if nonnull_diff.into_iter().all(check) && null_diff.into_iter().all(check) {
                     None
                 } else {
-                    Some(i + 1)
+                    Some(param)
                 }
             })
             .collect()
