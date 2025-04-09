@@ -29,7 +29,7 @@ pub struct TransferedTerminator {
 pub enum CallKind {
     Intra(Vec<AbsBase>),
     Method,
-    RustEffect(Vec<AbsBase>),
+    RustEffect(Option<Vec<AbsBase>>),
     RustPure,
     C,
     TOP,
@@ -573,7 +573,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let bases = self
                     .get_write_bases_of_ptr(&args[0].ptrv)
                     .unwrap_or_default();
-                call_kind = CallKind::RustEffect(bases);
+                call_kind = CallKind::RustEffect(Some(bases));
                 AbsValue::top()
             }
             ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") => {
@@ -610,7 +610,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             | ("", "num", _, "count_ones" | "trailing_zeros" | "leading_zeros")
             | ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
             ("", "", "panicking", "panic" | "begin_panic") => {
-                call_kind = CallKind::RustEffect(vec![]);
+                call_kind = CallKind::RustEffect(None);
                 AbsValue::bot()
             }
             ("", "vec", _, "leak")
@@ -650,7 +650,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let bases = self
                     .get_write_bases_of_ptr(&args[0].ptrv)
                     .unwrap_or_default();
-                call_kind = CallKind::RustEffect(bases);
+                call_kind = CallKind::RustEffect(Some(bases));
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
