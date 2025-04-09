@@ -531,9 +531,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let call_info = call_info_map.get(loc).unwrap();
                 outer_state.local.get(idx).is_bot()
                     && call_info.iter().all(|kind| match kind {
-                        CallKind::C | CallKind::TOP => false,
                         CallKind::Method | CallKind::RustPure => true,
-                        CallKind::RustEffect(bases) | CallKind::Intra(bases) => {
+                        CallKind::C | CallKind::TOP | CallKind::RustEffect(None) => false,
+                        CallKind::RustEffect(Some(bases)) | CallKind::Intra(bases) => {
                             let writes = writes_map.get(loc).unwrap();
                             bases.iter().all(|p| match p {
                                 AbsBase::Local(idx) => outer_state.local.get(*idx).is_bot(),
