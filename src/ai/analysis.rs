@@ -15,7 +15,10 @@ use rustc_hir::{
 use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind},
+    mir::{
+        BasicBlock, Body, Local, Location, Operand, Place, Rvalue, StatementKind, Terminator,
+        TerminatorKind,
+    },
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
 use rustc_session::config::Input;
@@ -232,6 +235,7 @@ pub fn analyze(
                     &null_checks_map,
                     &call_info_map,
                 );
+
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
@@ -516,44 +520,185 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
+    fn check_stmt_uses(
+        &self,
+        bb: BasicBlock,
+        idx: usize,
+        stmt: &StatementKind<'_>,
+        locs: &BTreeSet<&Location>,
+        idxs: &BTreeSet<usize>,
+    ) -> Option<bool> {
+        let loc = Location {
+            block: bb,
+            statement_index: idx,
+        };
+        let check_rvalue = |rvalue: &Rvalue<'_>| match rvalue {
+            Rvalue::Use(operand)
+            | Rvalue::Repeat(operand, _)
+            | Rvalue::Cast(_, operand, _)
+            | Rvalue::UnaryOp(_, operand) => check_operand(operand, idxs),
+            Rvalue::Ref(_, _, place)
+            | Rvalue::AddressOf(_, place)
+            | Rvalue::CopyForDeref(place) => check_place(place, idxs),
+            Rvalue::BinaryOp(_, box (operand1, operand2)) => {
+                check_operand(operand1, idxs) && check_operand(operand2, idxs)
+            }
+            Rvalue::Aggregate(_, fields) => fields.iter().all(|f| check_operand(f, idxs)),
+            _ => true,
+        };
+
+        if !locs.contains(&loc) {
+            if let StatementKind::Assign(box (place, rvalue)) = stmt {
+                if !check_rvalue(rvalue) {
+                    return Some(false);
+                }
+                if idxs.contains(&place.local.index()) {
+                    return None;
+                }
+            }
+        }
+        Some(true)
+    }
+
+    // Check if any local in idxs is used in the following blocks
+    fn check_local_uses(
+        &self,
+        body: &Body<'_>,
+        block: &BasicBlock,
+        locs: &BTreeSet<&Location>,
+        idxs: &BTreeSet<usize>,
+    ) -> bool {
+        let mut work_list = VecDeque::new();
+        work_list.extend(body.basic_blocks.successors(*block));
+        let mut visited = BTreeSet::new();
+
+        while let Some(bb) = work_list.pop_front() {
+            if visited.insert(bb) {
+                let bbd = &body.basic_blocks[bb];
+                let mut overwritten = false;
+                for (i, stmt) in bbd.statements.iter().enumerate() {
+                    match self.check_stmt_uses(bb, i, &stmt.kind, locs, idxs) {
+                        Some(true) => continue,      // no use -- continue to check next statement
+                        Some(false) => return false, // found a use
+                        None => {
+                            overwritten = false;
+                            break;
+                        } // value is overwritten -- stop checking
+                    }
+                }
+
+                let term = bbd.terminator();
+                let loc = Location {
+                    block: bb,
+                    statement_index: bbd.statements.len(),
+                };
+
+                if !overwritten {
+                    continue;
+                }
+
+                if !locs.contains(&loc) {
+                    match &term.kind {
+                        TerminatorKind::Call {
+                            func,
+                            args,
+                            destination,
+                            ..
+                        } => {
+                            if !check_place(destination, idxs) {
+                                continue;
+                            }
+                            if !check_operand(func, idxs)
+                                || args.iter().any(|arg| !check_operand(arg, idxs))
+                            {
+                                return false;
+                            }
+                        }
+                        TerminatorKind::SwitchInt { discr: operand, .. }
+                        | TerminatorKind::Assert { cond: operand, .. } => {
+                            if !check_operand(operand, idxs) {
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    };
+                }
+                work_list.extend(body.basic_blocks.successors(bb));
+            }
+        }
+        true
+    }
+
     fn check_terminator_pure(
         &self,
         loc: &Location,
+        local_writes: &mut BTreeSet<usize>,
         param: usize,
         outer_state: &AbsState,
-        writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
         term: &Terminator<'_>,
     ) -> bool {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
-                let idx = destination.local.index();
                 let call_info = call_info_map.get(loc).unwrap();
-                outer_state.local.get(idx).is_bot()
-                    && call_info.iter().all(|kind| match kind {
-                        CallKind::Method | CallKind::RustPure => true,
-                        CallKind::C | CallKind::TOP | CallKind::RustEffect(None) => false,
-                        CallKind::RustEffect(Some(bases)) | CallKind::Intra(bases) => {
-                            let writes = writes_map.get(loc).unwrap();
-                            bases.iter().all(|p| match p {
-                                AbsBase::Local(idx) => outer_state.local.get(*idx).is_bot(),
-                                AbsBase::Heap => false,
-                                AbsBase::Null | AbsBase::Arg(_) => true,
-                            }) && writes.iter().all(|p| p.base() == param)
-                        }
-                    })
+                let idx = destination.local.index();
+                // check the destination of call
+                if idx == 0 || idx != param && !outer_state.local.get(idx).is_bot() {
+                    return false;
+                }
+                if idx != param || !destination.is_indirect_first_projection() {
+                    local_writes.insert(idx);
+                }
+
+                // check the writes of callee
+                call_info.iter().all(|kind| match kind {
+                    CallKind::Method | CallKind::RustPure => true,
+                    CallKind::C | CallKind::TOP | CallKind::RustEffect(None) => false,
+                    CallKind::RustEffect(Some(bases)) | CallKind::Intra(bases) => {
+                        bases.iter().all(|p| match p {
+                            AbsBase::Local(idx) => {
+                                // Defer the check to the caller
+                                local_writes.insert(*idx);
+                                true
+                            }
+                            AbsBase::Heap => false,
+                            AbsBase::Null | AbsBase::Arg(_) => true,
+                        })
+                    }
+                })
             }
             TerminatorKind::InlineAsm { .. } => false,
             _ => true,
         }
     }
 
-    fn check_assign_pure(&self, outer_state: &AbsState, stmt: &StatementKind<'_>) -> bool {
+    fn check_assign_pure(
+        &self,
+        locs: &mut BTreeSet<usize>,
+        param: usize,
+        outer_state: &AbsState,
+        stmt: &StatementKind<'_>,
+    ) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            place.local.index() != 0 && outer_state.local.get(place.local.index()).is_bot()
+            let idx = place.local.index();
+            if idx == param && place.is_indirect_first_projection() {
+                return true;
+            }
+            if idx == 0 || !outer_state.local.get(idx).is_bot() {
+                return false;
+            }
+            locs.insert(idx);
+            true
         } else {
             unreachable!("{:?}", stmt)
         }
+    }
+
+    fn extract_locs(&self, diffs: &'a BTreeMap<BasicBlock, BTreeSet<Location>>) -> BTreeSet<&Location> {
+        diffs
+            .values()
+            .flat_map(|locs| locs.iter())
+            .collect::<BTreeSet<_>>()
     }
 
     fn is_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
@@ -593,12 +738,16 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         body: &Body<'_>,
         null_checks_map: &'a BTreeMap<usize, BTreeMap<Location, AbsState>>,
-        nonnull_locs: BTreeSet<Location>,
+        diff_locs: BTreeSet<Location>,
         param: usize,
-    ) -> BTreeMap<Location, &AbsState> {
-        let mut reachable_locs: BTreeMap<Location, &AbsState> = BTreeMap::new();
+    ) -> (
+        BTreeMap<BasicBlock, BTreeSet<Location>>,
+        BTreeMap<BasicBlock, &AbsState>,
+    ) {
+        let mut reachable_group: BTreeMap<BasicBlock, BTreeSet<Location>> = BTreeMap::new();
+        let mut reachable_state: BTreeMap<BasicBlock, &AbsState> = BTreeMap::new();
         if let Some(null_checks) = null_checks_map.get(&param) {
-            for loc in nonnull_locs {
+            for loc in diff_locs {
                 let check_state = null_checks.iter().rev().find_map(|(check_loc, state)| {
                     if self.is_reachable_from(&loc, check_loc, body) {
                         Some(state)
@@ -607,11 +756,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     }
                 });
                 if let Some(state) = check_state {
-                    reachable_locs.insert(loc, state);
+                    reachable_group.entry(loc.block).or_default().insert(loc);
+                    reachable_state.insert(loc.block, state);
                 }
             }
         }
-        reachable_locs
+        (reachable_group, reachable_state)
     }
 
     // We consider a parameter to be nullable if below sets are not the same:
@@ -626,7 +776,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
     ) -> BTreeSet<usize> {
         let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
-        let write_spans = compute_write_spans(body, writes_map, self.info.inputs);
 
         nonnull_locs
             .into_iter()
@@ -636,40 +785,54 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 if null.is_empty() {
                     return None;
                 }
-                let param = i + 1;
-                let nonnull_diff =
-                    self.compute_reachable_locs(body, null_checks_map, &nonnull - &null, param);
-                let null_diff =
-                    self.compute_reachable_locs(body, null_checks_map, &null - &nonnull, param);
 
-                let check = |(loc, state)| {
-                    let Location {
-                        block,
-                        statement_index,
-                    } = loc;
-                    let bbd = &body.basic_blocks[block];
-                    if statement_index == bbd.statements.len() {
-                        let term = bbd.terminator();
-                        write_spans[param]
-                            .iter()
-                            .any(|span| span.overlaps(term.source_info.span))
-                            || self.check_terminator_pure(
-                                &loc,
-                                param,
-                                state,
-                                writes_map,
-                                call_info_map,
-                                term,
-                            )
-                    } else {
-                        let stmt = &bbd.statements[statement_index];
-                        write_spans[param]
-                            .iter()
-                            .any(|span| span.overlaps(stmt.source_info.span))
-                            || self.check_assign_pure(state, &stmt.kind)
-                    }
-                };
-                if nonnull_diff.into_iter().all(check) && null_diff.into_iter().all(check) {
+                let param = i + 1;
+                let (nonnull_diff, nonnull_state) =
+                    self.compute_reachable_locs(body, null_checks_map, &nonnull - &null, param);
+                let (null_diff, null_state) =
+                    self.compute_reachable_locs(body, null_checks_map, &null - &nonnull, param);
+                let nonnull_locs = self.extract_locs(&nonnull_diff);
+                let null_locs = self.extract_locs(&null_diff);
+
+                let check =
+                    |block, locs: &BTreeSet<_>, diff_locs, diff_states: &BTreeMap<_, &AbsState>| {
+                        let state = diff_states.get(block).unwrap();
+                        let mut local_writes = BTreeSet::new();
+                        locs.iter().all(|loc| {
+                            let writes = writes_map.get(loc).unwrap();
+                            let Location {
+                                block,
+                                statement_index,
+                            } = loc;
+
+                            if writes.iter().any(|p| p.base() != param) {
+                                return false;
+                            }
+
+                            let bbd = &body.basic_blocks[*block];
+                            if *statement_index < bbd.statements.len() {
+                                let stmt = &bbd.statements[*statement_index];
+                                self.check_assign_pure(&mut local_writes, param, state, &stmt.kind)
+                            } else {
+                                let term = bbd.terminator();
+                                self.check_terminator_pure(
+                                    loc,
+                                    &mut local_writes,
+                                    param,
+                                    state,
+                                    call_info_map,
+                                    term,
+                                )
+                            }
+                        }) && self.check_local_uses(body, block, diff_locs, &local_writes)
+                    };
+                if nonnull_diff
+                    .iter()
+                    .all(|(b, locs)| check(b, locs, &nonnull_locs, &nonnull_state))
+                    && null_diff
+                        .iter()
+                        .all(|(b, locs)| check(b, locs, &null_locs, &null_state))
+                {
                     None
                 } else {
                     Some(param)
@@ -1574,31 +1737,17 @@ fn compute_nonnull_null_locs(
     (nonnull_locs, null_locs)
 }
 
-// Compute spans where writes to the parameters happen
-fn compute_write_spans(
-    body: &Body<'_>,
-    writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
-    inputs: usize,
-) -> Vec<BTreeSet<Span>> {
-    let mut write_spans = vec![BTreeSet::new(); inputs + 1];
-    for (loc, writes) in writes_map {
-        for path in writes {
-            let base = path.base();
-            let Location {
-                block,
-                statement_index,
-            } = loc;
-            let bbd = &body.basic_blocks[*block];
-            if *statement_index == bbd.statements.len() {
-                let span = bbd.terminator().source_info.span;
-                write_spans[base].insert(span);
-            } else {
-                let span = bbd.statements[*statement_index].source_info.span;
-                write_spans[base].insert(span);
-            }
-        }
+// Check if the index of the place is not in the set of indices
+fn check_place(place: &Place<'_>, idxs: &BTreeSet<usize>) -> bool {
+    !idxs.contains(&place.local.index())
+}
+
+fn check_operand(operand: &Operand<'_>, idxs: &BTreeSet<usize>) -> bool {
+    if let Operand::Copy(place) | Operand::Move(place) = operand {
+        check_place(place, idxs)
+    } else {
+        true
     }
-    write_spans
 }
 
 #[allow(unused)]
