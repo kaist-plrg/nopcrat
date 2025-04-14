@@ -694,7 +694,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
     }
 
-    fn extract_locs(&self, diffs: &'a BTreeMap<BasicBlock, BTreeSet<Location>>) -> BTreeSet<&Location> {
+    fn extract_locs(
+        &self,
+        diffs: &'a BTreeMap<BasicBlock, BTreeSet<Location>>,
+    ) -> BTreeSet<&Location> {
         diffs
             .values()
             .flat_map(|locs| locs.iter())
