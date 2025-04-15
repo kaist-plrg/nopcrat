@@ -27,7 +27,7 @@ pub struct TransferedTerminator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallKind {
-    Intra(Vec<AbsBase>),
+    Intra,
     Method,
     RustEffect(Option<Vec<AbsBase>>),
     RustPure,
@@ -286,7 +286,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         mut reads: Vec<AbsPath>,
     ) -> (Vec<AbsState>, BTreeSet<AbsPath>, Option<usize>, CallKind) {
         if summary.return_states.is_empty() {
-            return (vec![], BTreeSet::new(), None, CallKind::Intra(vec![]));
+            return (vec![], BTreeSet::new(), None, CallKind::Intra);
         }
 
         let mut ptr_maps = BTreeMap::new();
@@ -305,7 +305,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         let mut states = vec![];
         let mut ret_writes = BTreeSet::new();
-        let mut bases = vec![];
         for return_state in summary.return_states.values() {
             let mut state = state.clone();
             let ret_v = return_state.local.get(0);
@@ -359,23 +358,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     continue;
                 }
                 let ptr = ptrs.first().unwrap();
-
-                match AbsPath::from_place(ptr, &self.ptr_params) {
-                    None => {
-                        bases.push(ptr.base);
-                    }
-                    Some((mut path, array_access)) => {
-                        if array_access {
-                            continue;
-                        }
-                        path.0.extend(write.0[1..].to_owned());
-                        callee_writes.push(path.clone());
-                        self.call_args
-                            .entry(location)
-                            .or_default()
-                            .insert(path.base() - 1, idx);
-                    }
+                let (mut path, array_access) =
+                    some_or!(AbsPath::from_place(ptr, &self.ptr_params), continue);
+                if array_access {
+                    continue;
                 }
+                path.0.extend(write.0[1..].to_owned());
+                callee_writes.push(path.clone());
+                self.call_args
+                    .entry(location)
+                    .or_default()
+                    .insert(path.base() - 1, idx);
             }
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
@@ -384,7 +377,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ret_writes.extend(writes);
             states.push(state)
         }
-        (states, ret_writes, None, CallKind::Intra(bases))
+        (states, ret_writes, None, CallKind::Intra)
     }
 
     fn transfer_method_call(
