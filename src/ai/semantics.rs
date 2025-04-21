@@ -2,15 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use etrace::some_or;
 use rustc_abi::{FieldIdx, Size, VariantIdx};
-use rustc_const_eval::interpret::{AllocRange, ConstValue, GlobalAlloc, Scalar};
+use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Constant, ConstantKind, Location, Operand, Place,
+        AggregateKind, BinOp, CastKind, Const, ConstValue, ConstOperand, Location, Operand, Place,
         PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         UnOp,
     },
-    ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind, TypeAndMut},
+    ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind},
 };
 use rustc_span::def_id::DefId;
 use rustc_type_ir::{FloatTy, IntTy, UintTy};
@@ -118,7 +118,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (func, mut reads) = self.transfer_operand(func, state);
                 let (args, readss): (Vec<_>, Vec<_>) = args
                     .iter()
-                    .map(|arg| self.transfer_operand(arg, state))
+                    .map(|arg| self.transfer_operand(&arg.node, state))
                     .unzip();
                 for reads2 in readss {
                     reads.extend(reads2);
@@ -169,6 +169,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 };
                 TransferedTerminator::new(new_states, locations, writes)
             }
+            TerminatorKind::TailCall { .. } => todo!("{:?}", terminator.kind),
             TerminatorKind::Assert { cond, target, .. } => {
                 let (_, reads) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
@@ -176,14 +177,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 TransferedTerminator::state_location(new_state, target.start_location())
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
-            TerminatorKind::GeneratorDrop => unreachable!("{:?}", terminator.kind),
+            TerminatorKind::CoroutineDrop => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseEdge { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseUnwind { .. } => unreachable!("{:?}", terminator.kind),
-            TerminatorKind::InlineAsm { destination, .. } => {
-                let mut locations = vec![];
-                if let Some(dst) = destination {
-                    locations.push(dst.start_location());
-                }
+            TerminatorKind::InlineAsm { targets, .. } => {
+                let locations = targets.iter().map(|target| {
+                    target.start_location()
+                }) .collect();
                 TransferedTerminator::state_locations(state.clone(), locations)
             }
         }
@@ -352,7 +352,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         args: &[AbsValue],
         reads: &mut Vec<AbsPath>,
     ) -> AbsValue {
-        let node = self.tcx.hir().get_if_local(callee).unwrap();
+        let node = self.tcx.hir_get_if_local(callee).unwrap();
         if let hir::Node::ImplItem(item) = node {
             let span_str = self.span_to_string(item.span);
             assert_eq!(span_str, "BitfieldStruct", "{:?} {}", callee, span_str);
@@ -400,7 +400,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .iter()
             .enumerate()
             .filter_map(|(i, ty)| {
-                if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+                if let TyKind::RawPtr(ty, _) = ty.kind() {
                     if let TyKind::Adt(adt, _) = ty.kind() {
                         if self.def_id_to_string(adt.did()).ends_with("::_IO_FILE") {
                             return None;
@@ -428,7 +428,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
-        } else if output.is_unsafe_ptr() {
+        } else if output.is_raw_ptr() {
             AbsValue::heap_or_null()
         } else {
             AbsValue::top()
@@ -651,7 +651,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             Rvalue::Repeat(operand, len) => {
                 let (v, reads) = self.transfer_operand(operand, state);
-                let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
+                let len = len.try_to_target_usize(self.tcx).unwrap();
                 (AbsValue::alpha_list(vec![v; len as usize]), reads, vec![])
             }
             Rvalue::Ref(_, _, place) => {
@@ -681,7 +681,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 (v, vec![], vec![])
             }
             Rvalue::ThreadLocalRef(_) => (AbsValue::top_ptr(), vec![], vec![]),
-            Rvalue::AddressOf(_, place) => {
+            Rvalue::RawPtr(_, place) => {
                 assert_eq!(place.projection.len(), 1);
                 assert!(place.is_indirect_first_projection());
                 let v = state.local.get(place.local.index());
@@ -691,8 +691,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             Rvalue::Cast(kind, operand, ty) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match kind {
-                    CastKind::PointerExposeAddress => self.top_value_of_ty(ty),
-                    CastKind::PointerFromExposedAddress => {
+                    CastKind::PointerExposeProvenance => self.top_value_of_ty(ty),
+                    CastKind::PointerWithExposedProvenance => {
                         let zero: BTreeSet<u128> = [0].into_iter().collect();
                         if v.uintv.gamma().map(|s| s == &zero).unwrap_or(false) {
                             AbsValue::null()
@@ -700,7 +700,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             AbsValue::top_ptr()
                         }
                     }
-                    CastKind::PointerCoercion(coercion) => match coercion {
+                    CastKind::PointerCoercion(coercion, _) => match coercion {
                         PointerCoercion::ReifyFnPointer => v,
                         PointerCoercion::UnsafeFnPointer => unreachable!("{:?}", rvalue),
                         PointerCoercion::ClosureFnPointer(_) => unreachable!("{:?}", rvalue),
@@ -722,8 +722,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             }
                         }
                         PointerCoercion::Unsize => v,
+                        PointerCoercion::DynStar => unreachable!("{:?}", rvalue),
                     },
-                    CastKind::DynStar => unreachable!("{:?}", rvalue),
                     CastKind::IntToInt | CastKind::FloatToInt => match ty.kind() {
                         TyKind::Int(int_ty) => match int_ty {
                             IntTy::Isize => v.to_i64(),
@@ -746,15 +746,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     CastKind::FloatToFloat | CastKind::IntToFloat => {
                         if let TyKind::Float(float_ty) = ty.kind() {
                             match float_ty {
+                                FloatTy::F16 => todo!("{:?}", rvalue),
                                 FloatTy::F32 => v.to_f32(),
                                 FloatTy::F64 => v.to_f64(),
+                                FloatTy::F128 => todo!("{:?}", rvalue),
                             }
                         } else {
                             unreachable!("{:?}", rvalue)
                         }
                     }
                     CastKind::PtrToPtr => {
-                        let void = if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+                        let void = if let TyKind::RawPtr(ty, _) = ty.kind() {
                             ty.is_c_void(self.tcx)
                         } else {
                             false
@@ -776,10 +778,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let v = match binop {
                     BinOp::Add => l.add(&r),
                     BinOp::AddUnchecked => unreachable!("{:?}", rvalue),
+                    BinOp::AddWithOverflow => unreachable!("{:?}", rvalue),
                     BinOp::Sub => l.sub(&r),
                     BinOp::SubUnchecked => unreachable!("{:?}", rvalue),
+                    BinOp::SubWithOverflow => unreachable!("{:?}", rvalue),
                     BinOp::Mul => l.mul(&r),
                     BinOp::MulUnchecked => unreachable!("{:?}", rvalue),
+                    BinOp::MulWithOverflow => unreachable!("{:?}", rvalue),
                     BinOp::Div => l.div(&r),
                     BinOp::Rem => l.rem(&r),
                     BinOp::BitXor => l.bit_xor(&r),
@@ -795,6 +800,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     BinOp::Ne => l.ne(&r),
                     BinOp::Ge => l.ge(&r),
                     BinOp::Gt => l.gt(&r),
+                    BinOp::Cmp => todo!("{:?}", rvalue),
                     BinOp::Offset => todo!("{:?}", rvalue),
                 };
                 let mut cmps = vec![];
@@ -812,13 +818,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 reads_l.extend(reads_r);
                 (v, reads_l, cmps)
             }
-            Rvalue::CheckedBinaryOp(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::NullaryOp(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::UnaryOp(unary, operand) => {
                 let (v, reads) = self.transfer_operand(operand, state);
                 let v = match unary {
                     UnOp::Not => v.not(),
                     UnOp::Neg => v.neg(),
+                    UnOp::PtrMetadata => todo!("{:?}", rvalue),
                 };
                 (v, reads, vec![])
             }
@@ -877,13 +883,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     }
                 }
                 AggregateKind::Closure(_, _) => unreachable!("{:?}", rvalue),
-                AggregateKind::Generator(_, _, _) => unreachable!("{:?}", rvalue),
+                AggregateKind::Coroutine(_, _) => unreachable!("{:?}", rvalue),
+                AggregateKind::CoroutineClosure(_, _) => unreachable!("{:?}", rvalue),
+                AggregateKind::RawPtr(_, _) => todo!("{:?}", rvalue),
             },
             Rvalue::ShallowInitBox(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::CopyForDeref(place) => {
                 let (v, reads) = self.transfer_place(place, state);
                 (v, reads, vec![])
-            }
+            },
+            Rvalue::WrapUnsafeBinder(_, _) => unreachable!("{:?}", rvalue),
         }
     }
 
@@ -894,7 +903,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> (AbsValue, Vec<AbsPath>) {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.transfer_place(place, state),
-            Operand::Constant(constant) => (self.transfer_constant(constant), vec![]),
+            Operand::Constant(box constant) => (self.transfer_constant(constant), vec![]),
         }
     }
 
@@ -910,10 +919,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
     }
 
-    fn transfer_constant(&self, constant: &Constant<'tcx>) -> AbsValue {
-        match constant.literal {
-            ConstantKind::Ty(_) => unreachable!("{:?}", constant),
-            ConstantKind::Unevaluated(constant, ty) => {
+    fn transfer_constant(&self, constant: &ConstOperand<'tcx>) -> AbsValue {
+        match constant.const_ {
+            Const::Ty(_, _) => unreachable!("{:?}", constant),
+            Const::Unevaluated(constant, ty) => {
                 if ty.is_ref() {
                     AbsValue::top()
                 } else if let Ok(v) = self.tcx.const_eval_poly(constant.def) {
@@ -922,7 +931,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     self.top_value_of_ty(&ty)
                 }
             }
-            ConstantKind::Val(v, ty) => self.transfer_const_value(&v, &ty),
+            Const::Val(v, ty) => self.transfer_const_value(&v, &ty),
         }
     }
 
@@ -932,41 +941,43 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 Scalar::Int(i) => match ty.kind() {
                     TyKind::Int(int_ty) => {
                         let v = match int_ty {
-                            IntTy::Isize => i.try_to_i64().unwrap() as _,
-                            IntTy::I8 => i.try_to_i8().unwrap() as _,
-                            IntTy::I16 => i.try_to_i16().unwrap() as _,
-                            IntTy::I32 => i.try_to_i32().unwrap() as _,
-                            IntTy::I64 => i.try_to_i64().unwrap() as _,
-                            IntTy::I128 => i.try_to_i128().unwrap(),
+                            IntTy::Isize => i.to_i64() as _,
+                            IntTy::I8 => i.to_i8() as _,
+                            IntTy::I16 => i.to_i16() as _,
+                            IntTy::I32 => i.to_i32() as _,
+                            IntTy::I64 => i.to_i64() as _,
+                            IntTy::I128 => i.to_i128(),
                         };
                         AbsValue::alpha_int(v)
                     }
                     TyKind::Uint(uint_ty) => {
                         let v = match uint_ty {
-                            UintTy::Usize => i.try_to_u64().unwrap() as _,
-                            UintTy::U8 => i.try_to_u8().unwrap() as _,
-                            UintTy::U16 => i.try_to_u16().unwrap() as _,
-                            UintTy::U32 => i.try_to_u32().unwrap() as _,
-                            UintTy::U64 => i.try_to_u64().unwrap() as _,
-                            UintTy::U128 => i.try_to_u128().unwrap(),
+                            UintTy::Usize => i.to_u64() as _,
+                            UintTy::U8 => i.to_u8() as _,
+                            UintTy::U16 => i.to_u16() as _,
+                            UintTy::U32 => i.to_u32() as _,
+                            UintTy::U64 => i.to_u64() as _,
+                            UintTy::U128 => i.to_u128(),
                         };
                         AbsValue::alpha_uint(v)
                     }
                     TyKind::Float(float_ty) => {
                         let v = match float_ty {
-                            FloatTy::F32 => f32::from_bits(i.try_to_u32().unwrap()) as _,
-                            FloatTy::F64 => f64::from_bits(i.try_to_u64().unwrap()),
+                            FloatTy::F16 => todo!("{:?}", float_ty),
+                            FloatTy::F32 => f32::from_bits(i.to_u32()) as _,
+                            FloatTy::F64 => f64::from_bits(i.to_u64()),
+                            FloatTy::F128 => todo!("{:?}", float_ty),
                         };
                         AbsValue::alpha_float(v)
                     }
                     TyKind::Bool => AbsValue::alpha_bool(i.try_to_bool().unwrap()),
-                    TyKind::Char => AbsValue::alpha_uint(i.try_to_u32().unwrap() as _),
+                    TyKind::Char => AbsValue::alpha_uint(i.to_u32() as _),
                     _ => unreachable!("{:?}", ty),
                 },
                 Scalar::Ptr(ptr, _) => {
-                    let alloc = self.tcx.global_alloc(ptr.provenance);
+                    let alloc = self.tcx.global_alloc(ptr.provenance.alloc_id());
                     match alloc {
-                        GlobalAlloc::Function(_) => unreachable!("{:?}", alloc),
+                        GlobalAlloc::Function{..} => unreachable!("{:?}", alloc),
                         GlobalAlloc::VTable(_, _) => unreachable!("{:?}", alloc),
                         GlobalAlloc::Static(_) | GlobalAlloc::Memory(_) => AbsValue::heap(),
                     }
@@ -979,10 +990,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     unreachable!("{:?}", v)
                 }
             }
-            ConstValue::Slice { data, start, end } => {
-                let start = Size::from_bytes(*start);
-                let size = Size::from_bytes(*end) - start;
-                let range = AllocRange { start, size };
+            ConstValue::Slice { data, meta } => {
+                let size = Size::from_bytes(*meta);
+                let range = AllocRange { start: Size::ZERO, size };
                 let arr = data
                     .inner()
                     .get_bytes_strip_provenance(&self.tcx, range)
@@ -994,7 +1004,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     unreachable!("{:?}", msg)
                 }
             }
-            ConstValue::ByRef { .. } => AbsValue::top(),
+            ConstValue::Indirect { .. } => AbsValue::top(),
         }
     }
 
@@ -1031,22 +1041,24 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TyKind::Foreign(_) => AbsValue::top(),
             TyKind::Str => unreachable!("{:?}", ty),
             TyKind::Array(ty, len) => {
-                let len = len.try_to_scalar_int().unwrap().try_to_u64().unwrap();
+                let len = len.try_to_target_usize(self.tcx).unwrap();
                 if len <= 100 {
                     AbsValue::alpha_list((0..len).map(|_| self.top_value_of_ty(ty)).collect())
                 } else {
                     AbsValue::top_list()
                 }
             }
+            TyKind::Pat(_, _) => unreachable!("{:?}", ty),
             TyKind::Slice(_) => unreachable!("{:?}", ty),
-            TyKind::RawPtr(TypeAndMut { .. }) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
+            TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => AbsValue::heap_or_null(),
             TyKind::FnDef(_, _) => unreachable!("{:?}", ty),
-            TyKind::FnPtr(_) => todo!("{:?}", ty),
+            TyKind::FnPtr(_, _) => todo!("{:?}", ty),
+            TyKind::UnsafeBinder(_) => unreachable!("{:?}", ty),
             TyKind::Dynamic(_, _, _) => unreachable!("{:?}", ty),
             TyKind::Closure(_, _) => unreachable!("{:?}", ty),
-            TyKind::Generator(_, _, _) => unreachable!("{:?}", ty),
-            TyKind::GeneratorWitness(_) => unreachable!("{:?}", ty),
-            TyKind::GeneratorWitnessMIR(_, _) => unreachable!("{:?}", ty),
+            TyKind::CoroutineClosure(_, _) => unreachable!("{:?}", ty),
+            TyKind::Coroutine(_, _) => unreachable!("{:?}", ty),
+            TyKind::CoroutineWitness(_, _) => unreachable!("{:?}", ty),
             TyKind::Never => AbsValue::bot(),
             TyKind::Tuple(tys) => {
                 AbsValue::alpha_list(tys.iter().map(|ty| self.top_value_of_ty(&ty)).collect())
@@ -1088,6 +1100,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ProjectionElem::Subslice { .. } => unreachable!("{:?}", elem),
             ProjectionElem::Downcast(_, _) => unreachable!("{:?}", elem),
             ProjectionElem::OpaqueCast(_) => unreachable!("{:?}", elem),
+            ProjectionElem::UnwrapUnsafeBinder(_) => unreachable!("{:?}", elem),
+            ProjectionElem::Subtype(_) => unreachable!("{:?}", elem),
         }
     }
 

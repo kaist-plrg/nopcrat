@@ -1,10 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
-    path::Path,
+    collections::{BTreeMap, BTreeSet}, fmt::Write as _, path::Path
 };
 
-use compile_util::LoHi;
+use crate::compile_util;
+use crate::compile_util::LoHi;
 use etrace::some_or;
 use rustc_abi::VariantIdx;
 use rustc_hir::{
@@ -12,20 +11,21 @@ use rustc_hir::{
     intravisit::Visitor as HVisitor,
     Expr, ExprKind, HirId, QPath,
 };
-use rustc_index::bit_set::BitSet;
+use crate::bitset::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{BasicBlock, Body, Local, Location, StatementKind, TerminatorKind},
-    ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
-use crate::{
-    rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
-};
+use rustc_data_structures::graph::Successors;
+use crate::graph;
+use rustc_mir_dataflow::Analysis as _;
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
@@ -109,12 +109,12 @@ pub fn analyze(
 
     let mut call_graph = BTreeMap::new();
     let mut inputs_map = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
         if item.ident.name.to_ident_string() == "main" {
             continue;
         }
-        let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
+        let inputs = if let rustc_hir::ItemKind::Fn{ sig, .. } = &item.kind {
             sig.decl.inputs.len()
         } else {
             continue;
@@ -138,7 +138,7 @@ pub fn analyze(
         .collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
-    tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
     let info_map: BTreeMap<_, _> = funcs
         .iter()
@@ -570,7 +570,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             }
 
             let ty = &body.local_decls[Local::from_usize(i)].ty;
-            let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() else {
+            let TyKind::RawPtr(ty, ..) = ty.kind() else {
                 continue;
             };
             if ty.is_c_void(self.tcx) {
@@ -740,7 +740,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         for i in 1..=self.info.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
-            let v = if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+            let v = if let TyKind::RawPtr(ty, .. ) = ty.kind() {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
@@ -996,8 +996,8 @@ impl<'tcx> CallVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1031,8 +1031,8 @@ impl<'tcx> FnPtrVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1186,8 +1186,8 @@ fn get_param_tys<'tcx>(body: &Body<'tcx>, inputs: usize, tcx: TyCtxt<'tcx>) -> V
         if i > inputs {
             break;
         }
-        let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
-            TypeInfo::from_ty(&tm.ty, tcx)
+        let ty = if let TyKind::RawPtr(ty, ..) = local.ty.kind() {
+            TypeInfo::from_ty(ty, tcx)
         } else {
             TypeInfo::NonStruct
         };
@@ -1268,7 +1268,8 @@ fn get_loop_blocks(
         .basic_blocks
         .indices()
         .flat_map(|bb| {
-            let mut doms: Vec<_> = dominators.dominators(bb).collect();
+            assert!(dominators.is_reachable(bb));
+            let mut doms: Vec<_> = std::iter::successors(Some(bb), |&bb_| dominators.immediate_dominator(bb_)).collect();
             let succs: BTreeSet<_> = body.basic_blocks.successors(bb).collect();
             doms.retain(|dom| succs.contains(dom));
             doms
@@ -1343,8 +1344,7 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
     let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
     borrowed_locals.insert(Local::from_usize(0));
     let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
-        .into_engine(tcx, body)
-        .iterate_to_fixpoint()
+        .iterate_to_fixpoint(tcx, body, None)
         .into_results_cursor(body);
     body.basic_blocks
         .indices()
@@ -1353,9 +1353,9 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
             let live_locals = cursor.get();
             let mut borrowed_or_live_locals = borrowed_locals.clone();
             borrowed_or_live_locals.union(live_locals);
-            let mut dead_locals = BitSet::new_filled(body.local_decls.len());
+            let mut dead_locals = DenseBitSet::new_filled(body.local_decls.len());
             dead_locals.subtract(&borrowed_or_live_locals);
-            dead_locals
+            BitSet::from_dense(&dead_locals)
         })
         .collect()
 }

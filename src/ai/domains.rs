@@ -5,7 +5,7 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use rustc_index::bit_set::BitSet;
+use crate::bitset::BitSet;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
