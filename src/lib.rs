@@ -8,7 +8,6 @@
 #![warn(missing_abi)]
 #![warn(missing_copy_implementations)]
 #![warn(non_ascii_idents)]
-#![warn(pointer_structural_match)]
 #![warn(private_bounds)]
 #![warn(private_interfaces)]
 #![warn(rust_2021_incompatible_closure_captures)]
@@ -25,7 +24,7 @@
 #![warn(unused_lifetimes)]
 #![warn(unused_macro_rules)]
 #![warn(unused_qualifications)]
-#![warn(unused_tuple_struct_fields)]
+#![warn(dead_code)]
 #![warn(variant_size_differences)]
 #![feature(rustc_private)]
 #![feature(iter_intersperse)]
@@ -38,8 +37,6 @@ extern crate rustc_ast;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
-extern crate rustc_driver_impl;
-extern crate rustc_error_codes;
 extern crate rustc_errors;
 extern crate rustc_feature;
 extern crate rustc_hash;
@@ -53,6 +50,7 @@ extern crate rustc_span;
 extern crate rustc_type_ir;
 
 pub mod ai;
+pub mod bitset;
 pub mod compile_util;
 pub mod graph;
 pub mod sampling;
