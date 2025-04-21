@@ -170,7 +170,8 @@ pub fn compute_sccs<T: Clone + Eq + PartialOrd + Ord>(
             })
         })
         .collect();
-    let sccs: Sccs<Id, Id> = Sccs::new(&VecGraph::new(map.len(), edges));
+    let vec_graph: VecGraph<Id> = VecGraph::new(map.len(), edges);
+    let sccs: Sccs<Id, Id> = Sccs::new(&vec_graph);
 
     let component_graph: BTreeMap<_, _> = sccs
         .all_sccs()
