@@ -55,8 +55,8 @@ fn transform(
     let source_map = tcx.sess.source_map();
 
     let mut def_id_ty_map = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
         let ItemKind::TyAlias(ty, _) = item.kind else {
             continue;
         };
@@ -71,15 +71,15 @@ fn transform(
     let mut funcs = BTreeMap::new();
     let mut wbrs = BTreeMap::new();
     let mut rcfws = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
-        let ItemKind::Fn(sig, _, body_id) = item.kind else {
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
+        let ItemKind::Fn{ sig, body, .. } = item.kind else {
             continue;
         };
         let def_id = id.owner_id.to_def_id();
         let name = tcx.def_path_str(def_id);
         let fn_analysis_result = some_or!(analysis_result.get(&name), continue);
-        let body = hir.body(body_id);
+        let body = tcx.hir_body(body);
         let mir_body = tcx.optimized_mir(def_id);
         let index_map: BTreeMap<_, _> = fn_analysis_result
             .output_params
@@ -219,9 +219,9 @@ fn transform(
     }
 
     let mut suggestions: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
-        let ItemKind::Fn(sig, _, body_id) = item.kind else {
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
+        let ItemKind::Fn{ sig, body, .. } = item.kind else {
             continue;
         };
 
@@ -234,7 +234,7 @@ fn transform(
         };
 
         let def_id = id.owner_id.to_def_id();
-        let body = hir.body(body_id);
+        let body = tcx.hir_body(body);
         let curr = funcs.get(&def_id);
 
         let default = BTreeMap::new();
@@ -397,7 +397,7 @@ fn transform(
                 }
             } else if let Some(expr) = get_parent_return(hir_id, tcx) {
                 if let Some(func) = curr {
-                    let arm = matches!(tcx.hir().find_parent(expr.hir_id), Some(Node::Arm(_)));
+                    let arm = matches!(tcx.parent_hir_node(expr.hir_id), Node::Arm(_));
                     ret_call_spans.insert(expr.span);
                     let pre_span = expr.span.with_hi(span.lo());
                     fix(
@@ -1081,8 +1081,8 @@ impl<'tcx> BodyVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for BodyVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1180,15 +1180,14 @@ fn remove_cast<'a, 'tcx>(expr: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
 fn as_int_lit(expr: &Expr<'_>) -> Option<u128> {
     if let ExprKind::Lit(lit) = remove_cast(expr).kind {
         if let LitKind::Int(n, _) = lit.node {
-            return Some(n);
+            return Some(n.get());
         }
     }
     None
 }
 
 fn get_parent(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
-    let hir = tcx.hir();
-    let Node::Expr(e) = hir.find_parent(hir_id)? else {
+    let Node::Expr(e) = tcx.parent_hir_node(hir_id) else {
         return None;
     };
     match e.kind {
