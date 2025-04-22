@@ -50,7 +50,6 @@ extern crate rustc_span;
 extern crate rustc_type_ir;
 
 pub mod ai;
-pub mod bitset;
 pub mod compile_util;
 pub mod graph;
 pub mod sampling;

@@ -6,11 +6,10 @@ use std::{
 
 use lazy_static::lazy_static;
 use rustc_hash::FxHashSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
-
-use crate::bitset::BitSet;
 
 #[derive(Debug, Clone)]
 pub struct AbsState {
@@ -256,7 +255,7 @@ impl AbsLocal {
         self.0.iter()
     }
 
-    pub fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+    pub fn clear_dead_locals(&mut self, dead_locals: &DenseBitSet<Local>) {
         for l in dead_locals.iter() {
             let i = l.as_usize();
             if i >= self.0.len() {

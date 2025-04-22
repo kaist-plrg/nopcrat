@@ -25,7 +25,7 @@ use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
-use crate::{bitset::BitSet, compile_util, compile_util::LoHi, graph};
+use crate::{compile_util, compile_util::LoHi, graph};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
@@ -445,7 +445,7 @@ struct FuncInfo {
     param_tys: Vec<TypeInfo>,
     loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     rpo_map: BTreeMap<BasicBlock, usize>,
-    dead_locals: Vec<BitSet<Local>>,
+    dead_locals: Vec<DenseBitSet<Local>>,
     fn_ptr: bool,
 }
 
@@ -1341,7 +1341,7 @@ fn compute_rpo_map(
     rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
 }
 
-fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Local>> {
+fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSet<Local>> {
     let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
     borrowed_locals.insert(Local::from_usize(0));
     let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
@@ -1356,7 +1356,7 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
             borrowed_or_live_locals.union(live_locals);
             let mut dead_locals = DenseBitSet::new_filled(body.local_decls.len());
             dead_locals.subtract(&borrowed_or_live_locals);
-            BitSet::from_dense(&dead_locals)
+            dead_locals
         })
         .collect()
 }
