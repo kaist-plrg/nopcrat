@@ -6,7 +6,7 @@ use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Const, ConstValue, ConstOperand, Location, Operand, Place,
+        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Location, Operand, Place,
         PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         UnOp,
     },
@@ -181,9 +181,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             TerminatorKind::FalseEdge { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::FalseUnwind { .. } => unreachable!("{:?}", terminator.kind),
             TerminatorKind::InlineAsm { targets, .. } => {
-                let locations = targets.iter().map(|target| {
-                    target.start_location()
-                }) .collect();
+                let locations = targets
+                    .iter()
+                    .map(|target| target.start_location())
+                    .collect();
                 TransferedTerminator::state_locations(state.clone(), locations)
             }
         }
@@ -527,7 +528,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 writes.extend(writes2);
                 AbsValue::top()
             }
-            ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") | ("", "", "ptr", "read") => {
+            ("", "", "ptr", "read_volatile")
+            | ("", "clone", "Clone", "clone")
+            | ("", "", "ptr", "read") => {
                 let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
                 reads.extend(reads2);
                 v
@@ -891,7 +894,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             Rvalue::CopyForDeref(place) => {
                 let (v, reads) = self.transfer_place(place, state);
                 (v, reads, vec![])
-            },
+            }
             Rvalue::WrapUnsafeBinder(_, _) => unreachable!("{:?}", rvalue),
         }
     }
@@ -925,7 +928,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let v = constant.to_value();
                 let v = self.tcx.valtree_to_const_val(v);
                 self.transfer_const_value(&v, &ty)
-            },
+            }
             Const::Unevaluated(constant, ty) => {
                 if ty.is_ref() {
                     AbsValue::top()
@@ -981,7 +984,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 Scalar::Ptr(ptr, _) => {
                     let alloc = self.tcx.global_alloc(ptr.provenance.alloc_id());
                     match alloc {
-                        GlobalAlloc::Function{..} => unreachable!("{:?}", alloc),
+                        GlobalAlloc::Function { .. } => unreachable!("{:?}", alloc),
                         GlobalAlloc::VTable(_, _) => unreachable!("{:?}", alloc),
                         GlobalAlloc::Static(_) | GlobalAlloc::Memory(_) => AbsValue::heap(),
                     }
@@ -996,7 +999,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             ConstValue::Slice { data, meta } => {
                 let size = Size::from_bytes(*meta);
-                let range = AllocRange { start: Size::ZERO, size };
+                let range = AllocRange {
+                    start: Size::ZERO,
+                    size,
+                };
                 let arr = data
                     .inner()
                     .get_bytes_strip_provenance(&self.tcx, range)

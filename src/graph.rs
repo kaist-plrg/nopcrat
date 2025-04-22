@@ -1,6 +1,6 @@
 use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
-use rustc_index::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_index::Idx;
 
 pub fn transitive_closure<T: Idx + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,

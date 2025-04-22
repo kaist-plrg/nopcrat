@@ -1,32 +1,31 @@
 use std::{
-    collections::{BTreeMap, BTreeSet}, fmt::Write as _, path::Path
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    path::Path,
 };
 
-use crate::compile_util;
-use crate::compile_util::LoHi;
 use etrace::some_or;
 use rustc_abi::VariantIdx;
+use rustc_data_structures::graph::Successors;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
     Expr, ExprKind, HirId, QPath,
 };
-use crate::bitset::BitSet;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{BasicBlock, Body, Local, Location, StatementKind, TerminatorKind},
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
+use rustc_mir_dataflow::Analysis as _;
 use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
-use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{domains::*, semantics::TransferedTerminator};
-use rustc_data_structures::graph::Successors;
-use crate::graph;
-use rustc_mir_dataflow::Analysis as _;
+use crate::{bitset::BitSet, compile_util, compile_util::LoHi, graph};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
@@ -113,7 +112,7 @@ pub fn analyze(
         if item.ident.name.to_ident_string() == "main" {
             continue;
         }
-        let inputs = if let rustc_hir::ItemKind::Fn{ sig, .. } = &item.kind {
+        let inputs = if let rustc_hir::ItemKind::Fn { sig, .. } = &item.kind {
             sig.decl.inputs.len()
         } else {
             continue;
@@ -171,7 +170,8 @@ pub fn analyze(
     let mut analysis_times: FxHashMap<_, u128> = FxHashMap::default();
 
     let mut wbrs: FxHashMap<DefId, Vec<WriteBeforeReturn>> = FxHashMap::default();
-    let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = FxHashMap::default();
+    let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
+        FxHashMap::default();
     let mut is_units = FxHashMap::default();
 
     let mut rcfws = FxHashMap::default();
@@ -739,7 +739,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         for i in 1..=self.info.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
-            let v = if let TyKind::RawPtr(ty, .. ) = ty.kind() {
+            let v = if let TyKind::RawPtr(ty, ..) = ty.kind() {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
@@ -973,7 +973,7 @@ impl FunctionSummary {
         self.init_state.ord(&other.init_state) && {
             self.return_states
                 .iter()
-                .all(|(k, v)| other.return_states.get(k).map_or(false, |w| v.ord(w)))
+                .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
         }
     }
 }
@@ -1268,7 +1268,9 @@ fn get_loop_blocks(
         .indices()
         .flat_map(|bb| {
             assert!(dominators.is_reachable(bb));
-            let mut doms: Vec<_> = std::iter::successors(Some(bb), |&bb_| dominators.immediate_dominator(bb_)).collect();
+            let mut doms: Vec<_> =
+                std::iter::successors(Some(bb), |&bb_| dominators.immediate_dominator(bb_))
+                    .collect();
             let succs: BTreeSet<_> = body.basic_blocks.successors(bb).collect();
             doms.retain(|dom| succs.contains(dom));
             doms

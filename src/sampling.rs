@@ -36,10 +36,9 @@ fn sample_from_input(input: Input, res: &AnalysisResult) -> Vec<String> {
                 && body
                     .args_iter()
                     .any(|arg| match body.local_decls[arg].ty.kind() {
-                        TyKind::RawPtr(
-                            ty,
-                            Mutability::Mut,
-                        ) => !ty.is_primitive() && !ty.is_c_void(tcx) && !ty.is_any_ptr(),
+                        TyKind::RawPtr(ty, Mutability::Mut) => {
+                            !ty.is_primitive() && !ty.is_c_void(tcx) && !ty.is_any_ptr()
+                        }
                         _ => false,
                     })
             // && has_call(body, tcx)

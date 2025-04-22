@@ -5,6 +5,7 @@ use std::{
 
 use etrace::some_or;
 use rustc_ast::LitKind;
+use rustc_hash::FxHashMap;
 use rustc_hir::{
     def::Res, intravisit::Visitor as HVisitor, BinOpKind, Expr, ExprKind, FnRetTy, HirId, ItemKind,
     MutTy, Node, PatKind, QPath, TyKind, UnOp,
@@ -15,7 +16,6 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
-use rustc_hash::FxHashMap;
 use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
@@ -73,7 +73,7 @@ fn transform(
     let mut wbrs = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        let ItemKind::Fn{ sig, body, .. } = item.kind else {
+        let ItemKind::Fn { sig, body, .. } = item.kind else {
             continue;
         };
         let def_id = id.owner_id.to_def_id();
@@ -142,7 +142,7 @@ fn transform(
                         };
                         def_id_ty_map
                             .get(&def_id)
-                            .expect(&format!("{:?}", ty))
+                            .unwrap_or_else(|| panic!("{:?}", ty))
                             .clone()
                     }
                     _ => unreachable!("{:?}", ty),
@@ -221,7 +221,7 @@ fn transform(
     let mut suggestions: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
-        let ItemKind::Fn{ sig, body, .. } = item.kind else {
+        let ItemKind::Fn { sig, body, .. } = item.kind else {
             continue;
         };
 

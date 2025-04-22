@@ -19,10 +19,8 @@ use rustc_session::{
     EarlyDiagCtxt,
 };
 use rustc_span::{
-    edition::Edition,
-    fatal_error::FatalError,
-    source_map::SourceMap,
-    BytePos, FileName, RealFileName, Span, SpanData, SyntaxContext,
+    edition::Edition, fatal_error::FatalError, source_map::SourceMap, BytePos, FileName,
+    RealFileName, Span, SpanData, SyntaxContext,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 use serde::{Deserialize, Serialize};
@@ -74,7 +72,10 @@ impl LoHi {
     }
 }
 
-pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Result<R, FatalError> {
+pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
+    config: Config,
+    f: F,
+) -> Result<R, FatalError> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
             let krate = parse(&compiler.sess);

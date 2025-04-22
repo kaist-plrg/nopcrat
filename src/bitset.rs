@@ -858,7 +858,9 @@ impl<T: Idx> HybridBitSet<T> {
             Bound::Excluded(end) => end.index(),
             Bound::Unbounded => self.domain_size() - 1,
         };
-        let Some(len) = end.checked_sub(start) else { return };
+        let Some(len) = end.checked_sub(start) else {
+            return;
+        };
         match self {
             HybridBitSet::Sparse(sparse) if sparse.len() + len < SPARSE_MAX => {
                 // The set is sparse and has space for `elems`.

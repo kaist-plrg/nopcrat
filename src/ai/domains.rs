@@ -5,11 +5,12 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use crate::bitset::BitSet;
+use rustc_hash::FxHashSet;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+
+use crate::bitset::BitSet;
 
 #[derive(Debug, Clone)]
 pub struct AbsState {
