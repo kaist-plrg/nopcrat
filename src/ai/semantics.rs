@@ -21,7 +21,7 @@ pub struct TransferedTerminator {
     pub next_states: Vec<AbsState>,
     pub next_locations: Vec<Location>,
     pub writes: BTreeSet<AbsPath>,
-    pub null_check_state: Option<(usize, AbsState)>,
+    pub null_check: Option<usize>,
     pub call_info: Vec<CallKind>,
 }
 
@@ -41,14 +41,14 @@ impl TransferedTerminator {
         next_states: Vec<AbsState>,
         next_locations: Vec<Location>,
         writes: BTreeSet<AbsPath>,
-        null_check_state: Option<(usize, AbsState)>,
+        null_check: Option<usize>,
         call_info: Vec<CallKind>,
     ) -> Self {
         Self {
             next_states,
             next_locations,
             writes,
-            null_check_state,
+            null_check,
             call_info,
         }
     }
@@ -146,9 +146,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
                     let mut ret_writes = BTreeSet::new();
                     let mut call_info = vec![];
-                    let mut null_check_state = None;
+                    let mut null_check = None;
                     for def_id in fns {
-                        let (states, writes, null_check, call_kind) = self.transfer_call(
+                        let (states, writes, null_arg, call_kind) = self.transfer_call(
                             *def_id,
                             &args,
                             destination,
@@ -159,8 +159,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         ret_writes.extend(writes);
                         call_info.push(call_kind);
 
-                        if let Some(arg) = null_check {
-                            null_check_state = Some((arg, state.clone()));
+                        if let Some(arg) = null_arg {
+                            null_check = Some(arg);
                         }
 
                         for state in states {
@@ -172,7 +172,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .into_values()
                         .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
                         .collect();
-                    (new_states, ret_writes, null_check_state, call_info)
+                    (new_states, ret_writes, null_check, call_info)
                 } else {
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
                     let reads2 = args
