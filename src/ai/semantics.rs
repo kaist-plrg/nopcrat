@@ -601,7 +601,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
-            | ("ffi", "va_list", _, "arg" | "as_va_list")
+            ("ffi", "va_list", _, "arg" | "as_va_list")
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
             | ("", "convert", "From", "from")
