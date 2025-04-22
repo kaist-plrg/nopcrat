@@ -1,11 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
 use rustc_index::Idx;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-pub fn transitive_closure<T: Idx + Ord>(
-    graph: &BTreeMap<T, BTreeSet<T>>,
-) -> BTreeMap<T, BTreeSet<T>> {
+pub fn transitive_closure<T: Idx + std::hash::Hash>(
+    graph: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
     let len = graph.len();
 
     let mut reachability = vec![vec![false; len]; len];
@@ -24,7 +23,7 @@ pub fn transitive_closure<T: Idx + Ord>(
         }
     }
 
-    let mut new_graph = BTreeMap::new();
+    let mut new_graph = FxHashMap::default();
     for (i, reachability) in reachability.iter().enumerate() {
         let neighbors = reachability
             .iter()
@@ -42,10 +41,10 @@ pub fn transitive_closure<T: Idx + Ord>(
     new_graph
 }
 
-pub fn reachable_vertices<T: Idx + Ord>(
-    graph: &BTreeMap<T, BTreeSet<T>>,
+pub fn reachable_vertices<T: Idx + std::hash::Hash>(
+    graph: &FxHashMap<T, FxHashSet<T>>,
     source: T,
-) -> BTreeSet<T> {
+) -> FxHashSet<T> {
     let mut dists = vec![usize::MAX; graph.len()];
     dists[source.index()] = 0;
 
@@ -85,9 +84,9 @@ pub fn reachable_vertices<T: Idx + Ord>(
         .collect()
 }
 
-fn symmetric_closure<T: Clone + Eq + PartialOrd + Ord>(
-    map: &BTreeMap<T, BTreeSet<T>>,
-) -> BTreeMap<T, BTreeSet<T>> {
+fn symmetric_closure<T: Clone + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
     let mut clo = map.clone();
     for (node, succs) in map {
         for succ in succs {
@@ -97,12 +96,12 @@ fn symmetric_closure<T: Clone + Eq + PartialOrd + Ord>(
     clo
 }
 
-pub fn inverse<T: Clone + Eq + PartialOrd + Ord>(
-    map: &BTreeMap<T, BTreeSet<T>>,
-) -> BTreeMap<T, BTreeSet<T>> {
-    let mut inv: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+pub fn inverse<T: Clone + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
+    let mut inv: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
     for node in map.keys() {
-        inv.insert(node.clone(), BTreeSet::new());
+        inv.insert(node.clone(), FxHashSet::default());
     }
     for (node, succs) in map {
         for succ in succs {
@@ -113,9 +112,9 @@ pub fn inverse<T: Clone + Eq + PartialOrd + Ord>(
 }
 
 /// `map` must not have a cycle.
-pub fn post_order<T: Clone + Eq + PartialOrd + Ord>(
-    map: &BTreeMap<T, BTreeSet<T>>,
-    inv_map: &BTreeMap<T, BTreeSet<T>>,
+pub fn post_order<T: Clone + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+    inv_map: &FxHashMap<T, FxHashSet<T>>,
 ) -> Vec<Vec<T>> {
     let mut res = vec![];
     let clo = symmetric_closure(map);
@@ -123,7 +122,7 @@ pub fn post_order<T: Clone + Eq + PartialOrd + Ord>(
 
     for (_, component) in components {
         let mut v = vec![];
-        let mut reached = BTreeSet::new();
+        let mut reached = FxHashSet::default();
         for node in component {
             if inv_map.get(&node).unwrap().is_empty() {
                 dfs_walk(&node, &mut v, &mut reached, map);
@@ -135,11 +134,11 @@ pub fn post_order<T: Clone + Eq + PartialOrd + Ord>(
     res
 }
 
-fn dfs_walk<T: Clone + Eq + PartialOrd + Ord>(
+fn dfs_walk<T: Clone + Eq + std::hash::Hash>(
     node: &T,
     v: &mut Vec<T>,
-    reached: &mut BTreeSet<T>,
-    map: &BTreeMap<T, BTreeSet<T>>,
+    reached: &mut FxHashSet<T>,
+    map: &FxHashMap<T, FxHashSet<T>>,
 ) {
     reached.insert(node.clone());
     for succ in map.get(node).unwrap() {
@@ -150,15 +149,15 @@ fn dfs_walk<T: Clone + Eq + PartialOrd + Ord>(
     v.push(node.clone());
 }
 
-pub fn compute_sccs<T: Clone + Eq + PartialOrd + Ord>(
-    map: &BTreeMap<T, BTreeSet<T>>,
-) -> (BTreeMap<Id, BTreeSet<Id>>, BTreeMap<Id, BTreeSet<T>>) {
-    let id_map: BTreeMap<_, _> = map
+pub fn compute_sccs<T: Clone + Eq + std::hash::Hash>(
+    map: &FxHashMap<T, FxHashSet<T>>,
+) -> (FxHashMap<Id, FxHashSet<Id>>, FxHashMap<Id, FxHashSet<T>>) {
+    let id_map: FxHashMap<_, _> = map
         .keys()
         .enumerate()
         .map(|(i, f)| (i, f.clone()))
         .collect();
-    let inv_id_map: BTreeMap<_, _> = id_map.iter().map(|(i, f)| (f.clone(), *i)).collect();
+    let inv_id_map: FxHashMap<_, _> = id_map.iter().map(|(i, f)| (f.clone(), *i)).collect();
     let edges = map
         .iter()
         .flat_map(|(node, succs)| {
@@ -173,12 +172,12 @@ pub fn compute_sccs<T: Clone + Eq + PartialOrd + Ord>(
     let vec_graph: VecGraph<Id> = VecGraph::new(map.len(), edges);
     let sccs: Sccs<Id, Id> = Sccs::new(&vec_graph);
 
-    let component_graph: BTreeMap<_, _> = sccs
+    let component_graph: FxHashMap<_, _> = sccs
         .all_sccs()
         .map(|node| (node, sccs.successors(node).iter().cloned().collect()))
         .collect();
 
-    let mut component_elems: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    let mut component_elems: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
     for i in 0..(map.len()) {
         let scc = sccs.scc(Id::new(i));
         let node = id_map.get(&i).unwrap().clone();
@@ -513,208 +512,208 @@ mod tests {
 
     #[test]
     fn test_reachability_1() {
-        let mut graph = BTreeMap::new();
-        graph.insert(I0, BTreeSet::from_iter(vec![I1]));
-        graph.insert(I1, BTreeSet::from_iter(vec![I2]));
-        graph.insert(I2, BTreeSet::from_iter(vec![I3]));
-        graph.insert(I3, BTreeSet::from_iter(vec![I4]));
-        graph.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut graph = FxHashMap::default();
+        graph.insert(I0, FxHashSet::from_iter(vec![I1]));
+        graph.insert(I1, FxHashSet::from_iter(vec![I2]));
+        graph.insert(I2, FxHashSet::from_iter(vec![I3]));
+        graph.insert(I3, FxHashSet::from_iter(vec![I4]));
+        graph.insert(I4, FxHashSet::from_iter(vec![]));
 
         let transitive_closure_graph = transitive_closure(&graph);
-        let mut expected = BTreeMap::new();
-        expected.insert(I0, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I1, BTreeSet::from_iter(vec![I2, I3, I4]));
-        expected.insert(I2, BTreeSet::from_iter(vec![I3, I4]));
-        expected.insert(I3, BTreeSet::from_iter(vec![I4]));
-        expected.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut expected = FxHashMap::default();
+        expected.insert(I0, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I1, FxHashSet::from_iter(vec![I2, I3, I4]));
+        expected.insert(I2, FxHashSet::from_iter(vec![I3, I4]));
+        expected.insert(I3, FxHashSet::from_iter(vec![I4]));
+        expected.insert(I4, FxHashSet::from_iter(vec![]));
         assert_eq!(transitive_closure_graph, expected);
 
         let reachables = reachable_vertices(&graph, I0);
-        let expected = BTreeSet::from_iter(vec![I0, I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I0, I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I1);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I2);
-        let expected = BTreeSet::from_iter(vec![I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I3);
-        let expected = BTreeSet::from_iter(vec![I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I4);
-        let expected = BTreeSet::from_iter(vec![I4]);
+        let expected = FxHashSet::from_iter(vec![I4]);
         assert_eq!(reachables, expected);
     }
 
     #[test]
     fn test_reachability_2() {
-        let mut graph = BTreeMap::new();
-        graph.insert(I0, BTreeSet::from_iter(vec![I1]));
-        graph.insert(I1, BTreeSet::from_iter(vec![I2, I3]));
-        graph.insert(I2, BTreeSet::from_iter(vec![I1]));
-        graph.insert(I3, BTreeSet::from_iter(vec![I4]));
-        graph.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut graph = FxHashMap::default();
+        graph.insert(I0, FxHashSet::from_iter(vec![I1]));
+        graph.insert(I1, FxHashSet::from_iter(vec![I2, I3]));
+        graph.insert(I2, FxHashSet::from_iter(vec![I1]));
+        graph.insert(I3, FxHashSet::from_iter(vec![I4]));
+        graph.insert(I4, FxHashSet::from_iter(vec![]));
 
         let transitive_closure_graph = transitive_closure(&graph);
-        let mut expected = BTreeMap::new();
-        expected.insert(I0, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I1, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I2, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I3, BTreeSet::from_iter(vec![I4]));
-        expected.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut expected = FxHashMap::default();
+        expected.insert(I0, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I1, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I2, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I3, FxHashSet::from_iter(vec![I4]));
+        expected.insert(I4, FxHashSet::from_iter(vec![]));
         assert_eq!(transitive_closure_graph, expected);
 
         let reachables = reachable_vertices(&graph, I0);
-        let expected = BTreeSet::from_iter(vec![I0, I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I0, I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I1);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I2);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I3);
-        let expected = BTreeSet::from_iter(vec![I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I4);
-        let expected = BTreeSet::from_iter(vec![I4]);
+        let expected = FxHashSet::from_iter(vec![I4]);
         assert_eq!(reachables, expected);
     }
 
     #[test]
     fn test_reachability_3() {
-        let mut graph = BTreeMap::new();
-        graph.insert(I0, BTreeSet::from_iter(vec![I1]));
-        graph.insert(I1, BTreeSet::from_iter(vec![I1, I2]));
-        graph.insert(I2, BTreeSet::from_iter(vec![I3]));
-        graph.insert(I3, BTreeSet::from_iter(vec![I4]));
-        graph.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut graph = FxHashMap::default();
+        graph.insert(I0, FxHashSet::from_iter(vec![I1]));
+        graph.insert(I1, FxHashSet::from_iter(vec![I1, I2]));
+        graph.insert(I2, FxHashSet::from_iter(vec![I3]));
+        graph.insert(I3, FxHashSet::from_iter(vec![I4]));
+        graph.insert(I4, FxHashSet::from_iter(vec![]));
 
         let transitive_closure_graph = transitive_closure(&graph);
-        let mut expected = BTreeMap::new();
-        expected.insert(I0, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I1, BTreeSet::from_iter(vec![I1, I2, I3, I4]));
-        expected.insert(I2, BTreeSet::from_iter(vec![I3, I4]));
-        expected.insert(I3, BTreeSet::from_iter(vec![I4]));
-        expected.insert(I4, BTreeSet::from_iter(vec![]));
+        let mut expected = FxHashMap::default();
+        expected.insert(I0, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I1, FxHashSet::from_iter(vec![I1, I2, I3, I4]));
+        expected.insert(I2, FxHashSet::from_iter(vec![I3, I4]));
+        expected.insert(I3, FxHashSet::from_iter(vec![I4]));
+        expected.insert(I4, FxHashSet::from_iter(vec![]));
         assert_eq!(transitive_closure_graph, expected);
 
         let reachables = reachable_vertices(&graph, I0);
-        let expected = BTreeSet::from_iter(vec![I0, I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I0, I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I1);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I2);
-        let expected = BTreeSet::from_iter(vec![I2, I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I2, I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I3);
-        let expected = BTreeSet::from_iter(vec![I3, I4]);
+        let expected = FxHashSet::from_iter(vec![I3, I4]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I4);
-        let expected = BTreeSet::from_iter(vec![I4]);
+        let expected = FxHashSet::from_iter(vec![I4]);
         assert_eq!(reachables, expected);
     }
 
     #[test]
     fn test_reachability_4() {
-        let mut graph = BTreeMap::new();
-        graph.insert(I0, BTreeSet::from_iter(vec![I1, I3]));
-        graph.insert(I1, BTreeSet::from_iter(vec![I2]));
-        graph.insert(I2, BTreeSet::from_iter(vec![I1, I5]));
-        graph.insert(I3, BTreeSet::from_iter(vec![I4]));
-        graph.insert(I4, BTreeSet::from_iter(vec![I3, I5]));
-        graph.insert(I5, BTreeSet::from_iter(vec![]));
+        let mut graph = FxHashMap::default();
+        graph.insert(I0, FxHashSet::from_iter(vec![I1, I3]));
+        graph.insert(I1, FxHashSet::from_iter(vec![I2]));
+        graph.insert(I2, FxHashSet::from_iter(vec![I1, I5]));
+        graph.insert(I3, FxHashSet::from_iter(vec![I4]));
+        graph.insert(I4, FxHashSet::from_iter(vec![I3, I5]));
+        graph.insert(I5, FxHashSet::from_iter(vec![]));
 
         let transitive_closure_graph = transitive_closure(&graph);
-        let mut expected = BTreeMap::new();
-        expected.insert(I0, BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]));
-        expected.insert(I1, BTreeSet::from_iter(vec![I1, I2, I5]));
-        expected.insert(I2, BTreeSet::from_iter(vec![I1, I2, I5]));
-        expected.insert(I3, BTreeSet::from_iter(vec![I3, I4, I5]));
-        expected.insert(I4, BTreeSet::from_iter(vec![I3, I4, I5]));
-        expected.insert(I5, BTreeSet::from_iter(vec![]));
+        let mut expected = FxHashMap::default();
+        expected.insert(I0, FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]));
+        expected.insert(I1, FxHashSet::from_iter(vec![I1, I2, I5]));
+        expected.insert(I2, FxHashSet::from_iter(vec![I1, I2, I5]));
+        expected.insert(I3, FxHashSet::from_iter(vec![I3, I4, I5]));
+        expected.insert(I4, FxHashSet::from_iter(vec![I3, I4, I5]));
+        expected.insert(I5, FxHashSet::from_iter(vec![]));
         assert_eq!(transitive_closure_graph, expected);
 
         let reachables = reachable_vertices(&graph, I0);
-        let expected = BTreeSet::from_iter(vec![I0, I1, I2, I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I0, I1, I2, I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I1);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I5]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I2);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I5]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I3);
-        let expected = BTreeSet::from_iter(vec![I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I4);
-        let expected = BTreeSet::from_iter(vec![I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I5);
-        let expected = BTreeSet::from_iter(vec![I5]);
+        let expected = FxHashSet::from_iter(vec![I5]);
         assert_eq!(reachables, expected);
     }
 
     #[test]
     fn test_reachability_5() {
-        let mut graph = BTreeMap::new();
-        graph.insert(I0, BTreeSet::from_iter(vec![I1]));
-        graph.insert(I1, BTreeSet::from_iter(vec![I2]));
-        graph.insert(I2, BTreeSet::from_iter(vec![I3, I4]));
-        graph.insert(I3, BTreeSet::from_iter(vec![I3]));
-        graph.insert(I4, BTreeSet::from_iter(vec![I1, I5]));
-        graph.insert(I5, BTreeSet::from_iter(vec![]));
+        let mut graph = FxHashMap::default();
+        graph.insert(I0, FxHashSet::from_iter(vec![I1]));
+        graph.insert(I1, FxHashSet::from_iter(vec![I2]));
+        graph.insert(I2, FxHashSet::from_iter(vec![I3, I4]));
+        graph.insert(I3, FxHashSet::from_iter(vec![I3]));
+        graph.insert(I4, FxHashSet::from_iter(vec![I1, I5]));
+        graph.insert(I5, FxHashSet::from_iter(vec![]));
 
         let transitive_closure_graph = transitive_closure(&graph);
-        let mut expected = BTreeMap::new();
-        expected.insert(I0, BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]));
-        expected.insert(I1, BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]));
-        expected.insert(I2, BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]));
-        expected.insert(I3, BTreeSet::from_iter(vec![I3]));
-        expected.insert(I4, BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]));
-        expected.insert(I5, BTreeSet::from_iter(vec![]));
+        let mut expected = FxHashMap::default();
+        expected.insert(I0, FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]));
+        expected.insert(I1, FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]));
+        expected.insert(I2, FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]));
+        expected.insert(I3, FxHashSet::from_iter(vec![I3]));
+        expected.insert(I4, FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]));
+        expected.insert(I5, FxHashSet::from_iter(vec![]));
         assert_eq!(transitive_closure_graph, expected);
 
         let reachables = reachable_vertices(&graph, I0);
-        let expected = BTreeSet::from_iter(vec![I0, I1, I2, I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I0, I1, I2, I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I1);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I2);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I3);
-        let expected = BTreeSet::from_iter(vec![I3]);
+        let expected = FxHashSet::from_iter(vec![I3]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I4);
-        let expected = BTreeSet::from_iter(vec![I1, I2, I3, I4, I5]);
+        let expected = FxHashSet::from_iter(vec![I1, I2, I3, I4, I5]);
         assert_eq!(reachables, expected);
 
         let reachables = reachable_vertices(&graph, I5);
-        let expected = BTreeSet::from_iter(vec![I5]);
+        let expected = FxHashSet::from_iter(vec![I5]);
         assert_eq!(reachables, expected);
     }
 }

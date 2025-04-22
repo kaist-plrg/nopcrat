@@ -15,6 +15,7 @@ use rustc_middle::{
     ty::TyCtxt,
 };
 use rustc_span::{def_id::DefId, source_map::SourceMap, BytePos, Span};
+use rustc_hash::FxHashMap;
 use rustfix::Suggestion;
 
 use crate::{ai::analysis::*, compile_util};
@@ -51,10 +52,9 @@ fn transform(
         ..Counter::default()
     };
 
-    let hir = tcx.hir();
     let source_map = tcx.sess.source_map();
 
-    let mut def_id_ty_map = BTreeMap::new();
+    let mut def_id_ty_map = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
         let ItemKind::TyAlias(ty, _) = item.kind else {
@@ -68,9 +68,9 @@ fn transform(
         def_id_ty_map.insert(def_id, ty);
     }
 
-    let mut funcs = BTreeMap::new();
-    let mut wbrs = BTreeMap::new();
-    let mut rcfws = BTreeMap::new();
+    let mut funcs = FxHashMap::default();
+    let mut rcfws = FxHashMap::default();
+    let mut wbrs = FxHashMap::default();
     for id in tcx.hir_free_items() {
         let item = tcx.hir_item(id);
         let ItemKind::Fn{ sig, body, .. } = item.kind else {
