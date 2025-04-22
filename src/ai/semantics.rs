@@ -563,7 +563,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ("", "cast", "ToPrimitive", "to_u64")
             | ("", "num", _, "count_ones" | "trailing_zeros" | "leading_zeros")
             | ("", "", "mem", "size_of" | "align_of") => AbsValue::top_uint(),
-            ("", "", "panicking", "panic" | "begin_panic") => AbsValue::bot(),
+            ("", "", "panicking", "panic" | "begin_panic" | "panic_explicit") => AbsValue::bot(),
             ("", "vec", _, "leak")
             | ("ops", "deref", "Deref", "deref")
             | ("ops", "deref", "DerefMut", "deref_mut") => AbsValue::top_ptr(),
@@ -601,7 +601,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 args[0].clone()
             }
             ("", "vec", _, "as_mut_ptr") => AbsValue::top_ptr(),
-            (_, "ffi", _, "arg" | "as_va_list")
+            | ("ffi", "va_list", _, "arg" | "as_va_list")
             | ("", "", "AsmCastTrait", "cast_in")
             | ("", "f128_t", _, "new")
             | ("", "convert", "From", "from")
