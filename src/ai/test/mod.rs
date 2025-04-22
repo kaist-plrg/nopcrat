@@ -28,7 +28,7 @@ fn analyze(code: &str) -> Vec<AbsState> {
             })
             .unwrap()
             .1
-             .0
+            .0
             .return_states
             .into_values()
             .collect()

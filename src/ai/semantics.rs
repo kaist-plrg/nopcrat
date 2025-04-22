@@ -68,7 +68,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let writes = new_state.add_writes(writes.into_iter());
             (new_state, writes)
         } else {
-            unreachable!("{:?}", stmt)
+            (state.clone(), BTreeSet::new())
         }
     }
 
@@ -527,7 +527,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 writes.extend(writes2);
                 AbsValue::top()
             }
-            ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") => {
+            ("", "", "ptr", "read_volatile") | ("", "clone", "Clone", "clone") | ("", "", "ptr", "read") => {
                 let (v, reads2) = self.read_ptr(&args[0].ptrv, &[], state);
                 reads.extend(reads2);
                 v
@@ -921,7 +921,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
     fn transfer_constant(&self, constant: &ConstOperand<'tcx>) -> AbsValue {
         match constant.const_ {
-            Const::Ty(_, _) => unreachable!("{:?}", constant),
+            Const::Ty(ty, constant) => {
+                let v = constant.to_value();
+                let v = self.tcx.valtree_to_const_val(v);
+                self.transfer_const_value(&v, &ty)
+            },
             Const::Unevaluated(constant, ty) => {
                 if ty.is_ref() {
                     AbsValue::top()

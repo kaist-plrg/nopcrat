@@ -276,6 +276,7 @@ fn test_read_write_struct() {
 #[test]
 fn test_write_read_struct() {
     let code = "
+        #[derive(Copy)]
         struct S { x: i32, y: i32 }
         unsafe fn f(p: *mut S) -> i32 {
             (*p).x = 0;
@@ -351,6 +352,7 @@ fn test_write_struct2_assign() {
 fn test_write_read_write_struct2() {
     let code = "
         struct S { x: T, y: T }
+        #[derive(Copy)]
         struct T { x: i32, y: i32 }
         unsafe fn f(p: *mut S) -> i32 {
             (*p).x.x = 0;
