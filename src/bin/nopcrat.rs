@@ -1,3 +1,5 @@
+#![feature(rustc_private)]
+
 use std::{
     alloc::{Layout, System},
     fs::{self, File},
