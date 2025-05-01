@@ -16,8 +16,8 @@ use rustc_index::bit_set::BitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        BasicBlock, Body, Local, Location, Operand, Place, Rvalue, StatementKind, Terminator,
-        TerminatorKind,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
+        BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
 };
@@ -229,6 +229,7 @@ pub fn analyze(
                     );
                 }
                 let nullable_params = analyzer.find_nullable_params(
+                    tcx,
                     &states,
                     body,
                     &writes_map,
@@ -491,6 +492,12 @@ struct AnalyzedBody {
     call_info_map: BTreeMap<Location, Vec<CallKind>>,
 }
 
+enum StatementCheck {
+    None,
+    UseExist,
+    Overwritten,
+}
+
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn new(
         tcx: TyCtxt<'tcx>,
@@ -520,50 +527,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
-    fn check_stmt_uses(
-        &self,
-        bb: BasicBlock,
-        idx: usize,
-        stmt: &StatementKind<'_>,
-        locs: &BTreeSet<&Location>,
-        idxs: &BTreeSet<usize>,
-    ) -> Option<bool> {
-        let loc = Location {
-            block: bb,
-            statement_index: idx,
-        };
-        let check_rvalue = |rvalue: &Rvalue<'_>| match rvalue {
-            Rvalue::Use(operand)
-            | Rvalue::Repeat(operand, _)
-            | Rvalue::Cast(_, operand, _)
-            | Rvalue::UnaryOp(_, operand) => check_operand(operand, idxs),
-            Rvalue::Ref(_, _, place)
-            | Rvalue::AddressOf(_, place)
-            | Rvalue::CopyForDeref(place) => check_place(place, idxs),
-            Rvalue::BinaryOp(_, box (operand1, operand2)) => {
-                check_operand(operand1, idxs) && check_operand(operand2, idxs)
-            }
-            Rvalue::Aggregate(_, fields) => fields.iter().all(|f| check_operand(f, idxs)),
-            _ => true,
-        };
-
-        if !locs.contains(&loc) {
-            if let StatementKind::Assign(box (place, rvalue)) = stmt {
-                if !check_rvalue(rvalue) {
-                    return Some(false);
-                }
-                if idxs.contains(&place.local.index()) {
-                    return None;
-                }
-            }
-        }
-        Some(true)
-    }
-
     // Check if any local in idxs is used in the following blocks
     fn check_local_uses(
         &self,
-        body: &Body<'_>,
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
         block: &BasicBlock,
         locs: &BTreeSet<&Location>,
         idxs: &BTreeSet<usize>,
@@ -571,20 +539,36 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut work_list = VecDeque::new();
         work_list.extend(body.basic_blocks.successors(*block));
         let mut visited = BTreeSet::new();
+        let mut visitor = LocalVisitor::new(tcx, idxs.clone());
 
         while let Some(bb) = work_list.pop_front() {
             if visited.insert(bb) {
                 let bbd = &body.basic_blocks[bb];
                 let mut overwritten = false;
+
                 for (i, stmt) in bbd.statements.iter().enumerate() {
-                    match self.check_stmt_uses(bb, i, &stmt.kind, locs, idxs) {
-                        Some(true) => continue,      // no use -- continue to check next statement
-                        Some(false) => return false, // found a use
-                        None => {
-                            overwritten = false;
-                            break;
-                        } // value is overwritten -- stop checking
+                    let loc = Location {
+                        block: bb,
+                        statement_index: i,
+                    };
+
+                    if !locs.contains(&loc) {
+                        visitor.clear();
+                        visitor.visit_statement(stmt, loc);
+                        match visitor.check_result {
+                            Some(StatementCheck::None) => continue, /* no use -- continue to check next statement */
+                            Some(StatementCheck::UseExist) => return false, // found a use
+                            Some(StatementCheck::Overwritten) => {
+                                overwritten = true;
+                                break;
+                            } /* value is overwritten -- stop checking */
+                            None => {}
+                        }
                     }
+                }
+
+                if overwritten {
+                    continue;
                 }
 
                 let term = bbd.terminator();
@@ -593,35 +577,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     statement_index: bbd.statements.len(),
                 };
 
-                if !overwritten {
-                    continue;
-                }
-
                 if !locs.contains(&loc) {
-                    match &term.kind {
-                        TerminatorKind::Call {
-                            func,
-                            args,
-                            destination,
-                            ..
-                        } => {
-                            if !check_place(destination, idxs) {
-                                continue;
-                            }
-                            if !check_operand(func, idxs)
-                                || args.iter().any(|arg| !check_operand(arg, idxs))
-                            {
-                                return false;
-                            }
-                        }
-                        TerminatorKind::SwitchInt { discr: operand, .. }
-                        | TerminatorKind::Assert { cond: operand, .. } => {
-                            if !check_operand(operand, idxs) {
-                                return false;
-                            }
-                        }
-                        _ => {}
-                    };
+                    visitor.clear();
+                    visitor.visit_terminator(term, loc);
+                    match visitor.check_result {
+                        Some(StatementCheck::None) => continue,
+                        Some(StatementCheck::UseExist) => return false,
+                        Some(StatementCheck::Overwritten) => break,
+                        None => {}
+                    }
                 }
                 work_list.extend(body.basic_blocks.successors(bb));
             }
@@ -764,8 +728,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     // 2. The set of locations that are reachable when x is null and have side-effects
     fn find_nullable_params(
         &self,
+        tcx: TyCtxt<'tcx>,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
-        body: &Body<'_>,
+        body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         null_checks_map: &BTreeMap<usize, BTreeSet<Location>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
@@ -816,7 +781,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 term,
                             )
                         }
-                    }) && self.check_local_uses(body, block, diff_locs, &local_writes)
+                    }) && self.check_local_uses(tcx, body, block, diff_locs, &local_writes)
                 };
                 if nonnull_diff
                     .iter()
@@ -1370,6 +1335,49 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     }
 }
 
+struct LocalVisitor<'tcx> {
+    _tcx: TyCtxt<'tcx>,
+    idx: BTreeSet<usize>,
+    check_result: Option<StatementCheck>,
+}
+
+impl<'tcx> LocalVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, idx: BTreeSet<usize>) -> Self {
+        Self {
+            _tcx: tcx,
+            idx,
+            check_result: None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.check_result = None;
+    }
+}
+
+impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
+        if self.idx.contains(&local.index()) {
+            match context {
+                PlaceContext::MutatingUse(MutatingUseContext::Store)
+                | PlaceContext::MutatingUse(MutatingUseContext::Call)
+                | PlaceContext::MutatingUse(MutatingUseContext::AsmOutput)
+                | PlaceContext::MutatingUse(MutatingUseContext::Yield) => {
+                    self.check_result = Some(StatementCheck::Overwritten);
+                }
+                PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection) => {
+                    self.check_result = Some(StatementCheck::UseExist);
+                }
+                _ => {
+                    self.check_result = Some(StatementCheck::None);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Label {
     pub location: Location,
@@ -1723,19 +1731,6 @@ fn compute_nonnull_null_locs(
         }
     }
     (nonnull_locs, null_locs)
-}
-
-// Check if the index of the place is not in the set of indices
-fn check_place(place: &Place<'_>, idxs: &BTreeSet<usize>) -> bool {
-    !idxs.contains(&place.local.index())
-}
-
-fn check_operand(operand: &Operand<'_>, idxs: &BTreeSet<usize>) -> bool {
-    if let Operand::Copy(place) | Operand::Move(place) = operand {
-        check_place(place, idxs)
-    } else {
-        true
-    }
 }
 
 #[allow(unused)]
