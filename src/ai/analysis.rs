@@ -17,8 +17,7 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
-        BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor}, BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
@@ -535,58 +534,56 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         locs: &BTreeSet<&Location>,
         locals: &BTreeSet<Local>,
     ) -> bool {
-        let mut work_list = VecDeque::new();
-        work_list.extend(body.basic_blocks.successors(*block));
-        let mut visited = BTreeSet::new();
-        let mut visitor = LocalVisitor::new(tcx, locals.clone());
+        if locals.is_empty() {
+            return true;
+        }
 
-        while let Some(bb) = work_list.pop_front() {
-            if visited.insert(bb) {
-                let bbd = &body.basic_blocks[bb];
-                let mut overwritten = false;
+        for local in locals {
+            let mut work_list = VecDeque::new();
+            work_list.extend(body.basic_blocks.successors(*block));
+            let mut visited = BTreeSet::new();
+            let mut visitor = LocalVisitor::new(tcx, local);
 
-                for (i, stmt) in bbd.statements.iter().enumerate() {
+            'outer: while let Some(bb) = work_list.pop_front() {
+                if visited.insert(bb) {
+                    let bbd = &body.basic_blocks[bb];
+
+                    for (i, stmt) in bbd.statements.iter().enumerate() {
+                        let loc = Location {
+                            block: bb,
+                            statement_index: i,
+                        };
+
+                        if !locs.contains(&loc) {
+                            visitor.clear();
+                            visitor.visit_statement(stmt, loc);
+                            match visitor.check_result {
+                                StatementCheck::None => {}, /* no use -- continue to check next statement */
+                                StatementCheck::UseExist => return false, // found a use
+                                StatementCheck::Overwritten => {
+                                    break 'outer;
+                                } /* value is overwritten -- stop checking */
+                            }
+                        }
+                    }
+
+                    let term = bbd.terminator();
                     let loc = Location {
                         block: bb,
-                        statement_index: i,
+                        statement_index: bbd.statements.len(),
                     };
 
                     if !locs.contains(&loc) {
                         visitor.clear();
-                        visitor.visit_statement(stmt, loc);
+                        visitor.visit_terminator(term, loc);
                         match visitor.check_result {
-                            Some(StatementCheck::None) => continue, /* no use -- continue to check next statement */
-                            Some(StatementCheck::UseExist) => return false, // found a use
-                            Some(StatementCheck::Overwritten) => {
-                                overwritten = true;
-                                break;
-                            } /* value is overwritten -- stop checking */
-                            None => {}
+                            StatementCheck::None => {},
+                            StatementCheck::UseExist => return false,
+                            StatementCheck::Overwritten => break,
                         }
                     }
+                    work_list.extend(body.basic_blocks.successors(bb));
                 }
-
-                if overwritten {
-                    continue;
-                }
-
-                let term = bbd.terminator();
-                let loc = Location {
-                    block: bb,
-                    statement_index: bbd.statements.len(),
-                };
-
-                if !locs.contains(&loc) {
-                    visitor.clear();
-                    visitor.visit_terminator(term, loc);
-                    match visitor.check_result {
-                        Some(StatementCheck::None) => continue,
-                        Some(StatementCheck::UseExist) => return false,
-                        Some(StatementCheck::Overwritten) => break,
-                        None => {}
-                    }
-                }
-                work_list.extend(body.basic_blocks.successors(bb));
             }
         }
         true
@@ -1334,43 +1331,46 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     }
 }
 
-struct LocalVisitor<'tcx> {
+struct LocalVisitor<'a, 'tcx> {
     _tcx: TyCtxt<'tcx>,
-    locals: BTreeSet<Local>,
-    check_result: Option<StatementCheck>,
+    local: &'a Local,
+    check_result: StatementCheck,
 }
 
-impl<'tcx> LocalVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, locals: BTreeSet<Local>) -> Self {
+impl<'a, 'tcx> LocalVisitor<'a, 'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, local: &'a Local) -> Self {
         Self {
             _tcx: tcx,
-            locals,
-            check_result: None,
+            local,
+            check_result: StatementCheck::None,
         }
     }
 
     fn clear(&mut self) {
-        self.check_result = None;
+        self.check_result = StatementCheck::None;
     }
 }
 
-impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
+impl<'tcx> MVisitor<'tcx> for LocalVisitor<'_, 'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
-        if self.locals.contains(&local) {
+        if *self.local == local {
             match context {
                 PlaceContext::MutatingUse(MutatingUseContext::Store)
                 | PlaceContext::MutatingUse(MutatingUseContext::Call)
                 | PlaceContext::MutatingUse(MutatingUseContext::AsmOutput)
                 | PlaceContext::MutatingUse(MutatingUseContext::Yield) => {
-                    self.check_result = Some(StatementCheck::Overwritten);
+                    self.check_result = StatementCheck::Overwritten;
                 }
                 PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy)
                 | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move)
-                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection) => {
-                    self.check_result = Some(StatementCheck::UseExist);
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow)
+                | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
+                | PlaceContext::MutatingUse(MutatingUseContext::RawBorrow) => {
+                    self.check_result = StatementCheck::UseExist;
                 }
                 _ => {
-                    self.check_result = Some(StatementCheck::None);
+                    self.check_result = StatementCheck::None;
                 }
             }
         }
