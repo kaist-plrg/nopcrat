@@ -17,7 +17,8 @@ use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
-        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor}, BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
+        BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
@@ -558,7 +559,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             visitor.clear();
                             visitor.visit_statement(stmt, loc);
                             match visitor.check_result {
-                                StatementCheck::None => {}, /* no use -- continue to check next statement */
+                                StatementCheck::None => {} /* no use -- continue to check next statement */
                                 StatementCheck::UseExist => return false, // found a use
                                 StatementCheck::Overwritten => {
                                     break 'outer;
@@ -577,7 +578,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         visitor.clear();
                         visitor.visit_terminator(term, loc);
                         match visitor.check_result {
-                            StatementCheck::None => {},
+                            StatementCheck::None => {}
                             StatementCheck::UseExist => return false,
                             StatementCheck::Overwritten => break,
                         }
