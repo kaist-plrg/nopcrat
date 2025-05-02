@@ -562,7 +562,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 StatementCheck::None => {} /* no use -- continue to check next statement */
                                 StatementCheck::UseExist => return false, // found a use
                                 StatementCheck::Overwritten => {
-                                    break 'outer;
+                                    continue 'outer;
                                 } /* value is overwritten -- stop checking */
                             }
                         }
