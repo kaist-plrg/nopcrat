@@ -1336,15 +1336,15 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
 
 struct LocalVisitor<'tcx> {
     _tcx: TyCtxt<'tcx>,
-    idx: BTreeSet<Local>,
+    locals: BTreeSet<Local>,
     check_result: Option<StatementCheck>,
 }
 
 impl<'tcx> LocalVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, idx: BTreeSet<Local>) -> Self {
+    fn new(tcx: TyCtxt<'tcx>, locals: BTreeSet<Local>) -> Self {
         Self {
             _tcx: tcx,
-            idx,
+            locals,
             check_result: None,
         }
     }
@@ -1356,7 +1356,7 @@ impl<'tcx> LocalVisitor<'tcx> {
 
 impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
-        if self.idx.contains(&local) {
+        if self.locals.contains(&local) {
             match context {
                 PlaceContext::MutatingUse(MutatingUseContext::Store)
                 | PlaceContext::MutatingUse(MutatingUseContext::Call)
