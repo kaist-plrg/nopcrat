@@ -5,7 +5,8 @@ use std::{
 };
 
 use lazy_static::lazy_static;
-use rustc_index::bit_set::BitSet;
+use rustc_hash::FxHashSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
@@ -254,7 +255,7 @@ impl AbsLocal {
         self.0.iter()
     }
 
-    pub fn clear_dead_locals(&mut self, dead_locals: &BitSet<Local>) {
+    pub fn clear_dead_locals(&mut self, dead_locals: &DenseBitSet<Local>) {
         for l in dead_locals.iter() {
             let i = l.as_usize();
             if i >= self.0.len() {
@@ -2872,7 +2873,7 @@ impl AbsOption {
 #[derive(Clone)]
 pub enum AbsFn {
     Top,
-    Set(BTreeSet<DefId>),
+    Set(FxHashSet<DefId>),
 }
 
 impl std::fmt::Debug for AbsFn {
@@ -2881,7 +2882,7 @@ impl std::fmt::Debug for AbsFn {
             Self::Top => write!(f, "⊤_fn"),
             Self::Set(s) => match s.len() {
                 0 => write!(f, "⊥_fn"),
-                1 => write!(f, "{:?}", s.first().unwrap()),
+                1 => write!(f, "{:?}", s.iter().next().unwrap()),
                 _ => {
                     write!(f, "{{")?;
                     for (i, n) in s.iter().enumerate() {
@@ -2905,7 +2906,7 @@ impl AbsFn {
 
     #[inline]
     fn bot() -> Self {
-        Self::Set(BTreeSet::new())
+        Self::Set(FxHashSet::default())
     }
 
     #[inline]
@@ -2926,7 +2927,7 @@ impl AbsFn {
         Self::alphas([n].into_iter().collect())
     }
 
-    fn alphas(set: BTreeSet<DefId>) -> Self {
+    fn alphas(set: FxHashSet<DefId>) -> Self {
         if set.len() > MAX_SIZE {
             Self::Top
         } else {
@@ -2934,7 +2935,7 @@ impl AbsFn {
         }
     }
 
-    pub fn gamma(&self) -> Option<&BTreeSet<DefId>> {
+    pub fn gamma(&self) -> Option<&FxHashSet<DefId>> {
         if let Self::Set(s) = self {
             Some(s)
         } else {

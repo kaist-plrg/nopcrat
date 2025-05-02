@@ -7,22 +7,20 @@ use std::{
 };
 
 use etrace::ok_or;
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
-    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Handler, Level,
+    emitter::Emitter, registry::Registry, translation::Translate, FluentBundle, Level,
 };
 use rustc_feature::UnstableFeatures;
-use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_interface::Config;
+use rustc_hash::FxHashMap;
+use rustc_interface::{create_and_enter_global_ctxt, passes::parse, Config};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{
-    config::{CheckCfg, CrateType, ErrorOutputType, Input, Options},
-    EarlyErrorHandler,
+    config::{CrateType, ErrorOutputType, Input, Options},
+    EarlyDiagCtxt,
 };
 use rustc_span::{
-    edition::Edition,
-    source_map::{FileName, SourceMap},
-    BytePos, RealFileName, Span, SpanData, SyntaxContext,
+    edition::Edition, fatal_error::FatalError, source_map::SourceMap, BytePos, FileName,
+    RealFileName, Span, SpanData, SyntaxContext,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 use serde::{Deserialize, Serialize};
@@ -74,13 +72,16 @@ impl LoHi {
     }
 }
 
-pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(config: Config, f: F) -> Option<R> {
+pub fn run_compiler<R: Send, F: FnOnce(TyCtxt<'_>) -> R + Send>(
+    config: Config,
+    f: F,
+) -> Result<R, FatalError> {
     rustc_driver::catch_fatal_errors(|| {
         rustc_interface::run_compiler(config, |compiler| {
-            compiler.enter(|queries| queries.global_ctxt().ok()?.enter(|tcx| Some(f(tcx))))
+            let krate = parse(&compiler.sess);
+            create_and_enter_global_ctxt(compiler, krate, f)
         })
     })
-    .ok()?
 }
 
 pub fn make_config(input: Input) -> Config {
@@ -96,22 +97,25 @@ pub fn make_config(input: Input) -> Config {
             edition: Edition::Edition2021,
             ..Options::default()
         },
-        crate_cfg: FxHashSet::default(),
-        crate_check_cfg: CheckCfg::default(),
+        crate_cfg: Vec::new(),
+        crate_check_cfg: Vec::new(),
         input,
         output_dir: None,
         output_file: None,
-        ice_file: rustc_driver::ice_path().clone(),
+        ice_file: None, // Note: rustc_driver:ice_path() is not public anymore
         file_loader: None,
-        locale_resources: rustc_driver_impl::DEFAULT_LOCALE_RESOURCES,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_owned(),
         lint_caps: FxHashMap::default(),
-        parse_sess_created: Some(Box::new(|ps| {
-            ps.span_diagnostic = Handler::with_emitter(Box::new(SilentEmitter));
+        psess_created: Some(Box::new(|ps| {
+            ps.dcx().make_silent(None, false);
         })),
         register_lints: None,
         override_queries: None,
         make_codegen_backend: None,
-        registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
+        registry: Registry::new(rustc_errors::codes::DIAGNOSTICS),
+        hash_untracked_state: None,
+        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+        expanded_args: Vec::new(),
     }
 }
 
@@ -119,8 +123,8 @@ pub fn make_counting_config(input: Input) -> (Config, Arc<Mutex<usize>>) {
     let mut config = make_config(input);
     let arc = Arc::new(Mutex::new(0));
     let emitter = CountingEmitter(arc.clone());
-    config.parse_sess_created = Some(Box::new(|ps| {
-        ps.span_diagnostic = Handler::with_emitter(Box::new(emitter));
+    config.psess_created = Some(Box::new(|ps| {
+        ps.dcx().set_emitter(Box::new(emitter));
     }));
     (config, arc)
 }
@@ -193,7 +197,7 @@ pub fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
     let lo_offset = file.original_relative_byte_pos(span.lo()).0;
     let hi_offset = file.original_relative_byte_pos(span.hi()).0;
     Snippet {
-        file_name: fname.prefer_remapped().to_string(),
+        file_name: fname.prefer_remapped_unconditionaly().to_string(),
         line_range,
         range: (lo_offset as usize)..(hi_offset as usize),
         text: (
@@ -207,7 +211,7 @@ pub fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
 struct CountingEmitter(Arc<Mutex<usize>>);
 
 impl Translate for CountingEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
+    fn fluent_bundle(&self) -> Option<&FluentBundle> {
         None
     }
 
@@ -217,33 +221,13 @@ impl Translate for CountingEmitter {
 }
 
 impl Emitter for CountingEmitter {
-    fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
-        if matches!(diag.level(), Level::Error { .. }) {
+    fn emit_diagnostic(&mut self, diag: rustc_errors::DiagInner, _: &Registry) {
+        if matches!(diag.level(), Level::Error) {
             *self.0.lock().unwrap() += 1;
         }
     }
 
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
-        None
-    }
-}
-
-struct SilentEmitter;
-
-impl Translate for SilentEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        None
-    }
-
-    fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!()
-    }
-}
-
-impl Emitter for SilentEmitter {
-    fn emit_diagnostic(&mut self, _: &rustc_errors::Diagnostic) {}
-
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+    fn source_map(&self) -> Option<&SourceMap> {
         None
     }
 }
@@ -253,7 +237,7 @@ fn find_deps() -> Options {
 
     let dir = std::env::var("DIR").unwrap_or_else(|_| ".".to_string());
     let dep = format!("{}/deps_crate/target/debug/deps", dir);
-    if let Ok(dir) = std::fs::read_dir(&dep) {
+    if let Ok(dir) = fs::read_dir(&dep) {
         args.push("-L".to_string());
         args.push(format!("dependency={}", dep));
 
@@ -271,7 +255,7 @@ fn find_deps() -> Options {
         }
     }
 
-    let mut handler = EarlyErrorHandler::new(ErrorOutputType::default());
+    let mut handler = EarlyDiagCtxt::new(ErrorOutputType::default());
     let matches = rustc_driver::handle_options(&handler, &args).unwrap();
     rustc_session::config::build_session_options(&mut handler, &matches)
 }

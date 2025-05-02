@@ -20,13 +20,12 @@ fn size_input(input: Input) {
         let mut blocks: usize = 0;
         let mut stmts: usize = 0;
 
-        let hir = tcx.hir();
-        for id in hir.items() {
-            let item = hir.item(id);
+        for id in tcx.hir_free_items() {
+            let item = tcx.hir_item(id);
             if item.ident.name.to_ident_string() == "main" {
                 continue;
             }
-            if !matches!(item.kind, rustc_hir::ItemKind::Fn(_, _, _)) {
+            if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
                 continue;
             }
 

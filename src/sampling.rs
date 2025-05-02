@@ -1,10 +1,9 @@
 use std::path::Path;
 
 use rustc_ast::Mutability;
-use rustc_const_eval::interpret::ConstValue;
 use rustc_middle::{
-    mir::{visit::Visitor, Body, ConstantKind},
-    ty::{TyCtxt, TyKind, TypeAndMut},
+    mir::{visit::Visitor, Body, Const, ConstValue},
+    ty::{TyCtxt, TyKind},
 };
 use rustc_session::config::Input;
 
@@ -21,14 +20,13 @@ pub fn sample_from_code(code: &str, res: &AnalysisResult) -> Vec<String> {
 fn sample_from_input(input: Input, res: &AnalysisResult) -> Vec<String> {
     let config = compile_util::make_config(input);
     compile_util::run_compiler(config, |tcx| {
-        let hir = tcx.hir();
         let mut fns = vec![];
-        for id in hir.items() {
-            let item = hir.item(id);
+        for id in tcx.hir_free_items() {
+            let item = tcx.hir_item(id);
             if item.ident.name.to_ident_string() == "main" {
                 continue;
             }
-            if !matches!(item.kind, rustc_hir::ItemKind::Fn(_, _, _)) {
+            if !matches!(item.kind, rustc_hir::ItemKind::Fn { .. }) {
                 continue;
             }
             let def_id = id.owner_id.to_def_id();
@@ -38,10 +36,9 @@ fn sample_from_input(input: Input, res: &AnalysisResult) -> Vec<String> {
                 && body
                     .args_iter()
                     .any(|arg| match body.local_decls[arg].ty.kind() {
-                        TyKind::RawPtr(TypeAndMut {
-                            ty,
-                            mutbl: Mutability::Mut,
-                        }) => !ty.is_primitive() && !ty.is_c_void(tcx) && !ty.is_any_ptr(),
+                        TyKind::RawPtr(ty, Mutability::Mut) => {
+                            !ty.is_primitive() && !ty.is_c_void(tcx) && !ty.is_any_ptr()
+                        }
                         _ => false,
                     })
             // && has_call(body, tcx)
@@ -74,7 +71,7 @@ impl<'tcx> Visitor<'tcx> for CallVisitor<'tcx> {
     ) {
         if let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind {
             if let Some(constant) = func.constant() {
-                if let ConstantKind::Val(ConstValue::ZeroSized, ty) = constant.literal {
+                if let Const::Val(ConstValue::ZeroSized, ty) = constant.const_ {
                     if let TyKind::FnDef(def_id, _) = ty.kind() {
                         let name = self.tcx.def_path(*def_id).to_string_no_crate_verbose();
                         if name.contains("{extern#")

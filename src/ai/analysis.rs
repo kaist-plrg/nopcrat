@@ -4,23 +4,25 @@ use std::{
     path::Path,
 };
 
-use compile_util::LoHi;
 use etrace::some_or;
 use rustc_abi::VariantIdx;
+use rustc_data_structures::graph::Successors;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     def::{DefKind, Res},
     intravisit::Visitor as HVisitor,
     Expr, ExprKind, HirId, QPath,
 };
-use rustc_index::bit_set::BitSet;
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
     mir::{
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
         BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
     },
-    ty::{AdtKind, Ty, TyCtxt, TyKind, TypeAndMut},
+    ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
+use rustc_mir_dataflow::Analysis as _;
 use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
@@ -29,9 +31,7 @@ use super::{
     domains::*,
     semantics::{CallKind, TransferedTerminator},
 };
-use crate::{
-    rustc_data_structures::graph::WithSuccessors as _, rustc_mir_dataflow::Analysis as _, *,
-};
+use crate::{compile_util, compile_util::LoHi, graph};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
@@ -110,17 +110,15 @@ enum Write {
 pub fn analyze(
     tcx: TyCtxt<'_>,
     conf: &AnalysisConfig,
-) -> BTreeMap<DefId, (FunctionSummary, FnAnalysisRes)> {
-    let hir = tcx.hir();
-
-    let mut call_graph = BTreeMap::new();
-    let mut inputs_map = BTreeMap::new();
-    for id in hir.items() {
-        let item = hir.item(id);
+) -> FxHashMap<DefId, (FunctionSummary, FnAnalysisRes)> {
+    let mut call_graph = FxHashMap::default();
+    let mut inputs_map = FxHashMap::default();
+    for id in tcx.hir_free_items() {
+        let item = tcx.hir_item(id);
         if item.ident.name.to_ident_string() == "main" {
             continue;
         }
-        let inputs = if let rustc_hir::ItemKind::Fn(sig, _, _) = &item.kind {
+        let inputs = if let rustc_hir::ItemKind::Fn { sig, .. } = &item.kind {
             sig.decl.inputs.len()
         } else {
             continue;
@@ -132,7 +130,7 @@ pub fn analyze(
         call_graph.insert(def_id, visitor.callees);
     }
 
-    let funcs: BTreeSet<_> = call_graph.keys().cloned().collect();
+    let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
     }
@@ -144,9 +142,9 @@ pub fn analyze(
         .collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
-    tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
-    let info_map: BTreeMap<_, _> = funcs
+    let info_map: FxHashMap<_, _> = funcs
         .iter()
         .map(|def_id| {
             let inputs = inputs_map[def_id];
@@ -169,24 +167,25 @@ pub fn analyze(
         })
         .collect();
 
-    let mut ptr_params_map = BTreeMap::new();
-    let mut output_params_map = BTreeMap::new();
-    let mut summaries = BTreeMap::new();
-    let mut results = BTreeMap::new();
-    let mut wm_map = BTreeMap::new();
-    let mut call_args_map = BTreeMap::new();
-    let mut analysis_times: BTreeMap<_, u128> = BTreeMap::new();
+    let mut ptr_params_map = FxHashMap::default();
+    let mut output_params_map = FxHashMap::default();
+    let mut summaries = FxHashMap::default();
+    let mut results = FxHashMap::default();
+    let mut wm_map = FxHashMap::default();
+    let mut call_args_map = FxHashMap::default();
+    let mut analysis_times: FxHashMap<_, u128> = FxHashMap::default();
 
-    let mut wbrs: BTreeMap<DefId, Vec<WriteBeforeReturn>> = BTreeMap::new();
-    let mut bb_musts: BTreeMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> = BTreeMap::new();
-    let mut is_units = BTreeMap::new();
+    let mut wbrs: FxHashMap<DefId, Vec<WriteBeforeReturn>> = FxHashMap::default();
+    let mut bb_musts: FxHashMap<DefId, BTreeMap<BasicBlock, BTreeSet<usize>>> =
+        FxHashMap::default();
+    let mut is_units = FxHashMap::default();
 
-    let mut rcfws = BTreeMap::new();
+    let mut rcfws = FxHashMap::default();
 
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
-            let def_id = def_ids.first().unwrap();
+            let def_id = def_ids.iter().next().unwrap();
             call_graph[def_id].contains(def_id)
         } else {
             true
@@ -462,7 +461,7 @@ struct FuncInfo {
     param_tys: Vec<TypeInfo>,
     loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     rpo_map: BTreeMap<BasicBlock, usize>,
-    dead_locals: Vec<BitSet<Local>>,
+    dead_locals: Vec<DenseBitSet<Local>>,
     fn_ptr: bool,
 }
 
@@ -479,7 +478,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     info: &'a FuncInfo,
     conf: &'a AnalysisConfig,
-    pub summaries: &'a BTreeMap<DefId, FunctionSummary>,
+    pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
 }
@@ -503,7 +502,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         info: &'a FuncInfo,
         conf: &'a AnalysisConfig,
-        summaries: &'a BTreeMap<DefId, FunctionSummary>,
+        summaries: &'a FxHashMap<DefId, FunctionSummary>,
     ) -> Self {
         Self {
             tcx,
@@ -831,7 +830,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             }
 
             let ty = &body.local_decls[Local::from_usize(i)].ty;
-            let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() else {
+            let TyKind::RawPtr(ty, ..) = ty.kind() else {
                 continue;
             };
             if ty.is_c_void(self.tcx) {
@@ -1001,7 +1000,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         for i in 1..=self.info.inputs {
             let ty = &body.local_decls[Local::from_usize(i)].ty;
-            let v = if let TyKind::RawPtr(TypeAndMut { ty, .. }) = ty.kind() {
+            let v = if let TyKind::RawPtr(ty, ..) = ty.kind() {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
@@ -1254,21 +1253,21 @@ impl FunctionSummary {
         self.init_state.ord(&other.init_state) && {
             self.return_states
                 .iter()
-                .all(|(k, v)| other.return_states.get(k).map_or(false, |w| v.ord(w)))
+                .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
         }
     }
 }
 
 struct CallVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    callees: BTreeSet<DefId>,
+    callees: FxHashSet<DefId>,
 }
 
 impl<'tcx> CallVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            callees: BTreeSet::new(),
+            callees: FxHashSet::default(),
         }
     }
 }
@@ -1276,8 +1275,8 @@ impl<'tcx> CallVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1295,7 +1294,7 @@ impl<'tcx> HVisitor<'tcx> for CallVisitor<'tcx> {
 struct FnPtrVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     callees: BTreeSet<HirId>,
-    fn_ptrs: BTreeSet<DefId>,
+    fn_ptrs: FxHashSet<DefId>,
 }
 
 impl<'tcx> FnPtrVisitor<'tcx> {
@@ -1303,7 +1302,7 @@ impl<'tcx> FnPtrVisitor<'tcx> {
         Self {
             tcx,
             callees: BTreeSet::new(),
-            fn_ptrs: BTreeSet::new(),
+            fn_ptrs: FxHashSet::default(),
         }
     }
 }
@@ -1311,8 +1310,8 @@ impl<'tcx> FnPtrVisitor<'tcx> {
 impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -1509,8 +1508,8 @@ fn get_param_tys<'tcx>(body: &Body<'tcx>, inputs: usize, tcx: TyCtxt<'tcx>) -> V
         if i > inputs {
             break;
         }
-        let ty = if let TyKind::RawPtr(tm) = local.ty.kind() {
-            TypeInfo::from_ty(&tm.ty, tcx)
+        let ty = if let TyKind::RawPtr(ty, ..) = local.ty.kind() {
+            TypeInfo::from_ty(ty, tcx)
         } else {
             TypeInfo::NonStruct
         };
@@ -1591,7 +1590,10 @@ fn get_loop_blocks(
         .basic_blocks
         .indices()
         .flat_map(|bb| {
-            let mut doms: Vec<_> = dominators.dominators(bb).collect();
+            assert!(dominators.is_reachable(bb));
+            let mut doms: Vec<_> =
+                std::iter::successors(Some(bb), |&bb_| dominators.immediate_dominator(bb_))
+                    .collect();
             let succs: BTreeSet<_> = body.basic_blocks.successors(bb).collect();
             doms.retain(|dom| succs.contains(dom));
             doms
@@ -1600,7 +1602,7 @@ fn get_loop_blocks(
     let mut loop_heads: Vec<_> = loop_heads.into_iter().collect();
     loop_heads.sort_by_key(|bb| rpo_map[bb]);
 
-    let succ_map: BTreeMap<_, BTreeSet<_>> = body
+    let succ_map: FxHashMap<_, FxHashSet<_>> = body
         .basic_blocks
         .indices()
         .map(|bb| (bb, body.basic_blocks.successors(bb).collect()))
@@ -1662,12 +1664,11 @@ fn compute_rpo_map(
     rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
 }
 
-fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Local>> {
+fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSet<Local>> {
     let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
     borrowed_locals.insert(Local::from_usize(0));
     let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
-        .into_engine(tcx, body)
-        .iterate_to_fixpoint()
+        .iterate_to_fixpoint(tcx, body, None)
         .into_results_cursor(body);
     body.basic_blocks
         .indices()
@@ -1676,7 +1677,7 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<BitSet<Loc
             let live_locals = cursor.get();
             let mut borrowed_or_live_locals = borrowed_locals.clone();
             borrowed_or_live_locals.union(live_locals);
-            let mut dead_locals = BitSet::new_filled(body.local_decls.len());
+            let mut dead_locals = DenseBitSet::new_filled(body.local_decls.len());
             dead_locals.subtract(&borrowed_or_live_locals);
             dead_locals
         })
