@@ -526,19 +526,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
-    // Check if any local in idxs is used in the following blocks
+    // Check if any local is used in the following blocks
     fn check_local_uses(
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block: &BasicBlock,
         locs: &BTreeSet<&Location>,
-        idxs: &BTreeSet<usize>,
+        locals: &BTreeSet<Local>,
     ) -> bool {
         let mut work_list = VecDeque::new();
         work_list.extend(body.basic_blocks.successors(*block));
         let mut visited = BTreeSet::new();
-        let mut visitor = LocalVisitor::new(tcx, idxs.clone());
+        let mut visitor = LocalVisitor::new(tcx, locals.clone());
 
         while let Some(bb) = work_list.pop_front() {
             if visited.insert(bb) {
@@ -595,7 +595,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn check_terminator_pure(
         &self,
         loc: &Location,
-        local_writes: &mut BTreeSet<usize>,
+        local_writes: &mut BTreeSet<Local>,
         param: usize,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
         term: &Terminator<'_>,
@@ -609,7 +609,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     return false;
                 }
                 if idx != param || !destination.is_indirect_first_projection() {
-                    local_writes.insert(idx);
+                    local_writes.insert(destination.local);
                 }
 
                 // check the writes of callee
@@ -622,7 +622,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         bases.iter().all(|p| match p {
                             AbsBase::Local(idx) => {
                                 // Defer the check to the caller
-                                local_writes.insert(*idx);
+                                local_writes.insert(Local::from_usize(*idx));
                                 true
                             }
                             AbsBase::Heap => false,
@@ -638,7 +638,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(
         &self,
-        locs: &mut BTreeSet<usize>,
+        locs: &mut BTreeSet<Local>,
         param: usize,
         stmt: &StatementKind<'_>,
     ) -> bool {
@@ -650,7 +650,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             if idx == 0 {
                 return false;
             }
-            locs.insert(idx);
+            locs.insert(place.local);
             true
         } else {
             unreachable!("{:?}", stmt)
@@ -1336,12 +1336,12 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
 
 struct LocalVisitor<'tcx> {
     _tcx: TyCtxt<'tcx>,
-    idx: BTreeSet<usize>,
+    idx: BTreeSet<Local>,
     check_result: Option<StatementCheck>,
 }
 
 impl<'tcx> LocalVisitor<'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, idx: BTreeSet<usize>) -> Self {
+    fn new(tcx: TyCtxt<'tcx>, idx: BTreeSet<Local>) -> Self {
         Self {
             _tcx: tcx,
             idx,
@@ -1356,7 +1356,7 @@ impl<'tcx> LocalVisitor<'tcx> {
 
 impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
-        if self.idx.contains(&local.index()) {
+        if self.idx.contains(&local) {
             match context {
                 PlaceContext::MutatingUse(MutatingUseContext::Store)
                 | PlaceContext::MutatingUse(MutatingUseContext::Call)
