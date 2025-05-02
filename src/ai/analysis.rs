@@ -580,7 +580,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         match visitor.check_result {
                             StatementCheck::None => {}
                             StatementCheck::UseExist => return false,
-                            StatementCheck::Overwritten => break,
+                            StatementCheck::Overwritten => continue,
                         }
                     }
                     work_list.extend(body.basic_blocks.successors(bb));
