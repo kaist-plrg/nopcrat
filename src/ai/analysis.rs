@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
     path::Path,
 };
@@ -16,7 +16,10 @@ use rustc_hir::{
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     hir::nested_filter,
-    mir::{BasicBlock, Body, Local, Location, StatementKind, TerminatorKind},
+    mir::{
+        visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
+        BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
+    },
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::Analysis as _;
@@ -24,7 +27,10 @@ use rustc_session::config::Input;
 use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
 use serde::{Deserialize, Serialize};
 
-use super::{domains::*, semantics::TransferedTerminator};
+use super::{
+    domains::*,
+    semantics::{CallKind, TransferedTerminator},
+};
 use crate::{compile_util, compile_util::LoHi, graph};
 
 #[derive(Debug, Clone)]
@@ -211,6 +217,8 @@ pub fn analyze(
                     states,
                     writes_map,
                     init_state,
+                    null_checks_map,
+                    call_info_map,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
@@ -219,7 +227,15 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
-                let nullable_params = analyzer.find_nullable_params(&states);
+                let nullable_params = analyzer.find_nullable_params(
+                    tcx,
+                    &states,
+                    body,
+                    &writes_map,
+                    &null_checks_map,
+                    &call_info_map,
+                );
+
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
@@ -471,6 +487,14 @@ struct AnalyzedBody {
     states: BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
+    null_checks_map: BTreeMap<usize, BTreeSet<Location>>,
+    call_info_map: BTreeMap<Location, Vec<CallKind>>,
+}
+
+enum StatementCheck {
+    None,
+    UseExist,
+    Overwritten,
 }
 
 impl<'a, 'tcx> Analyzer<'a, 'tcx> {
@@ -502,33 +526,268 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
-    fn find_nullable_params(
+    // Check if any local is used in the following blocks
+    fn check_local_uses(
         &self,
-        result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
-    ) -> BTreeSet<usize> {
-        let mut nonnull_locs = vec![BTreeSet::new(); self.info.inputs];
-        let mut null_locs = vec![BTreeSet::new(); self.info.inputs];
-        for (loc, sts) in result {
-            for (_, nulls) in sts.keys() {
-                for i in 0..self.info.inputs {
-                    let path = AbsPath(vec![i + 1]);
-                    if nulls.contains(&path) {
-                        null_locs[i].insert(*loc);
-                    } else {
-                        nonnull_locs[i].insert(*loc);
+        tcx: TyCtxt<'tcx>,
+        body: &Body<'tcx>,
+        block: &BasicBlock,
+        locs: &BTreeSet<&Location>,
+        locals: &BTreeSet<Local>,
+    ) -> bool {
+        if locals.is_empty() {
+            return true;
+        }
+
+        for local in locals {
+            let mut work_list = VecDeque::new();
+            work_list.extend(body.basic_blocks.successors(*block));
+            let mut visited = BTreeSet::new();
+            let mut visitor = LocalVisitor::new(tcx, *local);
+
+            'outer: while let Some(bb) = work_list.pop_front() {
+                if visited.insert(bb) {
+                    let bbd = &body.basic_blocks[bb];
+
+                    for (i, stmt) in bbd.statements.iter().enumerate() {
+                        let loc = Location {
+                            block: bb,
+                            statement_index: i,
+                        };
+
+                        if !locs.contains(&loc) {
+                            visitor.clear();
+                            visitor.visit_statement(stmt, loc);
+                            match visitor.check_result {
+                                StatementCheck::None => {} /* no use -- continue to check next statement */
+                                StatementCheck::UseExist => return false, // found a use
+                                StatementCheck::Overwritten => {
+                                    continue 'outer;
+                                } /* value is overwritten -- stop checking */
+                            }
+                        }
                     }
+
+                    let term = bbd.terminator();
+                    let loc = Location {
+                        block: bb,
+                        statement_index: bbd.statements.len(),
+                    };
+
+                    if !locs.contains(&loc) {
+                        visitor.clear();
+                        visitor.visit_terminator(term, loc);
+                        match visitor.check_result {
+                            StatementCheck::None => {}
+                            StatementCheck::UseExist => return false,
+                            StatementCheck::Overwritten => continue,
+                        }
+                    }
+                    work_list.extend(body.basic_blocks.successors(bb));
                 }
             }
         }
+        true
+    }
+
+    fn check_terminator_pure(
+        &self,
+        loc: &Location,
+        local_writes: &mut BTreeSet<Local>,
+        param: usize,
+        call_info_map: &BTreeMap<Location, Vec<CallKind>>,
+        term: &Terminator<'_>,
+    ) -> bool {
+        match &term.kind {
+            TerminatorKind::Call { destination, .. } => {
+                let call_info = call_info_map.get(loc).unwrap();
+                let idx = destination.local.index();
+                // check the destination of call
+                if idx == 0 {
+                    return false;
+                }
+                if idx != param || !destination.is_indirect_first_projection() {
+                    local_writes.insert(destination.local);
+                }
+
+                // check the writes of callee
+                call_info.iter().all(|kind| match kind {
+                    CallKind::Method | CallKind::RustPure => true,
+                    CallKind::C | CallKind::TOP | CallKind::RustEffect(None) | CallKind::Intra => {
+                        false
+                    }
+                    CallKind::RustEffect(Some(bases)) => {
+                        bases.iter().all(|p| match p {
+                            AbsBase::Local(idx) => {
+                                // Defer the check to the caller
+                                local_writes.insert(Local::from_usize(*idx));
+                                true
+                            }
+                            AbsBase::Heap => false,
+                            AbsBase::Null | AbsBase::Arg(_) => true,
+                        })
+                    }
+                })
+            }
+            TerminatorKind::InlineAsm { .. } => false,
+            _ => true,
+        }
+    }
+
+    fn check_assign_pure(
+        &self,
+        locs: &mut BTreeSet<Local>,
+        param: usize,
+        stmt: &StatementKind<'_>,
+    ) -> bool {
+        if let StatementKind::Assign(box (place, _)) = stmt {
+            let idx = place.local.index();
+            if idx == param && place.is_indirect_first_projection() {
+                return true;
+            }
+            if idx == 0 {
+                return false;
+            }
+            locs.insert(place.local);
+            true
+        } else {
+            unreachable!("{:?}", stmt)
+        }
+    }
+
+    fn extract_locs(
+        &self,
+        diffs: &'a BTreeMap<BasicBlock, BTreeSet<Location>>,
+    ) -> BTreeSet<&Location> {
+        diffs
+            .values()
+            .flat_map(|locs| locs.iter())
+            .collect::<BTreeSet<_>>()
+    }
+
+    fn is_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
+        if check.block == loc.block {
+            // loc and check should be different
+            return check.statement_index < loc.statement_index;
+        }
+
+        let dominators = body.basic_blocks.dominators();
+
+        if dominators.dominates(check.block, loc.block) {
+            return true;
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut work_list = VecDeque::from(vec![check.block]);
+        while let Some(bb) = work_list.pop_front() {
+            if bb == loc.block {
+                return true;
+            }
+            // If we reach a loop head, stop searching that path
+            if self.info.loop_blocks.contains_key(&bb)
+                && self.info.loop_blocks[&bb].contains(&check.block)
+            {
+                continue;
+            }
+            if visited.insert(bb) {
+                work_list.extend(body.basic_blocks.successors(bb));
+            }
+        }
+        false
+    }
+
+    // To derive the set of non-null locations, we check the location is reachable from
+    // any null check (is_null) location
+    fn compute_reachable_locs(
+        &self,
+        body: &Body<'_>,
+        null_checks_map: &'a BTreeMap<usize, BTreeSet<Location>>,
+        diff_locs: BTreeSet<Location>,
+        param: usize,
+    ) -> BTreeMap<BasicBlock, BTreeSet<Location>> {
+        let mut reachable_group: BTreeMap<BasicBlock, BTreeSet<Location>> = BTreeMap::new();
+        if let Some(null_checks) = null_checks_map.get(&param) {
+            for loc in diff_locs {
+                if null_checks
+                    .iter()
+                    .rev()
+                    .any(|check_loc| self.is_reachable_from(&loc, check_loc, body))
+                {
+                    reachable_group.entry(loc.block).or_default().insert(loc);
+                }
+            }
+        }
+        reachable_group
+    }
+
+    // We consider a parameter to be nullable if below sets are not the same:
+    // 1. The set of locations that are reachable when x is non-null and have side-effects
+    // 2. The set of locations that are reachable when x is null and have side-effects
+    fn find_nullable_params(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+        body: &Body<'tcx>,
+        writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
+        null_checks_map: &BTreeMap<usize, BTreeSet<Location>>,
+        call_info_map: &BTreeMap<Location, Vec<CallKind>>,
+    ) -> BTreeSet<usize> {
+        let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
+
         nonnull_locs
             .into_iter()
             .zip(null_locs)
             .enumerate()
             .filter_map(|(i, (nonnull, null))| {
-                if null.is_subset(&nonnull) {
+                if null.is_empty() {
+                    return None;
+                }
+
+                let param = i + 1;
+                let nonnull_diff =
+                    self.compute_reachable_locs(body, null_checks_map, &nonnull - &null, param);
+                let null_diff =
+                    self.compute_reachable_locs(body, null_checks_map, &null - &nonnull, param);
+                let nonnull_locs = self.extract_locs(&nonnull_diff);
+                let null_locs = self.extract_locs(&null_diff);
+
+                let check = |block, locs: &BTreeSet<_>, diff_locs| {
+                    let mut local_writes = BTreeSet::new();
+                    locs.iter().all(|loc| {
+                        let writes = writes_map.get(loc).unwrap();
+                        let Location {
+                            block,
+                            statement_index,
+                        } = loc;
+
+                        if writes.iter().any(|p| p.base() != param) {
+                            return false;
+                        }
+
+                        let bbd = &body.basic_blocks[*block];
+                        if *statement_index < bbd.statements.len() {
+                            let stmt = &bbd.statements[*statement_index];
+                            self.check_assign_pure(&mut local_writes, param, &stmt.kind)
+                        } else {
+                            let term = bbd.terminator();
+                            self.check_terminator_pure(
+                                loc,
+                                &mut local_writes,
+                                param,
+                                call_info_map,
+                                term,
+                            )
+                        }
+                    }) && self.check_local_uses(tcx, body, block, diff_locs, &local_writes)
+                };
+                if nonnull_diff
+                    .iter()
+                    .all(|(b, locs)| check(b, locs, &nonnull_locs))
+                    && null_diff.iter().all(|(b, locs)| check(b, locs, &null_locs))
+                {
                     None
                 } else {
-                    Some(i + 1)
+                    Some(param)
                 }
             })
             .collect()
@@ -771,7 +1030,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             BTreeSet::new()
         };
 
-        let (states, writes_map) = 'analysis_loop: loop {
+        let (states, writes_map, null_checks_map, call_info_map) = 'analysis_loop: loop {
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -781,6 +1040,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 start_state.clone(),
             );
             let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+            let mut null_checks_map: BTreeMap<usize, BTreeSet<_>> = BTreeMap::new();
+            let mut call_info_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
             self.call_args.clear();
             while let Some(label) = work_list.pop() {
@@ -807,10 +1068,25 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             next_states,
                             next_locations,
                             writes,
+                            null_check,
+                            call_info,
                         } = self.transfer_terminator(bbd.terminator(), state, label.location);
+                        // Record locations and states of is_null checks
+                        if let Some(arg) = null_check {
+                            null_checks_map
+                                .entry(arg)
+                                .or_default()
+                                .insert(label.location);
+                        }
+                        // Record locations and call info of function calls
+                        call_info_map
+                            .entry(label.location)
+                            .or_default()
+                            .extend(call_info);
                         (next_states, next_locations, writes)
                     };
                 writes_map.entry(label.location).or_default().extend(writes);
+
                 for location in &next_locations {
                     let dead_locals = &self.info.dead_locals[location.block.as_usize()];
                     if merging_blocks.contains(&location.block) {
@@ -900,13 +1176,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     continue 'analysis_loop;
                 }
             }
-            break (states, writes_map);
+            break (states, writes_map, null_checks_map, call_info_map);
         };
 
         AnalyzedBody {
             states,
             writes_map,
             init_state,
+            null_checks_map,
+            call_info_map,
         }
     }
 
@@ -1051,6 +1329,52 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
             _ => {}
         }
         rustc_hir::intravisit::walk_expr(self, expr);
+    }
+}
+
+struct LocalVisitor<'tcx> {
+    _tcx: TyCtxt<'tcx>,
+    local: Local,
+    check_result: StatementCheck,
+}
+
+impl<'tcx> LocalVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, local: Local) -> Self {
+        Self {
+            _tcx: tcx,
+            local,
+            check_result: StatementCheck::None,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.check_result = StatementCheck::None;
+    }
+}
+
+impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
+        if self.local == local {
+            match context {
+                PlaceContext::MutatingUse(MutatingUseContext::Store)
+                | PlaceContext::MutatingUse(MutatingUseContext::Call)
+                | PlaceContext::MutatingUse(MutatingUseContext::AsmOutput)
+                | PlaceContext::MutatingUse(MutatingUseContext::Yield) => {
+                    self.check_result = StatementCheck::Overwritten;
+                }
+                PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Move)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::Projection)
+                | PlaceContext::NonMutatingUse(NonMutatingUseContext::RawBorrow)
+                | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
+                | PlaceContext::MutatingUse(MutatingUseContext::RawBorrow) => {
+                    self.check_result = StatementCheck::UseExist;
+                }
+                _ => {
+                    self.check_result = StatementCheck::None;
+                }
+            }
+        }
     }
 }
 
@@ -1387,6 +1711,28 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
             })
             .collect()
     }
+}
+
+// Compute locations where the parameters are non-null or null
+fn compute_nonnull_null_locs(
+    result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+    inputs: usize,
+) -> (Vec<BTreeSet<Location>>, Vec<BTreeSet<Location>>) {
+    let mut nonnull_locs = vec![BTreeSet::new(); inputs];
+    let mut null_locs = vec![BTreeSet::new(); inputs];
+    for (loc, sts) in result {
+        for (_, nulls) in sts.keys() {
+            for i in 0..inputs {
+                let path = AbsPath(vec![i + 1]);
+                if nulls.contains(&path) {
+                    null_locs[i].insert(*loc);
+                } else {
+                    nonnull_locs[i].insert(*loc);
+                }
+            }
+        }
+    }
+    (nonnull_locs, null_locs)
 }
 
 #[allow(unused)]
