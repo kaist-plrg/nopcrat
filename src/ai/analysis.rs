@@ -543,7 +543,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut work_list = VecDeque::new();
             work_list.extend(body.basic_blocks.successors(*block));
             let mut visited = BTreeSet::new();
-            let mut visitor = LocalVisitor::new(tcx, local);
+            let mut visitor = LocalVisitor::new(tcx, *local);
 
             'outer: while let Some(bb) = work_list.pop_front() {
                 if visited.insert(bb) {
@@ -1332,14 +1332,14 @@ impl<'tcx> HVisitor<'tcx> for FnPtrVisitor<'tcx> {
     }
 }
 
-struct LocalVisitor<'a, 'tcx> {
+struct LocalVisitor<'tcx> {
     _tcx: TyCtxt<'tcx>,
-    local: &'a Local,
+    local: Local,
     check_result: StatementCheck,
 }
 
-impl<'a, 'tcx> LocalVisitor<'a, 'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, local: &'a Local) -> Self {
+impl<'tcx> LocalVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>, local: Local) -> Self {
         Self {
             _tcx: tcx,
             local,
@@ -1352,9 +1352,9 @@ impl<'a, 'tcx> LocalVisitor<'a, 'tcx> {
     }
 }
 
-impl<'tcx> MVisitor<'tcx> for LocalVisitor<'_, 'tcx> {
+impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
-        if *self.local == local {
+        if self.local == local {
             match context {
                 PlaceContext::MutatingUse(MutatingUseContext::Store)
                 | PlaceContext::MutatingUse(MutatingUseContext::Call)
