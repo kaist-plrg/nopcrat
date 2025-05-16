@@ -108,6 +108,20 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .into_iter()
                         .map(|b| targets.target_for_value(b as _).start_location())
                         .collect()
+                } else if !v.intv.is_bot() && !v.intv.is_top() {
+                    v.intv
+                        .gamma()
+                        .unwrap()
+                        .into_iter()
+                        .map(|b| targets.target_for_value(*b as _).start_location())
+                        .collect()
+                } else if !v.uintv.is_bot() && !v.uintv.is_top() {
+                    v.uintv
+                        .gamma()
+                        .unwrap()
+                        .into_iter()
+                        .map(|u| targets.target_for_value(*u).start_location())
+                        .collect()
                 } else {
                     targets
                         .all_targets()
