@@ -112,14 +112,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     v.intv
                         .gamma()
                         .unwrap()
-                        .into_iter()
+                        .iter()
                         .map(|b| targets.target_for_value(*b as _).start_location())
                         .collect()
                 } else if !v.uintv.is_bot() && !v.uintv.is_top() {
                     v.uintv
                         .gamma()
                         .unwrap()
-                        .into_iter()
+                        .iter()
                         .map(|u| targets.target_for_value(*u).start_location())
                         .collect()
                 } else {
@@ -250,7 +250,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
                 (
-                    vec![(self.transfer_c_call(callee, args, &mut state, &mut reads), None)],
+                    vec![(
+                        self.transfer_c_call(callee, args, &mut state, &mut reads),
+                        None,
+                    )],
                     CallKind::C,
                 )
             } else if name.contains("{impl#") {
