@@ -108,6 +108,20 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .into_iter()
                         .map(|b| targets.target_for_value(b as _).start_location())
                         .collect()
+                } else if !v.intv.is_bot() && !v.intv.is_top() {
+                    v.intv
+                        .gamma()
+                        .unwrap()
+                        .iter()
+                        .map(|b| targets.target_for_value(*b as _).start_location())
+                        .collect()
+                } else if !v.uintv.is_bot() && !v.uintv.is_top() {
+                    v.uintv
+                        .gamma()
+                        .unwrap()
+                        .iter()
+                        .map(|u| targets.target_for_value(*u).start_location())
+                        .collect()
                 } else {
                     targets
                         .all_targets()
@@ -236,7 +250,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
                 (
-                    vec![(self.transfer_c_call(callee, args, &state, &mut reads), None)],
+                    vec![(
+                        self.transfer_c_call(callee, args, &mut state, &mut reads),
+                        None,
+                    )],
                     CallKind::C,
                 )
             } else if name.contains("{impl#") {
@@ -424,7 +441,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &mut self,
         callee: DefId,
         args: &[AbsValue],
-        state: &AbsState,
+        state: &mut AbsState,
         reads: &mut Vec<AbsPath>,
     ) -> AbsValue {
         let sig = self.tcx.fn_sig(callee).skip_binder();
@@ -446,10 +463,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 None
             })
             .collect();
-        for arg in ptr_args {
-            let reads2 = self.get_read_paths_of_ptr(&args[arg].ptrv, &[]);
+        for arg in ptr_args.iter() {
+            let reads2 = self.get_read_paths_of_ptr(&args[*arg].ptrv, &[]);
             reads.extend(reads2);
         }
+
         for arg in args.iter().skip(inputs.len()) {
             let reads2 = self.get_read_paths_of_ptr(&arg.ptrv, &[]);
             reads.extend(reads2);
@@ -460,6 +478,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             self.get_read_paths_of_ptr(&v.ptrv, &[])
         });
         reads.extend(reads2);
+
+        for arg in ptr_args {
+            self.indirect_assign(&args[arg].ptrv, &AbsValue::top(), &[], state);
+        }
 
         if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
