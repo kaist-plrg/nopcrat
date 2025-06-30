@@ -1,7 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::{hash_map::Entry, HashMap, HashSet},
-};
+use std::{cell::RefCell, collections::hash_map::Entry};
 
 use etrace::some_or;
 use rustc_abi::FieldIdx;
@@ -40,17 +37,17 @@ pub struct PreAnalysisData<'tcx> {
     alloc_fns: FxHashSet<LocalDefId>,
 
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
-    indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, usize>>,
+    indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, usize>>,
 
     ends: Vec<usize>,
-    globals: HashMap<LocalDefId, usize>,
-    inv_fns: HashMap<usize, LocalDefId>,
-    vars: HashMap<Var, usize>,
+    globals: FxHashMap<LocalDefId, usize>,
+    inv_fns: FxHashMap<usize, LocalDefId>,
+    vars: FxHashMap<Var, usize>,
 
-    index_prefixes: HashMap<usize, u8>,
-    union_offsets: HashMap<usize, Vec<usize>>,
-    graph: HashMap<LocNode, LocEdges>,
-    var_nodes: HashMap<(LocalDefId, Local), LocNode>,
+    index_prefixes: FxHashMap<usize, u8>,
+    union_offsets: FxHashMap<usize, Vec<usize>>,
+    graph: FxHashMap<LocNode, LocEdges>,
+    var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 }
 
 pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for HybridBitSet
@@ -58,21 +55,21 @@ pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for Hybri
 #[derive(Debug)]
 pub struct AnalysisResults {
     pub ends: Vec<usize>,
-    pub union_offsets: HashMap<usize, Vec<usize>>,
+    pub union_offsets: FxHashMap<usize, Vec<usize>>,
     pub graph: LocGraph,
-    pub var_nodes: HashMap<(LocalDefId, Local), LocNode>,
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 
     pub solutions: Solutions,
 
-    pub indirect_calls: HashMap<LocalDefId, HashMap<BasicBlock, Vec<LocalDefId>>>,
+    pub indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, Vec<LocalDefId>>>,
     pub call_graph_sccs: FxHashMap<graph::Id, FxHashSet<graph::Id>>,
     pub scc_elems: FxHashMap<graph::Id, FxHashSet<LocalDefId>>,
     pub fn_sccs: FxHashMap<LocalDefId, graph::Id>,
-    pub reachables: RefCell<HashMap<usize, HashSet<usize>>>,
+    pub reachables: RefCell<FxHashMap<usize, FxHashSet<usize>>>,
 
-    pub writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub bitfield_writes: HashMap<LocalDefId, HashMap<Location, HybridBitSet<usize>>>,
-    pub fn_writes: HashMap<LocalDefId, HybridBitSet<usize>>,
+    pub writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<usize>>>,
+    pub bitfield_writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<usize>>>,
+    pub fn_writes: FxHashMap<LocalDefId, HybridBitSet<usize>>,
 }
 
 impl AnalysisResults {
@@ -90,23 +87,23 @@ impl AnalysisResults {
     }
 
     #[inline]
-    fn with_reachables<R, F: FnOnce(&HashSet<usize>) -> R>(&self, scc: usize, f: F) -> R {
+    fn with_reachables<R, F: FnOnce(&FxHashSet<usize>) -> R>(&self, scc: usize, f: F) -> R {
         if let Some(rs) = self.reachables.borrow().get(&scc) {
             return f(rs);
         }
-        let mut reachables = HashSet::new();
+        let mut reachables = FxHashSet::default();
         self.reachables_from_scc(scc, &mut reachables);
         let r = f(&reachables);
         self.reachables.borrow_mut().insert(scc, reachables.clone());
         r
     }
 
-    fn reachables_from_scc(&self, scc: usize, reachables: &mut HashSet<usize>) {
+    fn reachables_from_scc(&self, scc: usize, reachables: &mut FxHashSet<usize>) {
         if let Some(rs) = self.reachables.borrow().get(&scc) {
             reachables.extend(rs);
             return;
         }
-        let mut this_reachables: HashSet<_> = [scc].into_iter().collect();
+        let mut this_reachables: FxHashSet<_> = [scc].into_iter().collect();
         let idx = graph::Id::new(scc);
         for succ in &self.call_graph_sccs[&idx] {
             self.reachables_from_scc(succ.index(), &mut this_reachables);
@@ -123,7 +120,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let alloc_fns = alloc_finder::analyze(tcx);
 
     let mut bodies = vec![];
-    let mut fn_def_ids = HashSet::new();
+    let mut fn_def_ids = FxHashSet::default();
     let mut visitor = FnPtrVisitor::new(tcx);
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
@@ -161,20 +158,20 @@ pub fn pre_analyze<'a, 'tcx>(
     let fn_ptrs = visitor.fn_ptrs;
 
     // local_def_id -> global_index : item with local_def_id has global_index
-    let mut globals = HashMap::new();
+    let mut globals = FxHashMap::default();
     // global_index -> local_def_id : global_index is a function with local_def_id
-    let mut inv_fns = HashMap::new();
+    let mut inv_fns = FxHashMap::default();
     // local -> global_index
-    let mut vars = HashMap::new();
+    let mut vars = FxHashMap::default();
     let mut ends = vec![];
     let mut alloc_ends: Vec<usize> = vec![];
     let mut allocs = vec![];
-    let mut graph = HashMap::new();
-    let mut union_offsets = HashMap::new();
-    let mut index_prefixes = HashMap::new();
+    let mut graph = FxHashMap::default();
+    let mut union_offsets = FxHashMap::default();
+    let mut index_prefixes = FxHashMap::default();
     // indirect calls using the var of the global index
-    let mut indirect_calls: HashMap<_, HashMap<_, _>> = HashMap::new();
-    let mut var_nodes = HashMap::new();
+    let mut indirect_calls: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+    let mut var_nodes = FxHashMap::default();
     for item in &bodies {
         // not c function
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
@@ -392,8 +389,8 @@ pub fn post_analyze<'a, 'tcx>(
         tss,
         graph: Graph::new(pre.ends.len()),
     };
-    let mut writes: HashMap<_, HashMap<_, _>> = HashMap::new();
-    let mut bitfield_writes: HashMap<_, HashMap<_, _>> = HashMap::new();
+    let mut writes: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+    let mut bitfield_writes: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     for item in &pre.bodies {
         let writes = writes.entry(item.local_def_id).or_default();
         let bitfield_writes = bitfield_writes.entry(item.local_def_id).or_default();
@@ -450,7 +447,7 @@ pub fn post_analyze<'a, 'tcx>(
             writes.intersect(&address_taken_indices);
         }
     }
-    let fn_writes: HashMap<_, _> = writes
+    let fn_writes: FxHashMap<_, _> = writes
         .iter()
         .map(|(f, writes)| {
             let mut ws = HybridBitSet::new_empty(pre.ends.len());
@@ -461,7 +458,7 @@ pub fn post_analyze<'a, 'tcx>(
         })
         .collect();
 
-    let indirect_calls: HashMap<_, HashMap<_, Vec<_>>> = pre
+    let indirect_calls: FxHashMap<_, FxHashMap<_, Vec<_>>> = pre
         .indirect_calls
         .into_iter()
         .map(|(def_id, calls)| {
@@ -498,7 +495,7 @@ pub fn post_analyze<'a, 'tcx>(
         call_graph_sccs,
         scc_elems,
         fn_sccs,
-        reachables: RefCell::new(HashMap::new()),
+        reachables: RefCell::new(FxHashMap::default()),
         writes,
         bitfield_writes,
         fn_writes,
@@ -527,7 +524,7 @@ fn compute_writes<'tcx>(
     solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, HybridBitSet<usize>>,
+    writes: &mut FxHashMap<Location, HybridBitSet<usize>>,
 ) {
     let writes = writes
         .entry(location)
@@ -566,7 +563,7 @@ fn compute_bitfield_writes<'tcx>(
     solutions: &[HybridBitSet<usize>],
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut HashMap<Location, HybridBitSet<usize>>,
+    writes: &mut FxHashMap<Location, HybridBitSet<usize>>,
 ) {
     if args.len() != 2 {
         return;
@@ -632,8 +629,8 @@ fn add_edges(
     ty: &TyShape<'_>,
     index: usize, // global index
     graph: &mut LocGraph,
-    index_prefixes: &mut HashMap<usize, u8>,
-    union_offsets: &mut HashMap<usize, Vec<usize>>,
+    index_prefixes: &mut FxHashMap<usize, u8>,
+    union_offsets: &mut FxHashMap<usize, Vec<usize>>,
 ) -> LocNode {
     let node = match ty {
         TyShape::Primitive => return LocNode::new(0, index),
@@ -664,7 +661,7 @@ fn add_edges(
     node
 }
 
-pub type LocGraph = HashMap<LocNode, LocEdges>;
+pub type LocGraph = FxHashMap<LocNode, LocEdges>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocNode {
@@ -1039,7 +1036,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
     }
 }
 
-type WeightedGraph = HashMap<usize, HashMap<usize, HashSet<usize>>>;
+type WeightedGraph = FxHashMap<usize, FxHashMap<usize, FxHashSet<usize>>>;
 
 struct Graph {
     solutions: Solutions,
@@ -1070,9 +1067,9 @@ impl Graph {
         Self {
             solutions: vec![HybridBitSet::new_empty(size); size],
             zero_weight_edges: vec![HybridBitSet::new_empty(size); size],
-            pos_weight_edges: HashMap::new(),
-            deref_eqs: HashMap::new(),
-            eq_derefs: HashMap::new(),
+            pos_weight_edges: FxHashMap::default(),
+            deref_eqs: FxHashMap::default(),
+            eq_derefs: FxHashMap::default(),
         }
     }
 
@@ -1135,7 +1132,7 @@ impl Graph {
 
             let mut scc_to_rep = vec![];
             let mut cycles = vec![];
-            let mut new_id_to_rep = HashMap::new();
+            let mut new_id_to_rep = FxHashMap::default();
             for component in components.iter() {
                 let rep = component.iter().next().unwrap();
                 scc_to_rep.push(rep);
@@ -1500,7 +1497,7 @@ fn contains_multiple<T: Idx>(set: &HybridBitSet<T>) -> bool {
 
 struct FnPtrVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    fn_ptrs: HashSet<LocalDefId>,
+    fn_ptrs: FxHashSet<LocalDefId>,
 }
 
 impl<'tcx> FnPtrVisitor<'tcx> {
@@ -1508,7 +1505,7 @@ impl<'tcx> FnPtrVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            fn_ptrs: HashSet::new(),
+            fn_ptrs: FxHashSet::default(),
         }
     }
 

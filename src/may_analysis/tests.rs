@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use rustc_hash::FxHashMap;
 use rustc_index::Idx;
 use rustc_middle::{
     mir::{BasicBlock, Location},
@@ -2292,7 +2291,7 @@ fn l(block: usize, statement_index: usize) -> Location {
 }
 
 fn wg(
-    writes: &HashMap<Location, HybridBitSet<usize>>,
+    writes: &FxHashMap<Location, HybridBitSet<usize>>,
     block: usize,
     statement_index: usize,
 ) -> Vec<usize> {
