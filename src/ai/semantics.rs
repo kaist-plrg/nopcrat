@@ -6,9 +6,9 @@ use rustc_const_eval::interpret::{AllocRange, GlobalAlloc, Scalar};
 use rustc_hir as hir;
 use rustc_middle::{
     mir::{
-        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Location, Operand, Place,
-        PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
-        UnOp,
+        AggregateKind, BinOp, CastKind, Const, ConstOperand, ConstValue, Local, Location, Operand,
+        Place, PlaceElem, ProjectionElem, Rvalue, Statement, StatementKind, Terminator,
+        TerminatorKind, UnOp,
     },
     ty::{adjustment::PointerCoercion, AdtKind, Ty, TyKind},
 };
@@ -77,9 +77,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         state: &AbsState,
     ) -> (AbsState, BTreeSet<AbsPath>) {
         if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
-            let (new_v, reads, cmps) = self.transfer_rvalue(rvalue, state);
+            let (new_v, reads, excludes) = self.transfer_rvalue(rvalue, state);
             let (mut new_state, writes) = self.assign(place, new_v, state);
-            new_state.add_excludes(cmps.into_iter());
+            new_state.add_excludes(excludes.into_iter());
             new_state.add_reads(reads.into_iter());
             let writes = new_state.add_writes(writes.into_iter());
             (new_state, writes)
@@ -99,9 +99,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 TransferedTerminator::state_location(state.clone(), target.start_location())
             }
             TerminatorKind::SwitchInt { discr, targets } => {
-                let (v, reads) = self.transfer_operand(discr, state);
+                let (v, reads, excludes) = self.transfer_operand(discr, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
+                new_state.add_excludes(excludes.into_iter());
                 let locations = if v.intv.is_bot() && v.uintv.is_bot() {
                     v.boolv
                         .gamma()
@@ -145,13 +146,14 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 target,
                 ..
             } => {
-                let (func, mut reads) = self.transfer_operand(func, state);
-                let (args, readss): (Vec<_>, Vec<_>) = args
+                let (func, mut reads, mut excludes) = self.transfer_operand(func, state);
+                let (args, readss, excludess): (Vec<_>, Vec<_>, Vec<_>) = args
                     .iter()
                     .map(|arg| self.transfer_operand(&arg.node, state))
-                    .unzip();
-                for reads2 in readss {
+                    .collect();
+                for (reads2, excludes2) in readss.into_iter().zip(excludess.into_iter()) {
                     reads.extend(reads2);
+                    excludes.extend(excludes2);
                 }
 
                 let (new_states, writes, null_check, call_info) = if let Some(fns) =
@@ -177,8 +179,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             null_check = Some(arg);
                         }
 
-                        for state in states {
+                        for mut state in states {
                             let wn = (state.writes.clone(), state.nulls.clone());
+                            state.add_excludes(excludes.iter().cloned());
                             new_states_map.entry(wn).or_default().push(state);
                         }
                     }
@@ -212,9 +215,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             TerminatorKind::TailCall { .. } => todo!("{:?}", terminator.kind),
             TerminatorKind::Assert { cond, target, .. } => {
-                let (_, reads) = self.transfer_operand(cond, state);
+                let (_, reads, excludes) = self.transfer_operand(cond, state);
                 let mut new_state = state.clone();
                 new_state.add_reads(reads.into_iter());
+                new_state.add_excludes(excludes.into_iter());
                 TransferedTerminator::state_location(new_state, target.start_location())
             }
             TerminatorKind::Yield { .. } => unreachable!("{:?}", terminator.kind),
@@ -720,13 +724,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> (AbsValue, Vec<AbsPath>, Vec<AbsPath>) {
         match rvalue {
             Rvalue::Use(operand) => {
-                let (v, reads) = self.transfer_operand(operand, state);
-                (v, reads, vec![])
+                let (v, reads, excludes) = self.transfer_operand(operand, state);
+                (v, reads, excludes)
             }
             Rvalue::Repeat(operand, len) => {
-                let (v, reads) = self.transfer_operand(operand, state);
+                let (v, reads, excludes) = self.transfer_operand(operand, state);
                 let len = len.try_to_target_usize(self.tcx).unwrap();
-                (AbsValue::alpha_list(vec![v; len as usize]), reads, vec![])
+                (AbsValue::alpha_list(vec![v; len as usize]), reads, excludes)
             }
             Rvalue::Ref(_, _, place) => {
                 let v = if place.is_indirect_first_projection() {
@@ -763,7 +767,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             Rvalue::Len(_) => unreachable!("{:?}", rvalue),
             Rvalue::Cast(kind, operand, ty) => {
-                let (v, reads) = self.transfer_operand(operand, state);
+                let (v, reads, excludes) = self.transfer_operand(operand, state);
                 let v = match kind {
                     CastKind::PointerExposeProvenance => self.top_value_of_ty(ty),
                     CastKind::PointerWithExposedProvenance => {
@@ -844,11 +848,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     CastKind::FnPtrToPtr => v,
                     CastKind::Transmute => v,
                 };
-                (v, reads, vec![])
+                (v, reads, excludes)
             }
             Rvalue::BinaryOp(binop, box (l, r)) => {
-                let (l, mut reads_l) = self.transfer_operand(l, state);
-                let (r, reads_r) = self.transfer_operand(r, state);
+                let (l, mut reads_l, excludes_l) = self.transfer_operand(l, state);
+                let (r, reads_r, excludes_r) = self.transfer_operand(r, state);
                 let v = match binop {
                     BinOp::Add => l.add(&r),
                     BinOp::AddUnchecked => unreachable!("{:?}", rvalue),
@@ -890,51 +894,55 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     cmps.extend(self.get_read_paths_of_ptr(&r.ptrv, &[]));
                 }
                 reads_l.extend(reads_r);
+                cmps.extend(excludes_l);
+                cmps.extend(excludes_r);
                 (v, reads_l, cmps)
             }
             Rvalue::NullaryOp(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::UnaryOp(unary, operand) => {
-                let (v, reads) = self.transfer_operand(operand, state);
+                let (v, reads, excludes) = self.transfer_operand(operand, state);
                 let v = match unary {
                     UnOp::Not => v.not(),
                     UnOp::Neg => v.neg(),
                     UnOp::PtrMetadata => todo!("{:?}", rvalue),
                 };
-                (v, reads, vec![])
+                (v, reads, excludes)
             }
             Rvalue::Discriminant(_) => todo!("{:?}", rvalue),
             Rvalue::Aggregate(box kind, fields) => match kind {
                 AggregateKind::Array(_) => {
-                    let (vs, readss): (Vec<_>, Vec<_>) = fields
+                    let (vs, readss, excludes): (Vec<_>, Vec<_>, Vec<_>) = fields
                         .iter()
                         .map(|operand| self.transfer_operand(operand, state))
-                        .unzip();
+                        .collect();
                     let v = AbsValue::alpha_list(vs.into_iter().collect());
                     let reads = readss.into_iter().flatten().collect();
-                    (v, reads, vec![])
+                    let excludes = excludes.into_iter().flatten().collect();
+                    (v, reads, excludes)
                 }
                 AggregateKind::Tuple => unreachable!("{:?}", rvalue),
                 AggregateKind::Adt(def_id, _, _, _, _) => {
                     let adt_def = self.tcx.adt_def(def_id);
                     match adt_def.adt_kind() {
                         AdtKind::Struct => {
-                            let (vs, readss): (Vec<_>, Vec<_>) = fields
+                            let (vs, readss, excludess): (Vec<_>, Vec<_>, Vec<_>) = fields
                                 .iter()
                                 .map(|operand| self.transfer_operand(operand, state))
-                                .unzip();
+                                .collect();
                             let v = AbsValue::alpha_list(vs.into_iter().collect());
                             let reads = readss.into_iter().flatten().collect();
-                            (v, reads, vec![])
+                            let excludes = excludess.into_iter().flatten().collect();
+                            (v, reads, excludes)
                         }
                         AdtKind::Union => {
                             assert_eq!(fields.len(), 1);
                             let operand = &fields[FieldIdx::from_usize(0)];
-                            let (v, reads) = self.transfer_operand(operand, state);
+                            let (v, reads, excludes) = self.transfer_operand(operand, state);
                             let variant = adt_def.variant(VariantIdx::from_usize(0));
                             let v = AbsValue::alpha_list(
                                 variant.fields.iter().map(|_| v.clone()).collect(),
                             );
-                            (v, reads, vec![])
+                            (v, reads, excludes)
                         }
                         AdtKind::Enum => {
                             assert_eq!(
@@ -944,11 +952,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                                 rvalue
                             );
                             if let Some(field) = fields.get(FieldIdx::from_usize(0)) {
-                                let (v, reads) = self.transfer_operand(field, state);
+                                let (v, reads, excludes) = self.transfer_operand(field, state);
                                 if v.is_bot() {
-                                    (AbsValue::bot(), reads, vec![])
+                                    (AbsValue::bot(), reads, excludes)
                                 } else {
-                                    (AbsValue::some(v), reads, vec![])
+                                    (AbsValue::some(v), reads, excludes)
                                 }
                             } else {
                                 (AbsValue::none(), vec![], vec![])
@@ -963,8 +971,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             },
             Rvalue::ShallowInitBox(_, _) => unreachable!("{:?}", rvalue),
             Rvalue::CopyForDeref(place) => {
-                let (v, reads) = self.transfer_place(place, state);
-                (v, reads, vec![])
+                let (v, reads, excludes) = self.transfer_place(place, state);
+                (v, reads, excludes)
             }
             Rvalue::WrapUnsafeBinder(_, _) => unreachable!("{:?}", rvalue),
         }
@@ -974,22 +982,29 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         &self,
         operand: &Operand<'tcx>,
         state: &AbsState,
-    ) -> (AbsValue, Vec<AbsPath>) {
+    ) -> (AbsValue, Vec<AbsPath>, Vec<AbsPath>) {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.transfer_place(place, state),
-            Operand::Constant(box constant) => (self.transfer_constant(constant), vec![]),
+            Operand::Constant(box constant) => (self.transfer_constant(constant), vec![], vec![]), /* TODO! */
         }
     }
 
-    fn transfer_place(&self, place: &Place<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
+    fn transfer_place(
+        &self,
+        place: &Place<'tcx>,
+        state: &AbsState,
+    ) -> (AbsValue, Vec<AbsPath>, Vec<AbsPath>) {
         if place.is_indirect_first_projection() {
+            let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
-            let ptr = state.local.get(place.local.index());
-            self.read_ptr(&ptr.ptrv, &projection, state)
+            let ptr = state.local.get(local.index());
+            let aliases = self.check_param_aliases(ptr, local);
+            let (v, reads) = self.read_ptr(&ptr.ptrv, &projection, state);
+            (v, reads, aliases)
         } else {
             let v = state.local.get(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
-            (self.get_value(v, &projection), vec![])
+            (self.get_value(v, &projection), vec![], vec![])
         }
     }
 
@@ -1194,8 +1209,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> (AbsState, Vec<AbsPath>) {
         let mut new_state = state.clone();
         let writes = if place.is_indirect_first_projection() {
+            let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
-            let ptr = state.local.get(place.local.index());
+            let ptr = state.local.get(local.index());
+            let aliases = self.check_param_aliases(ptr, local);
+            new_state.add_excludes(aliases.into_iter());
             self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
             self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {
@@ -1369,5 +1387,33 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsList::Bot => AbsValue::bot(),
             },
         }
+    }
+
+    fn check_param_aliases(&self, ptr: &AbsValue, local: Local) -> Vec<AbsPath> {
+        // If the local is an alias created in the function, skip the check
+        if let AbsPtr::Set(ptrs) = &ptr.ptrv {
+            if ptrs.len() == 1 {
+                let ptr = ptrs.first().unwrap();
+                if matches!(ptr.base, AbsBase::Arg(_)) {
+                    return Vec::new();
+                }
+            }
+        }
+
+        let Some(index) = self
+            .pre_context
+            .pre_data
+            .var_nodes
+            .get(&(self.pre_context.local_def_id, local))
+            .map(|node| node.index)
+        else {
+            return Vec::new();
+        };
+
+        self.pre_context
+            .check_index(index)
+            .into_iter()
+            .flat_map(|i| self.expands_path(&AbsPath(vec![i])))
+            .collect()
     }
 }

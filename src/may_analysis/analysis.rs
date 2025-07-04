@@ -39,9 +39,9 @@ pub struct PreAnalysisData<'tcx> {
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, usize>>,
 
-    ends: Vec<usize>,
-    globals: FxHashMap<LocalDefId, usize>,
-    inv_fns: FxHashMap<usize, LocalDefId>,
+    pub ends: Vec<usize>,
+    pub globals: FxHashMap<LocalDefId, usize>,
+    pub inv_fns: FxHashMap<usize, LocalDefId>,
     vars: FxHashMap<Var, usize>,
 
     index_prefixes: FxHashMap<usize, u8>,
@@ -51,6 +51,17 @@ pub struct PreAnalysisData<'tcx> {
 }
 
 pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for HybridBitSet
+
+#[derive(Debug)]
+pub struct AliasResults {
+    pub aliases: FxHashMap<DefId, HybridBitSet<usize>>,
+    pub inv_aliases: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
+    pub excludess: FxHashMap<DefId, FxHashSet<usize>>,
+    pub ends: Vec<usize>,
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
+    pub globals: FxHashMap<LocalDefId, usize>,
+    pub solutions: Solutions,
+}
 
 #[derive(Debug)]
 pub struct AnalysisResults {
@@ -354,6 +365,78 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
         }
     }
     solutions
+}
+
+pub fn compute_alias(
+    pre: PreAnalysisData<'_>,
+    solutions: Solutions,
+    inputs_map: &FxHashMap<DefId, usize>,
+) -> AliasResults {
+    let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
+    let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
+    let mut excludess: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
+    let inv_solutions = solutions.iter().enumerate().fold(
+        FxHashMap::default(),
+        |mut acc: FxHashMap<usize, HybridBitSet<_>>, (index, set)| {
+            for i in set.iter() {
+                acc.entry(i)
+                    .or_insert(HybridBitSet::new_empty(pre.ends.len()))
+                    .insert(index);
+            }
+            acc
+        },
+    );
+
+    for (def_id, inputs) in inputs_map {
+        let local_def_id = some_or!(def_id.as_local(), continue);
+        let mut excludes = FxHashSet::default();
+        let mut params = FxHashMap::default();
+        let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        let mut fun_alias = HybridBitSet::new_empty(pre.ends.len());
+
+        for p in 1..=*inputs {
+            let local = Local::from_usize(p);
+            let index = pre.var_nodes[&(local_def_id, local)].index;
+            params.insert(index, p);
+        }
+
+        for (index, p) in &params {
+            let sol = &solutions[*index];
+
+            for s in sol.iter() {
+                if let Some(inv_sols) = inv_solutions.get(&s) {
+                    fun_alias.union(inv_sols);
+                    for inv_s in inv_sols.iter() {
+                        if inv_s == *index {
+                            continue;
+                        }
+
+                        if params.contains_key(&inv_s) {
+                            let q = params[&inv_s];
+                            excludes.insert(q);
+                            continue;
+                        }
+
+                        inv_alias.entry(inv_s).or_default().insert(*p);
+                    }
+                }
+            }
+        }
+
+        aliases.insert(*def_id, fun_alias);
+        inv_aliases.insert(*def_id, inv_alias);
+        excludess.insert(*def_id, excludes);
+    }
+
+    AliasResults {
+        aliases,
+        inv_aliases,
+        excludess,
+        ends: pre.ends,
+        var_nodes: pre.var_nodes,
+        globals: pre.globals,
+        solutions,
+    }
 }
 
 pub fn post_analyze<'a, 'tcx>(

@@ -6,6 +6,7 @@ use std::{
 
 use etrace::some_or;
 use rustc_abi::VariantIdx;
+use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -18,20 +19,30 @@ use rustc_middle::{
     hir::nested_filter,
     mir::{
         visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor as MVisitor},
-        BasicBlock, Body, Local, Location, StatementKind, Terminator, TerminatorKind,
+        BasicBlock, Body, Const, ConstOperand, ConstValue, Local, Location, Rvalue, Statement,
+        StatementKind, Terminator, TerminatorKind,
     },
     ty::{AdtKind, Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::Analysis as _;
 use rustc_session::config::Input;
-use rustc_span::{def_id::DefId, source_map::SourceMap, Span};
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    source_map::SourceMap,
+    Span,
+};
 use serde::{Deserialize, Serialize};
+use typed_arena::Arena;
 
 use super::{
     domains::*,
     semantics::{CallKind, TransferedTerminator},
 };
-use crate::{compile_util, compile_util::LoHi, graph};
+use crate::{
+    compile_util::{self, LoHi},
+    graph,
+    may_analysis::{self, analysis::AliasResults, bitset::HybridBitSet},
+};
 
 #[derive(Debug, Clone)]
 pub struct AnalysisConfig {
@@ -107,6 +118,27 @@ enum Write {
     None,
 }
 
+#[derive(Clone, Debug, Copy)]
+pub struct PreAnalysisContext<'a> {
+    pub def_id: DefId,
+    pub local_def_id: LocalDefId,
+    pub alias: &'a HybridBitSet<usize>,
+    pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
+    pub pre_data: &'a AliasResults,
+}
+
+impl PreAnalysisContext<'_> {
+    pub fn check_index(&self, index: usize) -> FxHashSet<usize> {
+        // If the local is an alias
+        if self.alias.contains(index) {
+            if let Some(params) = self.inv_alias.get(&index) {
+                return params.clone();
+            }
+        }
+        FxHashSet::default()
+    }
+}
+
 pub fn analyze(
     tcx: TyCtxt<'_>,
     conf: &AnalysisConfig,
@@ -131,6 +163,14 @@ pub fn analyze(
     }
 
     let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
+
+    // Do points-to analysis as a pre_analysis step
+    let arena = Arena::new();
+    let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
+    let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
+    let solutions = may_analysis::analysis::analyze(&pre, &tss, tcx);
+    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map);
+
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
     }
@@ -142,6 +182,7 @@ pub fn analyze(
         .collect();
 
     let mut visitor = FnPtrVisitor::new(tcx);
+    let mut global_visitor = GlobalVisitor::new(tcx);
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
 
     let info_map: FxHashMap<_, _> = funcs
@@ -155,6 +196,8 @@ pub fn analyze(
             let rpo_map = compute_rpo_map(body, &loop_blocks);
             let dead_locals = get_dead_locals(body, tcx);
             let fn_ptr = visitor.fn_ptrs.contains(def_id);
+            global_visitor.visit_body(body);
+            let globals = std::mem::take(&mut global_visitor.globals);
             let info = FuncInfo {
                 inputs,
                 param_tys,
@@ -162,6 +205,7 @@ pub fn analyze(
                 rpo_map,
                 dead_locals,
                 fn_ptr,
+                globals,
             };
             (*def_id, info)
         })
@@ -201,8 +245,16 @@ pub fn analyze(
             let mut need_rerun = false;
             for def_id in def_ids {
                 let start = std::time::Instant::now();
+                let pre_context = PreAnalysisContext {
+                    def_id: *def_id,
+                    local_def_id: def_id.as_local().unwrap(),
+                    alias: pre_data.aliases.get(def_id).unwrap(),
+                    inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
+                    pre_data: &pre_data,
+                };
 
-                let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
+                let mut analyzer =
+                    Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                 let body = tcx.optimized_mir(*def_id);
                 if conf.verbose {
                     println!(
@@ -227,7 +279,7 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
-                let nullable_params = analyzer.find_nullable_params(
+                let mut nullable_params = analyzer.find_nullable_params(
                     tcx,
                     &states,
                     body,
@@ -235,8 +287,10 @@ pub fn analyze(
                     &null_checks_map,
                     &call_info_map,
                 );
+                let alias_params = analyzer.check_reachable_globals(&info_map, &call_graph[def_id]);
+                nullable_params.extend(alias_params);
 
-                let nullable_paths: Vec<_> = nullable_params
+                let exclude_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
                     .collect();
@@ -301,7 +355,7 @@ pub fn analyze(
                     .unwrap_or_default();
                 for st in return_states.values_mut() {
                     st.writes.remove(&nullable_params);
-                    st.add_excludes(nullable_paths.iter().cloned());
+                    st.add_excludes(exclude_paths.iter().cloned());
                 }
                 let summary = FunctionSummary::new(init_state, return_states);
                 results.insert(*def_id, states);
@@ -324,7 +378,15 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let mut analyzer = Analyzer::new(tcx, &info_map[def_id], conf, &summaries);
+                    let pre_context = PreAnalysisContext {
+                        def_id: *def_id,
+                        local_def_id: def_id.as_local().unwrap(),
+                        alias: pre_data.aliases.get(def_id).unwrap(),
+                        inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
+                        pre_data: &pre_data,
+                    };
+                    let mut analyzer =
+                        Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
                     let summary = &summaries[def_id];
                     let return_ptrs = analyzer.get_return_ptrs(summary);
@@ -463,6 +525,7 @@ struct FuncInfo {
     rpo_map: BTreeMap<BasicBlock, usize>,
     dead_locals: Vec<DenseBitSet<Local>>,
     fn_ptr: bool,
+    globals: FxHashSet<DefId>,
 }
 
 impl FuncInfo {
@@ -481,6 +544,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
+    pub pre_context: PreAnalysisContext<'a>,
 }
 
 struct AnalyzedBody {
@@ -503,6 +567,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         info: &'a FuncInfo,
         conf: &'a AnalysisConfig,
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
+        pre_context: PreAnalysisContext<'a>,
     ) -> Self {
         Self {
             tcx,
@@ -511,6 +576,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             summaries,
             ptr_params: vec![],
             call_args: BTreeMap::new(),
+            pre_context,
         }
     }
 
@@ -793,6 +859,28 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
+    // Check if the global variables that is reachable from the function
+    // is an alias of the function parameters
+    fn check_reachable_globals(
+        &self,
+        info_map: &FxHashMap<DefId, FuncInfo>,
+        callees: &FxHashSet<DefId>,
+    ) -> BTreeSet<usize> {
+        let mut indexes = FxHashSet::default();
+        for callee in callees {
+            let globals = info_map[callee].globals.iter().filter_map(|def_id| {
+                let local_id = def_id.as_local()?;
+                self.pre_context.pre_data.globals.get(&local_id).copied()
+            });
+            indexes.extend(globals);
+        }
+
+        indexes
+            .into_iter()
+            .flat_map(|index| self.pre_context.check_index(index))
+            .collect()
+    }
+
     fn find_output_params(
         &self,
         summary: &FunctionSummary,
@@ -992,13 +1080,24 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     }
 
     fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
+        let excludess = self
+            .pre_context
+            .pre_data
+            .excludess
+            .get(&self.pre_context.def_id)
+            .unwrap();
+
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
         start_state.nulls = MustPathSet::top();
 
         for i in 1..=self.info.inputs {
-            let ty = &body.local_decls[Local::from_usize(i)].ty;
+            let local = Local::from_usize(i);
+            let ty = &body.local_decls[local].ty;
             let v = if let TyKind::RawPtr(ty, ..) = ty.kind() {
+                if excludess.contains(&i) {
+                    start_state.excludes.insert(AbsPath(vec![i]));
+                }
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
@@ -1375,6 +1474,53 @@ impl<'tcx> MVisitor<'tcx> for LocalVisitor<'tcx> {
                 }
             }
         }
+    }
+}
+
+struct GlobalVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    globals: FxHashSet<DefId>,
+}
+
+impl<'tcx> GlobalVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            globals: FxHashSet::default(),
+        }
+    }
+}
+
+impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
+    fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _location: Location) {
+        if let Const::Val(value, ty) = constant.const_ {
+            match value {
+                ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
+                    if let GlobalAlloc::Static(def_id) =
+                        self.tcx.global_alloc(ptr.provenance.alloc_id())
+                    {
+                        self.globals.insert(def_id);
+                    }
+                }
+                ConstValue::ZeroSized => {
+                    let TyKind::FnDef(def_id, _) = ty.kind() else {
+                        unreachable!()
+                    };
+                    self.globals.insert(*def_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn visit_statement(&mut self, stmt: &Statement<'tcx>, location: Location) {
+        let StatementKind::Assign(box (_l, r)) = &stmt.kind else {
+            return;
+        };
+        if let Rvalue::ThreadLocalRef(def_id) = r {
+            self.globals.insert(*def_id);
+        }
+        self.super_statement(stmt, location);
     }
 }
 
