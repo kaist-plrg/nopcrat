@@ -124,6 +124,7 @@ pub struct PreAnalysisContext<'a> {
     pub local_def_id: LocalDefId,
     pub alias: &'a HybridBitSet<usize>,
     pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
+    pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub pre_data: &'a AliasResults,
 }
 
@@ -134,6 +135,14 @@ impl PreAnalysisContext<'_> {
             if let Some(params) = self.inv_alias.get(&index) {
                 return params.clone();
             }
+        }
+        FxHashSet::default()
+    }
+
+    pub fn check_index_global(&self, index: usize) -> FxHashSet<usize> {
+        if self.inv_param.contains_key(&index) {
+            let params = self.inv_param.get(&index).unwrap();
+            return params.clone();
         }
         FxHashSet::default()
     }
@@ -169,7 +178,7 @@ pub fn analyze(
     let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
     let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
     let solutions = may_analysis::analysis::analyze(&pre, &tss, tcx);
-    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map);
+    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, tcx);
 
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
@@ -225,7 +234,6 @@ pub fn analyze(
     let mut is_units = FxHashMap::default();
 
     let mut rcfws = FxHashMap::default();
-
     for id in &po {
         let def_ids = &elems[id];
         let recursive = if def_ids.len() == 1 {
@@ -250,6 +258,7 @@ pub fn analyze(
                     local_def_id: def_id.as_local().unwrap(),
                     alias: pre_data.aliases.get(def_id).unwrap(),
                     inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
+                    inv_param: pre_data.inv_params.get(def_id).unwrap(),
                     pre_data: &pre_data,
                 };
 
@@ -383,6 +392,7 @@ pub fn analyze(
                         local_def_id: def_id.as_local().unwrap(),
                         alias: pre_data.aliases.get(def_id).unwrap(),
                         inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
+                        inv_param: pre_data.inv_params.get(def_id).unwrap(),
                         pre_data: &pre_data,
                     };
                     let mut analyzer =
@@ -877,7 +887,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         indexes
             .into_iter()
-            .flat_map(|index| self.pre_context.check_index(index))
+            .flat_map(|index| self.pre_context.check_index_global(index))
             .collect()
     }
 
@@ -1493,7 +1503,7 @@ impl<'tcx> GlobalVisitor<'tcx> {
 
 impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _location: Location) {
-        if let Const::Val(value, ty) = constant.const_ {
+        if let Const::Val(value, _ty) = constant.const_ {
             match value {
                 ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
                     if let GlobalAlloc::Static(def_id) =
@@ -1501,12 +1511,6 @@ impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
                     {
                         self.globals.insert(def_id);
                     }
-                }
-                ConstValue::ZeroSized => {
-                    let TyKind::FnDef(def_id, _) = ty.kind() else {
-                        unreachable!()
-                    };
-                    self.globals.insert(*def_id);
                 }
                 _ => {}
             }

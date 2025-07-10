@@ -56,6 +56,7 @@ pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for Hybri
 pub struct AliasResults {
     pub aliases: FxHashMap<DefId, HybridBitSet<usize>>,
     pub inv_aliases: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
+    pub inv_params: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
     pub excludess: FxHashMap<DefId, FxHashSet<usize>>,
     pub ends: Vec<usize>,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
@@ -371,10 +372,14 @@ pub fn compute_alias(
     pre: PreAnalysisData<'_>,
     solutions: Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
+    tcx: TyCtxt<'_>,
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
     let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
     let mut excludess: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
+    let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
+
+    // location -> set of indexes which may point to the location
     let inv_solutions = solutions.iter().enumerate().fold(
         FxHashMap::default(),
         |mut acc: FxHashMap<usize, HybridBitSet<_>>, (index, set)| {
@@ -388,22 +393,44 @@ pub fn compute_alias(
     );
 
     for (def_id, inputs) in inputs_map {
+        let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut excludes = FxHashSet::default();
         let mut params = FxHashMap::default();
+        let mut locals = HybridBitSet::new_empty(pre.ends.len());
+        // Map of alias to the set of parameters
         let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        // Set of aliases for the function parameters
         let mut fun_alias = HybridBitSet::new_empty(pre.ends.len());
+        // Map of location to set of parameters that may point to the location
+        let mut inv_param: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
 
-        for p in 1..=*inputs {
-            let local = Local::from_usize(p);
-            let index = pre.var_nodes[&(local_def_id, local)].index;
-            params.insert(index, p);
+        for (local, decl) in body.local_decls.iter_enumerated() {
+            let index = local.index();
+            let g_index = pre.var_nodes[&(local_def_id, local)].index;
+
+            if (1..=*inputs).contains(&index) {
+                // In case the local is a parmeter whose type is a raw pointer
+                let ty = decl.ty;
+                let TyKind::RawPtr(..) = ty.kind() else {
+                    continue;
+                };
+                params.insert(g_index, index);
+            }
+            locals.insert(g_index);
         }
 
         for (index, p) in &params {
             let sol = &solutions[*index];
-
             for s in sol.iter() {
+                inv_param.entry(s)
+                    .or_default()
+                    .insert(*p);
+
+                    if locals.contains(s) {
+                    continue;
+                }
+
                 if let Some(inv_sols) = inv_solutions.get(&s) {
                     fun_alias.union(inv_sols);
                     for inv_s in inv_sols.iter() {
@@ -425,12 +452,14 @@ pub fn compute_alias(
 
         aliases.insert(*def_id, fun_alias);
         inv_aliases.insert(*def_id, inv_alias);
+        inv_params.insert(*def_id, inv_param);
         excludess.insert(*def_id, excludes);
     }
 
     AliasResults {
         aliases,
         inv_aliases,
+        inv_params,
         excludess,
         ends: pre.ends,
         var_nodes: pre.var_nodes,
