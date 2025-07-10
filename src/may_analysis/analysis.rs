@@ -423,11 +423,9 @@ pub fn compute_alias(
         for (index, p) in &params {
             let sol = &solutions[*index];
             for s in sol.iter() {
-                inv_param.entry(s)
-                    .or_default()
-                    .insert(*p);
+                inv_param.entry(s).or_default().insert(*p);
 
-                    if locals.contains(s) {
+                if locals.contains(s) {
                     continue;
                 }
 

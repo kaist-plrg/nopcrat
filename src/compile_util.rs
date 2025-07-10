@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use rustc_interface::{create_and_enter_global_ctxt, passes::parse, Config};
 use rustc_middle::{
     mir::{Body, TerminatorKind},
-    ty::TyCtxt
+    ty::TyCtxt,
 };
 use rustc_session::{
     config::{CrateType, ErrorOutputType, Input, Options},

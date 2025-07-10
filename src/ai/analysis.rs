@@ -1503,16 +1503,9 @@ impl<'tcx> GlobalVisitor<'tcx> {
 
 impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
     fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, _location: Location) {
-        if let Const::Val(value, _ty) = constant.const_ {
-            match value {
-                ConstValue::Scalar(Scalar::Ptr(ptr, _)) => {
-                    if let GlobalAlloc::Static(def_id) =
-                        self.tcx.global_alloc(ptr.provenance.alloc_id())
-                    {
-                        self.globals.insert(def_id);
-                    }
-                }
-                _ => {}
+        if let Const::Val(ConstValue::Scalar(Scalar::Ptr(ptr, _)), _) = constant.const_ {
+            if let GlobalAlloc::Static(def_id) = self.tcx.global_alloc(ptr.provenance.alloc_id()) {
+                self.globals.insert(def_id);
             }
         }
     }
