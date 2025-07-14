@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use etrace::some_or;
@@ -41,7 +41,7 @@ use super::{
 use crate::{
     compile_util::{self, LoHi},
     graph,
-    may_analysis::{self, analysis::AliasResults, bitset::HybridBitSet},
+    may_analysis::{self, analysis::LocNode, bitset::HybridBitSet},
 };
 
 #[derive(Debug, Clone)]
@@ -51,6 +51,9 @@ pub struct AnalysisConfig {
     pub verbose: bool,
     pub print_functions: BTreeSet<String>,
     pub function_times: Option<usize>,
+    pub dump_sol: Option<PathBuf>,
+    pub use_sol: Option<PathBuf>,
+    pub strict_alias: bool,
 }
 
 impl Default for AnalysisConfig {
@@ -61,6 +64,9 @@ impl Default for AnalysisConfig {
             verbose: false,
             print_functions: BTreeSet::new(),
             function_times: None,
+            dump_sol: None,
+            use_sol: None,
+            strict_alias: false,
         }
     }
 }
@@ -118,14 +124,16 @@ enum Write {
     None,
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
     pub def_id: DefId,
     pub local_def_id: LocalDefId,
     pub alias: &'a HybridBitSet<usize>,
     pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
-    pub pre_data: &'a AliasResults,
+    pub globals: &'a FxHashMap<LocalDefId, usize>,
+    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
+    pub skip_checks: FxHashMap<Local, FxHashSet<usize>>,
 }
 
 impl PreAnalysisContext<'_> {
@@ -173,13 +181,6 @@ pub fn analyze(
 
     let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
 
-    // Do points-to analysis as a pre_analysis step
-    let arena = Arena::new();
-    let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
-    let solutions = may_analysis::analysis::analyze(&pre, &tss, tcx);
-    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, tcx);
-
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
     }
@@ -220,6 +221,24 @@ pub fn analyze(
         })
         .collect();
 
+    let arena = Arena::new();
+    let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
+    let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
+    let solutions = if let Some(path) = &conf.use_sol {
+        let arr = std::fs::read(path).unwrap();
+        may_analysis::analysis::deserialize_solutions(&arr)
+    } else {
+        may_analysis::analysis::analyze(&pre, &tss, tcx)
+    };
+
+    if let Some(path) = &conf.dump_sol {
+        let arr = may_analysis::analysis::serialize_solutions(&solutions);
+        std::fs::write(path, arr).unwrap();
+    }
+
+    let pre_data =
+        may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, conf.strict_alias, tcx);
+
     let mut ptr_params_map = FxHashMap::default();
     let mut output_params_map = FxHashMap::default();
     let mut summaries = FxHashMap::default();
@@ -259,7 +278,9 @@ pub fn analyze(
                     alias: pre_data.aliases.get(def_id).unwrap(),
                     inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
                     inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                    pre_data: &pre_data,
+                    globals: &pre_data.globals,
+                    var_nodes: &pre_data.var_nodes,
+                    skip_checks: FxHashMap::default(),
                 };
 
                 let mut analyzer =
@@ -393,7 +414,9 @@ pub fn analyze(
                         alias: pre_data.aliases.get(def_id).unwrap(),
                         inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
                         inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                        pre_data: &pre_data,
+                        globals: &pre_data.globals,
+                        var_nodes: &pre_data.var_nodes,
+                        skip_checks: FxHashMap::default(),
                     };
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -880,7 +903,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         for callee in callees {
             let globals = info_map[callee].globals.iter().filter_map(|def_id| {
                 let local_id = def_id.as_local()?;
-                self.pre_context.pre_data.globals.get(&local_id).copied()
+                self.pre_context.globals.get(&local_id).copied()
             });
             indexes.extend(globals);
         }
@@ -1090,13 +1113,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     }
 
     fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
-        let excludess = self
-            .pre_context
-            .pre_data
-            .excludess
-            .get(&self.pre_context.def_id)
-            .unwrap();
-
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
         start_state.nulls = MustPathSet::top();
@@ -1105,9 +1121,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let local = Local::from_usize(i);
             let ty = &body.local_decls[local].ty;
             let v = if let TyKind::RawPtr(ty, ..) = ty.kind() {
-                if excludess.contains(&i) {
-                    start_state.excludes.insert(AbsPath(vec![i]));
-                }
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);

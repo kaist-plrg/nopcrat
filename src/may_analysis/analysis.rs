@@ -57,7 +57,6 @@ pub struct AliasResults {
     pub aliases: FxHashMap<DefId, HybridBitSet<usize>>,
     pub inv_aliases: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
     pub inv_params: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
-    pub excludess: FxHashMap<DefId, FxHashSet<usize>>,
     pub ends: Vec<usize>,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
     pub globals: FxHashMap<LocalDefId, usize>,
@@ -169,11 +168,8 @@ pub fn pre_analyze<'a, 'tcx>(
         .collect();
     let fn_ptrs = visitor.fn_ptrs;
 
-    // local_def_id -> global_index : item with local_def_id has global_index
     let mut globals = FxHashMap::default();
-    // global_index -> local_def_id : global_index is a function with local_def_id
     let mut inv_fns = FxHashMap::default();
-    // local -> global_index
     let mut vars = FxHashMap::default();
     let mut ends = vec![];
     let mut alloc_ends: Vec<usize> = vec![];
@@ -181,11 +177,10 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut graph = FxHashMap::default();
     let mut union_offsets = FxHashMap::default();
     let mut index_prefixes = FxHashMap::default();
-    // indirect calls using the var of the global index
+
     let mut indirect_calls: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
-        // not c function
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
         let global_index = ends.len();
         globals.insert(item.local_def_id, global_index);
@@ -200,7 +195,6 @@ pub fn pre_analyze<'a, 'tcx>(
         for _ in 0..item.body.arg_count {
             params.push(local_decls.next().unwrap());
         }
-        // params -> ret -> other locals
         let local_decls = params
             .into_iter()
             .chain(std::iter::once(ret))
@@ -219,12 +213,10 @@ pub fn pre_analyze<'a, 'tcx>(
             var_nodes.insert((item.local_def_id, local), node);
             compute_ends(ty, &mut ends);
 
-            // if it is a function return value
             if fn_ptr && local.index() == 0 {
                 ends[global_index] = ends.len() - 1;
             }
 
-            // if it is a pointer - modeling heap objects?
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
                 let mut ends = vec![];
                 let ty = tss.tys[&ty];
@@ -372,11 +364,11 @@ pub fn compute_alias(
     pre: PreAnalysisData<'_>,
     solutions: Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
+    strict: bool,
     tcx: TyCtxt<'_>,
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
     let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
-    let mut excludess: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
 
     // location -> set of indexes which may point to the location
@@ -395,13 +387,12 @@ pub fn compute_alias(
     for (def_id, inputs) in inputs_map {
         let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
-        let mut excludes = FxHashSet::default();
         let mut params = FxHashMap::default();
         let mut locals = HybridBitSet::new_empty(pre.ends.len());
-        // Map of alias to the set of parameters
-        let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         // Set of aliases for the function parameters
         let mut fun_alias = HybridBitSet::new_empty(pre.ends.len());
+        // Map of alias to the set of parameters
+        let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         // Map of location to set of parameters that may point to the location
         let mut inv_param: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
 
@@ -421,28 +412,29 @@ pub fn compute_alias(
         }
 
         for (index, p) in &params {
-            let sol = &solutions[*index];
-            for s in sol.iter() {
+            let sol = if strict {
+                solutions[*index]
+                    .iter()
+                    .filter(|s| !locals.contains(*s))
+                    .collect::<FxHashSet<usize>>()
+            } else {
+                let globals = pre.globals.values().collect::<FxHashSet<_>>();
+                solutions[*index]
+                    .iter()
+                    .filter(|s| globals.contains(s) && !locals.contains(*s))
+                    .collect::<FxHashSet<usize>>()
+            };
+
+            for s in sol {
                 inv_param.entry(s).or_default().insert(*p);
 
-                if locals.contains(s) {
-                    continue;
-                }
-
                 if let Some(inv_sols) = inv_solutions.get(&s) {
-                    fun_alias.union(inv_sols);
                     for inv_s in inv_sols.iter() {
                         if inv_s == *index {
                             continue;
                         }
-
-                        if params.contains_key(&inv_s) {
-                            let q = params[&inv_s];
-                            excludes.insert(q);
-                            continue;
-                        }
-
                         inv_alias.entry(inv_s).or_default().insert(*p);
+                        fun_alias.insert(inv_s);
                     }
                 }
             }
@@ -451,14 +443,12 @@ pub fn compute_alias(
         aliases.insert(*def_id, fun_alias);
         inv_aliases.insert(*def_id, inv_alias);
         inv_params.insert(*def_id, inv_param);
-        excludess.insert(*def_id, excludes);
     }
 
     AliasResults {
         aliases,
         inv_aliases,
         inv_params,
-        excludess,
         ends: pre.ends,
         var_nodes: pre.var_nodes,
         globals: pre.globals,

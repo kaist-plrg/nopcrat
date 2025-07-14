@@ -72,7 +72,7 @@ impl TransferedTerminator {
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     pub fn transfer_statement(
-        &self,
+        &mut self,
         stmt: &Statement<'tcx>,
         state: &AbsState,
     ) -> (AbsState, BTreeSet<AbsPath>) {
@@ -998,9 +998,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(local.index());
-            let aliases = self.check_param_aliases(ptr, local);
+            let excludes = self.check_param_aliases(ptr, local);
             let (v, reads) = self.read_ptr(&ptr.ptrv, &projection, state);
-            (v, reads, aliases)
+            (v, reads, excludes)
         } else {
             let v = state.local.get(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
@@ -1212,8 +1212,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(local.index());
-            let aliases = self.check_param_aliases(ptr, local);
-            new_state.add_excludes(aliases.into_iter());
+            let excludes = self.check_param_aliases(ptr, local);
+            new_state.add_excludes(excludes.into_iter());
             self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
             self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {
@@ -1390,19 +1390,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     }
 
     fn check_param_aliases(&self, ptr: &AbsValue, local: Local) -> Vec<AbsPath> {
-        // If the local is an alias created in the function, skip the check
-        if let AbsPtr::Set(ptrs) = &ptr.ptrv {
-            if ptrs.len() == 1 {
-                let ptr = ptrs.first().unwrap();
-                if matches!(ptr.base, AbsBase::Arg(_)) {
-                    return Vec::new();
-                }
-            }
-        }
-
         let Some(index) = self
             .pre_context
-            .pre_data
             .var_nodes
             .get(&(self.pre_context.local_def_id, local))
             .map(|node| node.index)
@@ -1410,10 +1399,21 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             return Vec::new();
         };
 
-        self.pre_context
-            .check_index(index)
+        let mut excludes = self.pre_context.check_index(index);
+
+        // If the local is an alias created in the function, skip the check for the param
+        if let AbsPtr::Set(ptrs) = &ptr.ptrv {
+            if ptrs.len() == 1 {
+                let ptr = ptrs.first().unwrap();
+                if let AbsBase::Arg(arg) = ptr.base {
+                    excludes.remove(&self.ptr_params[arg]);
+                }
+            }
+        }
+
+        excludes
             .into_iter()
-            .flat_map(|i| self.expands_path(&AbsPath(vec![i])))
-            .collect()
+            .map(|i| AbsPath(vec![i]))
+            .collect::<Vec<AbsPath>>()
     }
 }
