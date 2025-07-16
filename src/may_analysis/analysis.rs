@@ -417,7 +417,6 @@ fn check_type<'tcx>(
     index1: usize,
     index2: usize,
     tcx: TyCtxt<'tcx>,
-    num_unsized: &mut i32,
 ) -> bool {
     let ty1 = pre.index_info.get_ty(index1);
     let ty2 = pre.index_info.get_ty(index2);
@@ -428,12 +427,13 @@ fn check_type<'tcx>(
             if ty1 == ty2 {
                 return true;
             }
-            let typing_env1 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index1).to_def_id());
-            let typing_env2 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index2).to_def_id());
+            let typing_env1 =
+                TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index1).to_def_id());
+            let typing_env2 =
+                TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index2).to_def_id());
             let is_sized1 = ty1.is_sized(tcx, typing_env1);
             let is_sized2 = ty2.is_sized(tcx, typing_env2);
             if !is_sized1 || !is_sized2 {
-                *num_unsized += 1;
                 return true;
             }
 
@@ -456,22 +456,17 @@ pub fn compute_alias<'tcx>(
     let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
     let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
-
-    // location -> set of indexes which may point to the location
-    let inv_solutions = solutions.iter().enumerate().fold(
-        FxHashMap::default(),
-        |mut acc: FxHashMap<usize, HybridBitSet<_>>, (index, set)| {
-            for i in set.iter() {
-                acc.entry(i)
-                    .or_insert(HybridBitSet::new_empty(pre.index_info.len()))
-                    .insert(index);
-            }
-            acc
-        },
-    );
+    let globals = if strict {
+        None
+    } else {
+        let mut globals = HybridBitSet::new_empty(pre.index_info.len());
+        for g_index in pre.globals.values() {
+            globals.insert(*g_index);
+        }
+        Some(globals)
+    };
 
     for (def_id, inputs) in inputs_map {
-        let mut num_unsized = 0;
         let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut params = FxHashMap::default();
@@ -499,50 +494,25 @@ pub fn compute_alias<'tcx>(
         }
 
         for (index, p) in &params {
-            if strict {
-                let mut sol = solutions[*index].clone();
-                sol.subtract(&locals);
-
-                for s in sol.iter() {
-                    inv_param.entry(s).or_default().insert(*p);
+            let mut sol = solutions[*index].clone();
+            sol.subtract(&locals);
+            if !strict {
+                sol.intersect(globals.as_ref().unwrap());
+            }
+            for s in sol.iter() {
+                inv_param.entry(s).or_default().insert(*p);
+            }
+            for (cand_index, cand_sol) in solutions.iter().enumerate() {
+                if cand_index == *index || !check_type(&pre, *index, cand_index, tcx) {
+                    continue;
                 }
-                for cand_index in 0..pre.index_info.len() {
-                    if cand_index == *index {
-                        continue;
-                    }
-                    let mut cand = solutions[cand_index].clone();
-                    cand.intersect(&sol);
-                    if !cand.is_empty() {
-                        inv_alias.entry(cand_index).or_default().insert(*p);
-                        fun_alias.insert(cand_index);
-                    }
+                let mut cand = cand_sol.clone();
+                cand.intersect(&sol);
+                if !cand.is_empty() {
+                    inv_alias.entry(cand_index).or_default().insert(*p);
+                    fun_alias.insert(cand_index);
                 }
-            } else {
-                let globals = pre.globals.values().collect::<FxHashSet<_>>();
-                let sol = solutions[*index]
-                    .iter()
-                    .filter(|s| globals.contains(s) && !locals.contains(*s))
-                    .collect::<FxHashSet<usize>>();
-
-                for s in sol {
-                    inv_param.entry(s).or_default().insert(*p);
-
-                    if let Some(inv_sols) = inv_solutions.get(&s) {
-                        for inv_s in inv_sols.iter() {
-                            if inv_alias.entry(inv_s).or_default().contains(p) {
-                                continue;
-                            }
-                            if inv_s == *index
-                                || !check_type(&pre, *index, inv_s, tcx, &mut num_unsized)
-                            {
-                                continue;
-                            }
-                            inv_alias.entry(inv_s).or_default().insert(*p);
-                            fun_alias.insert(inv_s);
-                        }
-                    }
-                }
-            };
+            }
         }
 
         aliases.insert(*def_id, fun_alias);
@@ -718,7 +688,7 @@ pub fn post_analyze<'a, 'tcx>(
 fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id: LocalDefId) {
     match ty {
         TyShape::Primitive(pty) => {
-            ends.push(ends.len(), pty.clone(), def_id);
+            ends.push(ends.len(), *pty, def_id);
         }
         TyShape::Array(t, _) => compute_ends(t, ends, def_id),
         TyShape::Struct(len, ts, _) => {
