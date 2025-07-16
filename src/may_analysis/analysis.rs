@@ -14,7 +14,7 @@ use rustc_middle::{
         Operand, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         UnOp,
     },
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind, TypingEnv},
 };
 use rustc_span::{
     def_id::{DefId, LocalDefId},
@@ -32,6 +32,50 @@ pub struct BodyItem<'tcx> {
 }
 
 #[derive(Debug)]
+struct IndexInfo<'tcx> {
+    pub ends: Vec<usize>,
+    tys: Vec<Ty<'tcx>>,
+    owners: Vec<LocalDefId>,
+}
+
+impl<'tcx> IndexInfo<'tcx> {
+    fn new() -> Self {
+        IndexInfo {
+            ends: vec![],
+            tys: vec![],
+            owners: vec![],
+        }
+    }
+
+    fn len(&self) -> usize {
+        assert!(self.ends.len() == self.tys.len());
+        assert!(self.ends.len() == self.owners.len());
+        self.ends.len()
+    }
+
+    fn push(&mut self, end: usize, ty: Ty<'tcx>, owner: LocalDefId) {
+        self.ends.push(end);
+        self.tys.push(ty);
+        self.owners.push(owner);
+    }
+
+    fn get_ty(&self, index: usize) -> Ty<'tcx> {
+        assert!(index < self.tys.len());
+        self.tys[index]
+    }
+
+    fn get_owner(&self, index: usize) -> LocalDefId {
+        assert!(index < self.owners.len());
+        self.owners[index]
+    }
+
+    fn modify_end(&mut self, index: usize, new: usize) {
+        assert!(index < self.ends.len());
+        self.ends[index] = new;
+    }
+}
+
+#[derive(Debug)]
 pub struct PreAnalysisData<'tcx> {
     bodies: Vec<BodyItem<'tcx>>,
     alloc_fns: FxHashSet<LocalDefId>,
@@ -39,7 +83,7 @@ pub struct PreAnalysisData<'tcx> {
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
     indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, usize>>,
 
-    pub ends: Vec<usize>,
+    index_info: IndexInfo<'tcx>,
     pub globals: FxHashMap<LocalDefId, usize>,
     pub inv_fns: FxHashMap<usize, LocalDefId>,
     vars: FxHashMap<Var, usize>,
@@ -171,8 +215,9 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut globals = FxHashMap::default();
     let mut inv_fns = FxHashMap::default();
     let mut vars = FxHashMap::default();
-    let mut ends = vec![];
+    let mut index_info = IndexInfo::new();
     let mut alloc_ends: Vec<usize> = vec![];
+    let mut alloc_tys: Vec<Ty<'_>> = vec![];
     let mut allocs = vec![];
     let mut graph = FxHashMap::default();
     let mut union_offsets = FxHashMap::default();
@@ -182,7 +227,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
-        let global_index = ends.len();
+        let global_index = index_info.len();
         globals.insert(item.local_def_id, global_index);
 
         if item.is_fn {
@@ -201,31 +246,35 @@ pub fn pre_analyze<'a, 'tcx>(
             .chain(local_decls);
 
         for (local, local_decl) in local_decls {
-            vars.insert(Var::Local(item.local_def_id, local), ends.len());
+            vars.insert(Var::Local(item.local_def_id, local), index_info.len());
             let ty = tss.tys[&local_decl.ty];
             let node = add_edges(
                 ty,
-                ends.len(),
+                index_info.len(),
                 &mut graph,
                 &mut index_prefixes,
                 &mut union_offsets,
             );
             var_nodes.insert((item.local_def_id, local), node);
-            compute_ends(ty, &mut ends);
+            compute_ends(ty, &mut index_info, item.local_def_id);
 
             if fn_ptr && local.index() == 0 {
-                ends[global_index] = ends.len() - 1;
+                index_info.modify_end(global_index, index_info.len() - 1);
             }
 
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
-                let mut ends = vec![];
+                let mut index_info = IndexInfo::new();
                 let ty = tss.tys[&ty];
-                compute_ends(ty, &mut ends);
-                for (i, end) in ends.into_iter().enumerate() {
+                compute_ends(ty, &mut index_info, item.local_def_id);
+                for (i, (end, pty)) in index_info.ends.into_iter().zip(index_info.tys).enumerate() {
                     if alloc_ends.len() > i {
-                        alloc_ends[i] = alloc_ends[i].max(end);
+                        if alloc_ends[i] < end {
+                            alloc_ends[i] = end;
+                            alloc_tys[i] = pty;
+                        }
                     } else {
                         alloc_ends.push(end);
+                        alloc_tys.push(pty);
                     }
                 }
             }
@@ -269,10 +318,13 @@ pub fn pre_analyze<'a, 'tcx>(
     }
 
     for alloc in allocs {
-        let len = ends.len();
+        let len = index_info.len();
         vars.insert(alloc, len);
-        for end in &alloc_ends {
-            ends.push(len + *end);
+        for (end, ty) in alloc_ends.iter().zip(alloc_tys.iter()) {
+            let Var::Alloc(alloc_def_id, _) = alloc else {
+                unreachable!()
+            };
+            index_info.push(len + *end, *ty, alloc_def_id);
         }
     }
 
@@ -281,7 +333,7 @@ pub fn pre_analyze<'a, 'tcx>(
         alloc_fns,
         call_graph,
         indirect_calls,
-        ends,
+        index_info,
         globals,
         inv_fns,
         vars,
@@ -301,7 +353,7 @@ pub fn analyze<'a, 'tcx>(
         tcx,
         tss,
         pre,
-        graph: Graph::new(pre.ends.len()),
+        graph: Graph::new(pre.index_info.len()),
     };
     for item in &pre.bodies {
         // println!("{}", compile_util::body_to_str(item.body));
@@ -315,7 +367,7 @@ pub fn analyze<'a, 'tcx>(
             analyzer.transfer_term(terminator, ctx, block);
         }
     }
-    analyzer.graph.solve(&pre.ends)
+    analyzer.graph.solve(&pre.index_info.ends)
 }
 
 pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
@@ -360,12 +412,46 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     solutions
 }
 
-pub fn compute_alias(
-    pre: PreAnalysisData<'_>,
+fn check_type<'tcx>(
+    pre: &PreAnalysisData<'tcx>,
+    index1: usize,
+    index2: usize,
+    tcx: TyCtxt<'tcx>,
+    num_unsized: &mut i32,
+) -> bool {
+    let ty1 = pre.index_info.get_ty(index1);
+    let ty2 = pre.index_info.get_ty(index2);
+
+    match (ty1.kind(), ty2.kind()) {
+        (TyKind::RawPtr(ty1, _), TyKind::RawPtr(ty2, _))
+        | (TyKind::RawPtr(ty1, _), TyKind::Ref(_, ty2, _)) => {
+            if ty1 == ty2 {
+                return true;
+            }
+            let typing_env1 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index1).to_def_id());
+            let typing_env2 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index2).to_def_id());
+            let is_sized1 = ty1.is_sized(tcx, typing_env1);
+            let is_sized2 = ty2.is_sized(tcx, typing_env2);
+            if !is_sized1 || !is_sized2 {
+                *num_unsized += 1;
+                return true;
+            }
+
+            let layout1 = tcx.layout_of(typing_env1.as_query_input(*ty1)).unwrap();
+            let layout2 = tcx.layout_of(typing_env2.as_query_input(*ty2)).unwrap();
+
+            layout1.size == layout2.size
+        }
+        (_, _) => false,
+    }
+}
+
+pub fn compute_alias<'tcx>(
+    pre: PreAnalysisData<'tcx>,
     solutions: Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
     strict: bool,
-    tcx: TyCtxt<'_>,
+    tcx: TyCtxt<'tcx>,
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
     let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
@@ -377,7 +463,7 @@ pub fn compute_alias(
         |mut acc: FxHashMap<usize, HybridBitSet<_>>, (index, set)| {
             for i in set.iter() {
                 acc.entry(i)
-                    .or_insert(HybridBitSet::new_empty(pre.ends.len()))
+                    .or_insert(HybridBitSet::new_empty(pre.index_info.len()))
                     .insert(index);
             }
             acc
@@ -385,12 +471,13 @@ pub fn compute_alias(
     );
 
     for (def_id, inputs) in inputs_map {
+        let mut num_unsized = 0;
         let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut params = FxHashMap::default();
-        let mut locals = HybridBitSet::new_empty(pre.ends.len());
+        let mut locals = HybridBitSet::new_empty(pre.index_info.len());
         // Set of aliases for the function parameters
-        let mut fun_alias = HybridBitSet::new_empty(pre.ends.len());
+        let mut fun_alias = HybridBitSet::new_empty(pre.index_info.len());
         // Map of alias to the set of parameters
         let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         // Map of location to set of parameters that may point to the location
@@ -430,7 +517,12 @@ pub fn compute_alias(
 
                 if let Some(inv_sols) = inv_solutions.get(&s) {
                     for inv_s in inv_sols.iter() {
-                        if inv_s == *index {
+                        if inv_alias.entry(inv_s).or_default().contains(p) {
+                            continue;
+                        }
+                        if inv_s == *index
+                            || !check_type(&pre, *index, inv_s, tcx, &mut num_unsized)
+                        {
                             continue;
                         }
                         inv_alias.entry(inv_s).or_default().insert(*p);
@@ -449,7 +541,7 @@ pub fn compute_alias(
         aliases,
         inv_aliases,
         inv_params,
-        ends: pre.ends,
+        ends: pre.index_info.ends,
         var_nodes: pre.var_nodes,
         globals: pre.globals,
         solutions,
@@ -471,13 +563,13 @@ pub fn post_analyze<'a, 'tcx>(
         }
         pre.graph.insert(node, LocEdges::Deref(succs));
     }
-    let mut address_taken_indices = HybridBitSet::new_empty(pre.ends.len());
+    let mut address_taken_indices = HybridBitSet::new_empty(pre.index_info.len());
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
-    for (i, _) in pre.ends.iter().enumerate() {
+    for (i, _) in pre.index_info.ends.iter().enumerate() {
         if address_taken_indices.contains(i) {
-            for j in (i + 1)..=pre.ends[i] {
+            for j in (i + 1)..=pre.index_info.ends[i] {
                 address_taken_indices.insert(j);
             }
         }
@@ -487,7 +579,7 @@ pub fn post_analyze<'a, 'tcx>(
         tcx,
         pre: &pre,
         tss,
-        graph: Graph::new(pre.ends.len()),
+        graph: Graph::new(pre.index_info.len()),
     };
     let mut writes: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut bitfield_writes: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
@@ -504,7 +596,15 @@ pub fn post_analyze<'a, 'tcx>(
                     block,
                     statement_index,
                 };
-                compute_writes(l, location, &pre.ends, &solutions, ctx, &analyzer, writes);
+                compute_writes(
+                    l,
+                    location,
+                    &pre.index_info.ends,
+                    &solutions,
+                    ctx,
+                    &analyzer,
+                    writes,
+                );
             }
             if let TerminatorKind::Call {
                 func,
@@ -520,7 +620,7 @@ pub fn post_analyze<'a, 'tcx>(
                 compute_writes(
                     *destination,
                     location,
-                    &pre.ends,
+                    &pre.index_info.ends,
                     &solutions,
                     ctx,
                     &analyzer,
@@ -532,7 +632,7 @@ pub fn post_analyze<'a, 'tcx>(
                     location,
                     tss,
                     tcx,
-                    &pre.ends,
+                    &pre.index_info.ends,
                     &solutions,
                     ctx,
                     &analyzer,
@@ -550,7 +650,7 @@ pub fn post_analyze<'a, 'tcx>(
     let fn_writes: FxHashMap<_, _> = writes
         .iter()
         .map(|(f, writes)| {
-            let mut ws = HybridBitSet::new_empty(pre.ends.len());
+            let mut ws = HybridBitSet::new_empty(pre.index_info.len());
             for w in writes.values() {
                 ws.union(w);
             }
@@ -586,7 +686,7 @@ pub fn post_analyze<'a, 'tcx>(
         .collect();
 
     AnalysisResults {
-        ends: pre.ends,
+        ends: pre.index_info.ends,
         union_offsets: pre.union_offsets,
         graph: pre.graph,
         var_nodes: pre.var_nodes,
@@ -602,16 +702,18 @@ pub fn post_analyze<'a, 'tcx>(
     }
 }
 
-fn compute_ends(ty: &TyShape<'_>, ends: &mut Vec<usize>) {
+fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id: LocalDefId) {
     match ty {
-        TyShape::Primitive => ends.push(ends.len()),
-        TyShape::Array(t, _) => compute_ends(t, ends),
+        TyShape::Primitive(pty) => {
+            ends.push(ends.len(), pty.clone(), def_id);
+        }
+        TyShape::Array(t, _) => compute_ends(t, ends, def_id),
         TyShape::Struct(len, ts, _) => {
             let end = ends.len();
             for (_, t) in ts {
-                compute_ends(t, ends);
+                compute_ends(t, ends, def_id);
             }
-            ends[end] = end + *len - 1;
+            ends.modify_end(end, end + *len - 1);
         }
     }
 }
@@ -726,14 +828,14 @@ pub fn receiver_and_method(
 }
 
 fn add_edges(
-    ty: &TyShape<'_>,
+    ty: &TyShape<'_, '_>,
     index: usize, // global index
     graph: &mut LocGraph,
     index_prefixes: &mut FxHashMap<usize, u8>,
     union_offsets: &mut FxHashMap<usize, Vec<usize>>,
 ) -> LocNode {
     let node = match ty {
-        TyShape::Primitive => return LocNode::new(0, index),
+        TyShape::Primitive(_) => return LocNode::new(0, index),
         TyShape::Array(t, _) => {
             let succ = add_edges(t, index, graph, index_prefixes, union_offsets);
             let node = succ.parent();

@@ -11,9 +11,8 @@ use super::analysis;
 
 pub struct TyShapes<'a, 'tcx> {
     pub bitfields: HashMap<LocalDefId, BitField>,
-    pub tys: HashMap<Ty<'tcx>, &'a TyShape<'a>>,
-    prim: &'a TyShape<'a>,
-    arena: &'a Arena<TyShape<'a>>,
+    pub tys: HashMap<Ty<'tcx>, &'a TyShape<'a, 'tcx>>,
+    arena: &'a Arena<TyShape<'a, 'tcx>>,
 }
 
 impl std::fmt::Debug for TyShapes<'_, '_> {
@@ -39,14 +38,12 @@ impl BitField {
 }
 
 pub fn get_ty_shapes<'a, 'tcx>(
-    arena: &'a Arena<TyShape<'a>>,
+    arena: &'a Arena<TyShape<'a, 'tcx>>,
     tcx: TyCtxt<'tcx>,
 ) -> TyShapes<'a, 'tcx> {
-    let prim = arena.alloc(TyShape::Primitive);
     let mut tss = TyShapes {
         bitfields: HashMap::new(),
         tys: HashMap::new(),
-        prim,
         arena,
     };
     compute_bitfields(&mut tss, tcx);
@@ -171,14 +168,14 @@ fn compute_ty_shape<'a, 'tcx>(
     owner: DefId,
     tss: &mut TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> &'a TyShape<'a> {
+) -> &'a TyShape<'a, 'tcx> {
     if let Some(ts) = tss.tys.get(&ty) {
         return ts;
     }
     let ts = match ty.kind() {
         TyKind::Adt(adt_def, generic_args) => {
             if ty.is_c_void(tcx) {
-                tss.prim
+                tss.arena.alloc(TyShape::Primitive(ty))
             } else {
                 let tys = adt_def.variants().iter().flat_map(|variant| {
                     variant
@@ -202,7 +199,7 @@ fn compute_ty_shape<'a, 'tcx>(
             tss.arena.alloc(TyShape::Array(t, len))
         }
         TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, false, owner, tss, tcx),
-        _ => tss.prim,
+        _ => tss.arena.alloc(TyShape::Primitive(ty)),
     };
     tss.tys.insert(ty, ts);
     assert_ne!(ts.len(), 0);
@@ -217,7 +214,7 @@ fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
     owner: DefId,
     tss: &mut TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
-) -> &'a TyShape<'a> {
+) -> &'a TyShape<'a, 'tcx> {
     let mut len = 0;
     let mut fields = vec![];
     for ty in tys {
@@ -226,27 +223,27 @@ fn compute_ty_shape_many<'a, 'tcx, I: Iterator<Item = Ty<'tcx>>>(
         len += ts.len();
     }
     for _ in 0..bitfield_len {
-        fields.push((len, tss.prim));
+        fields.push((len, tss.arena.alloc(TyShape::Primitive(tcx.types.u8))));
         len += 1;
     }
     if len == 0 {
-        tss.prim
+        tss.arena.alloc(TyShape::Primitive(tcx.types.unit))
     } else {
         tss.arena.alloc(TyShape::Struct(len, fields, is_union))
     }
 }
 
 #[allow(variant_size_differences)]
-pub enum TyShape<'a> {
-    Primitive,
-    Array(&'a TyShape<'a>, usize),
-    Struct(usize, Vec<(usize, &'a TyShape<'a>)>, bool),
+pub enum TyShape<'a, 'tcx> {
+    Primitive(Ty<'tcx>),
+    Array(&'a TyShape<'a, 'tcx>, usize),
+    Struct(usize, Vec<(usize, &'a TyShape<'a, 'tcx>)>, bool),
 }
 
-impl std::fmt::Debug for TyShape<'_> {
+impl std::fmt::Debug for TyShape<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Primitive => write!(f, "*"),
+            Self::Primitive(_) => write!(f, "*"),
             Self::Array(t, len) => write!(f, "[{:?}; {}]", t, len),
             Self::Struct(len, fields, is_union) => {
                 write!(f, "{{{}", len)?;
@@ -264,12 +261,12 @@ impl std::fmt::Debug for TyShape<'_> {
     }
 }
 
-impl TyShape<'_> {
+impl TyShape<'_, '_> {
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         match self {
-            Self::Primitive => 1,
+            Self::Primitive(_) => 1,
             Self::Array(t, _) => t.len(),
             Self::Struct(len, _, _) => *len,
         }
