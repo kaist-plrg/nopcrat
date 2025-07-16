@@ -499,37 +499,50 @@ pub fn compute_alias<'tcx>(
         }
 
         for (index, p) in &params {
-            let sol = if strict {
-                solutions[*index]
-                    .iter()
-                    .filter(|s| !locals.contains(*s))
-                    .collect::<FxHashSet<usize>>()
-            } else {
-                let globals = pre.globals.values().collect::<FxHashSet<_>>();
-                solutions[*index]
-                    .iter()
-                    .filter(|s| globals.contains(s) && !locals.contains(*s))
-                    .collect::<FxHashSet<usize>>()
-            };
+            if strict {
+                let mut sol = solutions[*index].clone();
+                sol.subtract(&locals);
 
-            for s in sol {
-                inv_param.entry(s).or_default().insert(*p);
-
-                if let Some(inv_sols) = inv_solutions.get(&s) {
-                    for inv_s in inv_sols.iter() {
-                        if inv_alias.entry(inv_s).or_default().contains(p) {
-                            continue;
-                        }
-                        if inv_s == *index
-                            || !check_type(&pre, *index, inv_s, tcx, &mut num_unsized)
-                        {
-                            continue;
-                        }
-                        inv_alias.entry(inv_s).or_default().insert(*p);
-                        fun_alias.insert(inv_s);
+                for s in sol.iter() {
+                    inv_param.entry(s).or_default().insert(*p);
+                }
+                for cand_index in 0..pre.index_info.len() {
+                    if cand_index == *index {
+                        continue;
+                    }
+                    let mut cand = solutions[cand_index].clone();
+                    cand.intersect(&sol);
+                    if !cand.is_empty() {
+                        inv_alias.entry(cand_index).or_default().insert(*p);
+                        fun_alias.insert(cand_index);
                     }
                 }
-            }
+            } else {
+                let globals = pre.globals.values().collect::<FxHashSet<_>>();
+                let sol = solutions[*index]
+                    .iter()
+                    .filter(|s| globals.contains(s) && !locals.contains(*s))
+                    .collect::<FxHashSet<usize>>();
+
+                for s in sol {
+                    inv_param.entry(s).or_default().insert(*p);
+
+                    if let Some(inv_sols) = inv_solutions.get(&s) {
+                        for inv_s in inv_sols.iter() {
+                            if inv_alias.entry(inv_s).or_default().contains(p) {
+                                continue;
+                            }
+                            if inv_s == *index
+                                || !check_type(&pre, *index, inv_s, tcx, &mut num_unsized)
+                            {
+                                continue;
+                            }
+                            inv_alias.entry(inv_s).or_default().insert(*p);
+                            fun_alias.insert(inv_s);
+                        }
+                    }
+                }
+            };
         }
 
         aliases.insert(*def_id, fun_alias);
