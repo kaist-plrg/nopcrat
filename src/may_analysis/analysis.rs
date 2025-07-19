@@ -59,6 +59,11 @@ impl<'tcx> IndexInfo<'tcx> {
         self.owners.push(owner);
     }
 
+    fn get_end(&self, index: usize) -> usize {
+        assert!(index < self.ends.len());
+        self.ends[index]
+    }
+
     fn get_ty(&self, index: usize) -> Ty<'tcx> {
         assert!(index < self.tys.len());
         self.tys[index]
@@ -73,6 +78,15 @@ impl<'tcx> IndexInfo<'tcx> {
         assert!(index < self.ends.len());
         self.ends[index] = new;
     }
+
+    fn modify_ty(&mut self, index: usize, new: Ty<'tcx>) {
+        assert!(index < self.tys.len());
+        self.tys[index] = new;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&usize, &Ty<'tcx>)> {
+        self.ends.iter().zip(self.tys.iter())
+    }
 }
 
 #[derive(Debug)]
@@ -85,6 +99,7 @@ pub struct PreAnalysisData<'tcx> {
 
     index_info: IndexInfo<'tcx>,
     pub globals: FxHashMap<LocalDefId, usize>,
+    pub non_fn_globals: FxHashSet<usize>,
     pub inv_fns: FxHashMap<usize, LocalDefId>,
     vars: FxHashMap<Var, usize>,
 
@@ -213,11 +228,11 @@ pub fn pre_analyze<'a, 'tcx>(
     let fn_ptrs = visitor.fn_ptrs;
 
     let mut globals = FxHashMap::default();
+    let mut non_fn_globals = FxHashSet::default();
     let mut inv_fns = FxHashMap::default();
     let mut vars = FxHashMap::default();
     let mut index_info = IndexInfo::new();
-    let mut alloc_ends: Vec<usize> = vec![];
-    let mut alloc_tys: Vec<Ty<'_>> = vec![];
+    let mut alloc_info = IndexInfo::new();
     let mut allocs = vec![];
     let mut graph = FxHashMap::default();
     let mut union_offsets = FxHashMap::default();
@@ -266,18 +281,22 @@ pub fn pre_analyze<'a, 'tcx>(
                 let mut index_info = IndexInfo::new();
                 let ty = tss.tys[&ty];
                 compute_ends(ty, &mut index_info, item.local_def_id);
-                for (i, (end, pty)) in index_info.ends.into_iter().zip(index_info.tys).enumerate() {
-                    if alloc_ends.len() > i {
-                        if alloc_ends[i] < end {
-                            alloc_ends[i] = end;
-                            alloc_tys[i] = pty;
+                for (i, (end, pty)) in index_info.iter().enumerate() {
+                    if alloc_info.len() > i {
+                        let prev_end = alloc_info.get_end(i);
+                        if prev_end < *end {
+                            alloc_info.modify_end(i, *end);
+                            alloc_info.modify_ty(i, *pty);
                         }
                     } else {
-                        alloc_ends.push(end);
-                        alloc_tys.push(pty);
+                        alloc_info.push(*end, *pty, item.local_def_id);
                     }
                 }
             }
+        }
+
+        if !item.is_fn {
+            non_fn_globals.extend(global_index..=(index_info.get_end(global_index)));
         }
 
         for (bb, bbd) in item.body.basic_blocks.iter_enumerated() {
@@ -320,7 +339,7 @@ pub fn pre_analyze<'a, 'tcx>(
     for alloc in allocs {
         let len = index_info.len();
         vars.insert(alloc, len);
-        for (end, ty) in alloc_ends.iter().zip(alloc_tys.iter()) {
+        for (end, ty) in alloc_info.iter() {
             let Var::Alloc(alloc_def_id, _) = alloc else {
                 unreachable!()
             };
@@ -335,6 +354,7 @@ pub fn pre_analyze<'a, 'tcx>(
         indirect_calls,
         index_info,
         globals,
+        non_fn_globals,
         inv_fns,
         vars,
         index_prefixes,
@@ -440,7 +460,7 @@ fn check_type<'tcx>(
             let layout1 = tcx.layout_of(typing_env1.as_query_input(*ty1)).unwrap();
             let layout2 = tcx.layout_of(typing_env2.as_query_input(*ty2)).unwrap();
 
-            layout1.size == layout2.size
+            layout1.size.bytes() == layout2.size.bytes()
         }
         (_, _) => false,
     }
@@ -456,14 +476,18 @@ pub fn compute_alias<'tcx>(
     let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
     let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
-    let globals = if strict {
-        None
+    let globals = if !strict {
+        pre.non_fn_globals.iter().fold(
+            HybridBitSet::new_empty(pre.index_info.len()),
+            |mut acc, g| {
+                acc.insert(*g);
+                acc
+            },
+        )
     } else {
-        let mut globals = HybridBitSet::new_empty(pre.index_info.len());
-        for g_index in pre.globals.values() {
-            globals.insert(*g_index);
-        }
-        Some(globals)
+        let mut filled = HybridBitSet::new_empty(pre.index_info.len());
+        filled.insert_all();
+        filled
     };
 
     for (def_id, inputs) in inputs_map {
@@ -496,9 +520,8 @@ pub fn compute_alias<'tcx>(
         for (index, p) in &params {
             let mut sol = solutions[*index].clone();
             sol.subtract(&locals);
-            if !strict {
-                sol.intersect(globals.as_ref().unwrap());
-            }
+            sol.intersect(&globals);
+
             for s in sol.iter() {
                 inv_param.entry(s).or_default().insert(*p);
             }
