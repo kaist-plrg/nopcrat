@@ -132,8 +132,8 @@ pub struct PreAnalysisContext<'a> {
     pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub globals: &'a FxHashMap<LocalDefId, usize>,
+    pub ends: &'a Vec<usize>,
     pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
-    pub skip_checks: FxHashMap<Local, FxHashSet<usize>>,
 }
 
 impl PreAnalysisContext<'_> {
@@ -280,7 +280,7 @@ pub fn analyze(
                     inv_param: pre_data.inv_params.get(def_id).unwrap(),
                     globals: &pre_data.globals,
                     var_nodes: &pre_data.var_nodes,
-                    skip_checks: FxHashMap::default(),
+                    ends: &pre_data.ends,
                 };
 
                 let mut analyzer =
@@ -415,8 +415,8 @@ pub fn analyze(
                         inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
                         inv_param: pre_data.inv_params.get(def_id).unwrap(),
                         globals: &pre_data.globals,
+                        ends: &pre_data.ends,
                         var_nodes: &pre_data.var_nodes,
-                        skip_checks: FxHashMap::default(),
                     };
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -903,8 +903,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         for callee in callees {
             let globals = info_map[callee].globals.iter().filter_map(|def_id| {
                 let local_id = def_id.as_local()?;
-                self.pre_context.globals.get(&local_id).copied()
-            });
+                let start = self.pre_context.globals.get(&local_id).copied()?;
+                let end = self.pre_context.ends[start];
+                Some(start..=end)
+            })
+            .flatten();
             indexes.extend(globals);
         }
 
