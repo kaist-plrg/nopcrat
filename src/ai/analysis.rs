@@ -901,13 +901,16 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     ) -> BTreeSet<usize> {
         let mut indexes = FxHashSet::default();
         for callee in callees {
-            let globals = info_map[callee].globals.iter().filter_map(|def_id| {
-                let local_id = def_id.as_local()?;
-                let start = self.pre_context.globals.get(&local_id).copied()?;
-                let end = self.pre_context.ends[start];
-                Some(start..=end)
-            })
-            .flatten();
+            let globals = info_map[callee]
+                .globals
+                .iter()
+                .filter_map(|def_id| {
+                    let local_id = def_id.as_local()?;
+                    let start = self.pre_context.globals.get(&local_id).copied()?;
+                    let end = self.pre_context.ends[start];
+                    Some(start..=end)
+                })
+                .flatten();
             indexes.extend(globals);
         }
 
