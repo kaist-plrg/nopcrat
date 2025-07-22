@@ -433,6 +433,7 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     solutions
 }
 
+// To filter out the cases where the types of two global indices are not compatible
 fn check_type<'tcx>(
     pre: &PreAnalysisData<'tcx>,
     index1: usize,
@@ -467,6 +468,7 @@ fn check_type<'tcx>(
     }
 }
 
+// Computes the aliasing information for the function parameters
 pub fn compute_alias<'tcx>(
     pre: PreAnalysisData<'tcx>,
     solutions: Solutions,
@@ -496,9 +498,9 @@ pub fn compute_alias<'tcx>(
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut params = FxHashMap::default();
         let mut locals = HybridBitSet::new_empty(pre.index_info.len());
-        // Set of aliases for the function parameters
+        // Aliases of the function parameters
         let mut fun_alias = HybridBitSet::new_empty(pre.index_info.len());
-        // Map of alias to the set of parameters
+        // Map of an alias candidate to the set of parameters that it may alias
         let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
         // Map of location to set of parameters that may point to the location
         let mut inv_param: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
