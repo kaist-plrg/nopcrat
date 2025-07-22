@@ -41,7 +41,11 @@ use super::{
 use crate::{
     compile_util::{self, LoHi},
     graph,
-    may_analysis::{self, analysis::LocNode, bitset::HybridBitSet},
+    may_analysis::{
+        self,
+        analysis::{AliasResults, LocNode},
+        bitset::HybridBitSet,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -137,7 +141,21 @@ pub struct PreAnalysisContext<'a> {
     pub strict: bool,
 }
 
-impl PreAnalysisContext<'_> {
+impl<'a> PreAnalysisContext<'a> {
+    fn new(def_id: DefId, pre_data: &'a AliasResults, strict: bool) -> Self {
+        Self {
+            local_def_id: def_id.as_local().unwrap(),
+            alias: pre_data.aliases.get(&def_id).unwrap(),
+            inv_alias: pre_data.inv_aliases.get(&def_id).unwrap(),
+            inv_param: pre_data.inv_params.get(&def_id).unwrap(),
+            var_nodes: &pre_data.var_nodes,
+            ends: &pre_data.ends,
+            solutions: &pre_data.solutions,
+            non_fn_globals: &pre_data.non_fn_globals,
+            strict,
+        }
+    }
+
     pub fn check_index(&self, index: usize) -> FxHashSet<usize> {
         // If the local is an alias
         if self.alias.contains(index) {
@@ -273,17 +291,8 @@ pub fn analyze(
             let mut need_rerun = false;
             for def_id in def_ids {
                 let start = std::time::Instant::now();
-                let pre_context = PreAnalysisContext {
-                    local_def_id: def_id.as_local().unwrap(),
-                    alias: pre_data.aliases.get(def_id).unwrap(),
-                    inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
-                    inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                    var_nodes: &pre_data.var_nodes,
-                    ends: &pre_data.ends,
-                    solutions: &pre_data.solutions,
-                    non_fn_globals: &pre_data.non_fn_globals,
-                    strict: conf.strict_alias,
-                };
+
+                let pre_context = PreAnalysisContext::new(*def_id, &pre_data, conf.strict_alias);
 
                 let mut analyzer =
                     Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -311,6 +320,7 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
+
                 let mut nullable_params = analyzer.find_nullable_params(
                     tcx,
                     &states,
@@ -414,17 +424,8 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let pre_context = PreAnalysisContext {
-                        local_def_id: def_id.as_local().unwrap(),
-                        alias: pre_data.aliases.get(def_id).unwrap(),
-                        inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
-                        inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                        ends: &pre_data.ends,
-                        solutions: &pre_data.solutions,
-                        non_fn_globals: &pre_data.non_fn_globals,
-                        var_nodes: &pre_data.var_nodes,
-                        strict: conf.strict_alias,
-                    };
+                    let pre_context =
+                        PreAnalysisContext::new(*def_id, &pre_data, conf.strict_alias);
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();

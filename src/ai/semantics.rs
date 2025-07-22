@@ -1439,10 +1439,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             if ptrs.len() == 1 {
                 let ptr = ptrs.first().unwrap();
                 if let AbsBase::Arg(arg) = ptr.base {
-                    if !self.pre_context.strict {
-                        // skip the check for aliases btw parameters
-                        return vec![];
-                    }
                     excludes.remove(&self.ptr_params[arg]);
                 }
             }

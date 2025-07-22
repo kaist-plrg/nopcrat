@@ -433,8 +433,33 @@ pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     solutions
 }
 
-// To filter out the cases where the types of two global indices are not compatible
-fn check_type<'tcx>(
+fn check_type_inner<'tcx>(
+    pre: &PreAnalysisData<'tcx>,
+    ty1: &Ty<'tcx>,
+    ty2: &Ty<'tcx>,
+    index1: usize,
+    index2: usize,
+    tcx: TyCtxt<'tcx>,
+) -> bool {
+    if ty1 == ty2 {
+        return true;
+    }
+    let typing_env1 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index1).to_def_id());
+    let typing_env2 = TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index2).to_def_id());
+    let is_sized1 = ty1.is_sized(tcx, typing_env1);
+    let is_sized2 = ty2.is_sized(tcx, typing_env2);
+    if !is_sized1 || !is_sized2 {
+        return true;
+    }
+
+    let layout1 = tcx.layout_of(typing_env1.as_query_input(*ty1)).unwrap();
+    let layout2 = tcx.layout_of(typing_env2.as_query_input(*ty2)).unwrap();
+
+    layout1.size.bytes() == layout2.size.bytes()
+}
+
+// Filter out the cases where the sizes of types of two global indices are not compatible
+fn check_type_deref<'tcx>(
     pre: &PreAnalysisData<'tcx>,
     index1: usize,
     index2: usize,
@@ -446,25 +471,25 @@ fn check_type<'tcx>(
     match (ty1.kind(), ty2.kind()) {
         (TyKind::RawPtr(ty1, _), TyKind::RawPtr(ty2, _))
         | (TyKind::RawPtr(ty1, _), TyKind::Ref(_, ty2, _)) => {
-            if ty1 == ty2 {
-                return true;
-            }
-            let typing_env1 =
-                TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index1).to_def_id());
-            let typing_env2 =
-                TypingEnv::post_analysis(tcx, pre.index_info.get_owner(index2).to_def_id());
-            let is_sized1 = ty1.is_sized(tcx, typing_env1);
-            let is_sized2 = ty2.is_sized(tcx, typing_env2);
-            if !is_sized1 || !is_sized2 {
-                return true;
-            }
-
-            let layout1 = tcx.layout_of(typing_env1.as_query_input(*ty1)).unwrap();
-            let layout2 = tcx.layout_of(typing_env2.as_query_input(*ty2)).unwrap();
-
-            layout1.size.bytes() == layout2.size.bytes()
+            check_type_inner(pre, ty1, ty2, index1, index2, tcx)
         }
         (_, _) => false,
+    }
+}
+
+fn check_type<'tcx>(
+    pre: &PreAnalysisData<'tcx>,
+    index1: usize,
+    index2: usize,
+    tcx: TyCtxt<'tcx>,
+) -> bool {
+    let ty1 = pre.index_info.get_ty(index1);
+    let ty2 = pre.index_info.get_ty(index2);
+
+    if let TyKind::RawPtr(inner_ty1, _) = ty1.kind() {
+        check_type_inner(pre, inner_ty1, &ty2, index1, index2, tcx)
+    } else {
+        false
     }
 }
 
@@ -525,10 +550,13 @@ pub fn compute_alias<'tcx>(
             sol.intersect(&globals);
 
             for s in sol.iter() {
+                if !check_type(&pre, *index, s, tcx) {
+                    continue;
+                }
                 inv_param.entry(s).or_default().insert(*p);
             }
             for (cand_index, cand_sol) in solutions.iter().enumerate() {
-                if cand_index == *index || !check_type(&pre, *index, cand_index, tcx) {
+                if cand_index == *index || !check_type_deref(&pre, *index, cand_index, tcx) {
                     continue;
                 }
                 let mut cand = cand_sol.clone();
