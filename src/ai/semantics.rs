@@ -985,25 +985,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         }
     }
 
-    fn check_empty_arg(&self, operand: &Operand<'tcx>) -> Option<usize> {
-        if let Operand::Copy(place) | Operand::Move(place) = operand {
-            let local = place.local;
-            if let Some(index) = self
-                .pre_context
-                .var_nodes
-                .get(&(self.pre_context.local_def_id, local))
-                .map(|node| node.index)
-            {
-                let mut sol = self.pre_context.solutions[index].clone();
-                sol.intersect(self.pre_context.non_fn_globals);
-                if sol.is_empty() {
-                    return Some(local.index());
-                }
-            }
-        }
-        None
-    }
-
     fn transfer_place(
         &self,
         place: &Place<'tcx>,
@@ -1419,6 +1400,28 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             .collect::<Vec<_>>()
     }
 
+    // To avoid 'excludes' are propagated to unintended callers,
+    // check if set of locations that the argument may point to are empty.
+    fn check_empty_arg(&self, operand: &Operand<'tcx>) -> Option<usize> {
+        if let Operand::Copy(place) | Operand::Move(place) = operand {
+            let local = place.local;
+            if let Some(index) = self
+                .pre_context
+                .var_nodes
+                .get(&(self.pre_context.local_def_id, local))
+                .map(|node| node.index)
+            {
+                let mut sol = self.pre_context.solutions[index].clone();
+                sol.intersect(self.pre_context.non_fn_globals);
+                if sol.is_empty() {
+                    return Some(local.index());
+                }
+            }
+        }
+        None
+    }
+
+    // Check if the local is an alias of a function parameter
     fn check_param_aliases(&self, ptr: &AbsValue, local: Local) -> Vec<AbsPath> {
         let Some(index) = self
             .pre_context
@@ -1437,7 +1440,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let ptr = ptrs.first().unwrap();
                 if let AbsBase::Arg(arg) = ptr.base {
                     if !self.pre_context.strict {
-                        // skip the check for the param aliases
+                        // skip the check for aliases btw parameters
                         return vec![];
                     }
                     excludes.remove(&self.ptr_params[arg]);

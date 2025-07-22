@@ -510,7 +510,6 @@ pub fn compute_alias<'tcx>(
             let g_index = pre.var_nodes[&(local_def_id, local)].index;
 
             if (1..=*inputs).contains(&index) {
-                // In case the local is a parmeter whose type is a raw pointer
                 let ty = decl.ty;
                 let TyKind::RawPtr(..) = ty.kind() else {
                     continue;
