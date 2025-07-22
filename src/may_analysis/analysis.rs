@@ -119,6 +119,7 @@ pub struct AliasResults {
     pub ends: Vec<usize>,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
     pub globals: FxHashMap<LocalDefId, usize>,
+    pub non_fn_globals: HybridBitSet<usize>,
     pub solutions: Solutions,
 }
 
@@ -550,6 +551,7 @@ pub fn compute_alias<'tcx>(
         ends: pre.index_info.ends,
         var_nodes: pre.var_nodes,
         globals: pre.globals,
+        non_fn_globals: globals,
         solutions,
     }
 }

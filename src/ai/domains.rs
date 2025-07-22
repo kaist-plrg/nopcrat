@@ -16,6 +16,7 @@ pub struct AbsState {
     pub local: AbsLocal,
     pub args: AbsArgs,
     pub excludes: MayPathSet,
+    pub alias_excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
     pub nulls: MustPathSet,
@@ -28,6 +29,7 @@ impl AbsState {
             local: AbsLocal::bot(),
             args: AbsArgs::bot(),
             excludes: MayPathSet::bot(),
+            alias_excludes: MayPathSet::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
             nulls: MustPathSet::bot(),
@@ -39,6 +41,7 @@ impl AbsState {
             local: self.local.join(&other.local),
             args: self.args.join(&other.args),
             excludes: self.excludes.join(&other.excludes),
+            alias_excludes: self.alias_excludes.join(&other.alias_excludes),
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
             nulls: self.nulls.join(&other.nulls),
@@ -50,6 +53,7 @@ impl AbsState {
             local: self.local.widen(&other.local),
             args: self.args.widen(&other.args),
             excludes: self.excludes.widen(&other.excludes),
+            alias_excludes: self.alias_excludes.widen(&other.alias_excludes),
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
             nulls: self.nulls.widen(&other.nulls),
@@ -60,6 +64,7 @@ impl AbsState {
         self.local.ord(&other.local)
             && self.args.ord(&other.args)
             && self.excludes.ord(&other.excludes)
+            && self.alias_excludes.ord(&other.alias_excludes)
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
             && self.nulls.ord(&other.nulls)
@@ -112,6 +117,12 @@ impl AbsState {
         let path = AbsPath(vec![i]);
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
             self.nulls.insert(path)
+        }
+    }
+
+    pub fn add_alias_excludes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            self.alias_excludes.insert(path);
         }
     }
 }

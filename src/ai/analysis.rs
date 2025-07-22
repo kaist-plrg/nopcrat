@@ -126,14 +126,15 @@ enum Write {
 
 #[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
-    pub def_id: DefId,
     pub local_def_id: LocalDefId,
     pub alias: &'a HybridBitSet<usize>,
     pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
-    pub globals: &'a FxHashMap<LocalDefId, usize>,
     pub ends: &'a Vec<usize>,
+    pub solutions: &'a may_analysis::analysis::Solutions,
+    pub non_fn_globals: &'a HybridBitSet<usize>,
     pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
+    pub strict: bool,
 }
 
 impl PreAnalysisContext<'_> {
@@ -273,14 +274,15 @@ pub fn analyze(
             for def_id in def_ids {
                 let start = std::time::Instant::now();
                 let pre_context = PreAnalysisContext {
-                    def_id: *def_id,
                     local_def_id: def_id.as_local().unwrap(),
                     alias: pre_data.aliases.get(def_id).unwrap(),
                     inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
                     inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                    globals: &pre_data.globals,
                     var_nodes: &pre_data.var_nodes,
                     ends: &pre_data.ends,
+                    solutions: &pre_data.solutions,
+                    non_fn_globals: &pre_data.non_fn_globals,
+                    strict: conf.strict_alias,
                 };
 
                 let mut analyzer =
@@ -317,7 +319,11 @@ pub fn analyze(
                     &null_checks_map,
                     &call_info_map,
                 );
-                let alias_params = analyzer.check_reachable_globals(&info_map, &call_graph[def_id]);
+                let alias_params = analyzer.check_reachable_globals(
+                    &info_map,
+                    &pre_data.globals,
+                    &call_graph[def_id],
+                );
                 nullable_params.extend(alias_params);
 
                 let exclude_paths: Vec<_> = nullable_params
@@ -409,14 +415,15 @@ pub fn analyze(
             if !need_rerun {
                 for def_id in def_ids {
                     let pre_context = PreAnalysisContext {
-                        def_id: *def_id,
                         local_def_id: def_id.as_local().unwrap(),
                         alias: pre_data.aliases.get(def_id).unwrap(),
                         inv_alias: pre_data.inv_aliases.get(def_id).unwrap(),
                         inv_param: pre_data.inv_params.get(def_id).unwrap(),
-                        globals: &pre_data.globals,
                         ends: &pre_data.ends,
+                        solutions: &pre_data.solutions,
+                        non_fn_globals: &pre_data.non_fn_globals,
                         var_nodes: &pre_data.var_nodes,
+                        strict: conf.strict_alias,
                     };
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -897,6 +904,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn check_reachable_globals(
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
+        globals: &FxHashMap<LocalDefId, usize>,
         callees: &FxHashSet<DefId>,
     ) -> BTreeSet<usize> {
         let mut indexes = FxHashSet::default();
@@ -906,7 +914,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .iter()
                 .filter_map(|def_id| {
                     let local_id = def_id.as_local()?;
-                    let start = self.pre_context.globals.get(&local_id).copied()?;
+                    let start = globals.get(&local_id).copied()?;
                     let end = self.pre_context.ends[start];
                     Some(start..=end)
                 })
@@ -939,7 +947,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let excludes: BTreeSet<_> = summary
             .return_states
             .values()
-            .flat_map(|st| st.excludes.as_set())
+            .flat_map(|st| st.excludes.as_set().union(st.alias_excludes.as_set()))
             .map(|p| p.base())
             .collect();
 
