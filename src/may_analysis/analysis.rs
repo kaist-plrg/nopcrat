@@ -113,8 +113,7 @@ pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for Hybri
 
 #[derive(Debug)]
 pub struct AliasResults {
-    pub aliases: FxHashMap<DefId, HybridBitSet<usize>>,
-    pub inv_aliases: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
+    pub aliases: FxHashMap<DefId, FxHashSet<usize>>,
     pub inv_params: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
     pub ends: Vec<usize>,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
@@ -501,8 +500,7 @@ pub fn compute_alias<'tcx>(
     strict: bool,
     tcx: TyCtxt<'tcx>,
 ) -> AliasResults {
-    let mut aliases: FxHashMap<_, HybridBitSet<usize>> = FxHashMap::default();
-    let mut inv_aliases: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
+    let mut aliases: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
     let globals = if !strict {
         pre.non_fn_globals.iter().fold(
@@ -521,12 +519,10 @@ pub fn compute_alias<'tcx>(
     for (def_id, inputs) in inputs_map {
         let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
-        let mut params = FxHashMap::default();
+        let mut params = FxHashSet::default();
         let mut locals = HybridBitSet::new_empty(pre.index_info.len());
         // Aliases of the function parameters
-        let mut fun_alias = HybridBitSet::new_empty(pre.index_info.len());
-        // Map of an alias candidate to the set of parameters that it may alias
-        let mut inv_alias: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
+        let mut fun_alias = FxHashSet::default();
         // Map of location to set of parameters that may point to the location
         let mut inv_param: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
 
@@ -539,7 +535,7 @@ pub fn compute_alias<'tcx>(
                 let TyKind::RawPtr(..) = ty.kind() else {
                     continue;
                 };
-                params.insert(g_index, index);
+                params.insert((g_index, index));
             }
             locals.insert(g_index);
         }
@@ -555,27 +551,28 @@ pub fn compute_alias<'tcx>(
                 }
                 inv_param.entry(s).or_default().insert(*p);
             }
-            for (cand_index, cand_sol) in solutions.iter().enumerate() {
-                if cand_index == *index || !check_type_deref(&pre, *index, cand_index, tcx) {
+
+            for (cand_index, cand_p) in &params {
+                if *cand_index <= *index || !check_type_deref(&pre, *index, *cand_index, tcx) {
                     continue;
                 }
-                let mut cand = cand_sol.clone();
-                cand.intersect(&sol);
-                if !cand.is_empty() {
-                    inv_alias.entry(cand_index).or_default().insert(*p);
-                    fun_alias.insert(cand_index);
+                let mut cand_sol = solutions[*cand_index].clone();
+                cand_sol.intersect(&sol);
+
+                if !cand_sol.is_empty() {
+                    // inv_alias.entry(cand_index).or_default().insert(*p);
+                    fun_alias.insert(*p);
+                    fun_alias.insert(*cand_p);
                 }
             }
         }
 
         aliases.insert(*def_id, fun_alias);
-        inv_aliases.insert(*def_id, inv_alias);
         inv_params.insert(*def_id, inv_param);
     }
 
     AliasResults {
         aliases,
-        inv_aliases,
         inv_params,
         ends: pre.index_info.ends,
         var_nodes: pre.var_nodes,

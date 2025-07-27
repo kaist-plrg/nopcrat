@@ -131,8 +131,7 @@ enum Write {
 #[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
     pub local_def_id: LocalDefId,
-    pub alias: &'a HybridBitSet<usize>,
-    pub inv_alias: &'a FxHashMap<usize, FxHashSet<usize>>,
+    pub alias: &'a FxHashSet<usize>,
     pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub ends: &'a Vec<usize>,
     pub solutions: &'a may_analysis::analysis::Solutions,
@@ -146,7 +145,6 @@ impl<'a> PreAnalysisContext<'a> {
         Self {
             local_def_id: def_id.as_local().unwrap(),
             alias: pre_data.aliases.get(&def_id).unwrap(),
-            inv_alias: pre_data.inv_aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
             var_nodes: &pre_data.var_nodes,
             ends: &pre_data.ends,
@@ -154,16 +152,6 @@ impl<'a> PreAnalysisContext<'a> {
             non_fn_globals: &pre_data.non_fn_globals,
             strict,
         }
-    }
-
-    pub fn check_index(&self, index: usize) -> FxHashSet<usize> {
-        // If the local is an alias
-        if self.alias.contains(index) {
-            if let Some(params) = self.inv_alias.get(&index) {
-                return params.clone();
-            }
-        }
-        FxHashSet::default()
     }
 
     pub fn check_index_global(&self, index: usize) -> FxHashSet<usize> {
@@ -305,7 +293,6 @@ pub fn analyze(
                         body.local_decls.len()
                     );
                 }
-
                 let AnalyzedBody {
                     states,
                     writes_map,
@@ -961,7 +948,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let excludes: BTreeSet<_> = summary
             .return_states
             .values()
-            .flat_map(|st| st.excludes.as_set().union(st.alias_excludes.as_set()))
+            .flat_map(|st| st.excludes.as_set())
             .map(|p| p.base())
             .collect();
 
@@ -1152,6 +1139,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
+                if self.pre_context.alias.contains(&i) {
+                    start_state.excludes.insert(AbsPath(vec![i]));
+                }
                 AbsValue::arg(idx)
             } else {
                 self.top_value_of_ty(ty)
