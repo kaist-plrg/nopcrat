@@ -332,7 +332,8 @@ pub fn analyze(
                 let alias_params = analyzer.check_reachable_globals(
                     &info_map,
                     &pre_data.globals,
-                    &call_graph[def_id],
+                    *def_id,
+                    &call_graph,
                 );
                 nullable_params.extend(alias_params);
 
@@ -906,21 +907,36 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
         globals: &FxHashMap<LocalDefId, usize>,
-        callees: &FxHashSet<DefId>,
+        initial_id: DefId,
+        call_graph: &FxHashMap<DefId, FxHashSet<DefId>>,
     ) -> BTreeSet<usize> {
         let mut indexes = FxHashSet::default();
-        for callee in callees {
-            let globals = info_map[callee]
-                .globals
-                .iter()
-                .filter_map(|def_id| {
-                    let local_id = def_id.as_local()?;
-                    let start = globals.get(&local_id).copied()?;
-                    let end = self.pre_context.ends[start];
-                    Some(start..=end)
-                })
-                .flatten();
-            indexes.extend(globals);
+        let mut visited = FxHashSet::default();
+        let mut stack = vec![initial_id];
+        loop {
+            if let Some(callee) = stack.pop() {
+                if !visited.insert(callee) {
+                    continue;
+                }
+
+                let globals = info_map[&callee]
+                    .globals
+                    .iter()
+                    .filter_map(|def_id| {
+                        let local_id = def_id.as_local()?;
+                        let start = globals.get(&local_id).copied()?;
+                        let end = self.pre_context.ends[start];
+                        Some(start..=end)
+                    })
+                    .flatten();
+                indexes.extend(globals);
+
+                if let Some(callees) = call_graph.get(&callee) {
+                    stack.extend(callees.iter());
+                }
+            } else {
+                break;
+            }
         }
 
         indexes
