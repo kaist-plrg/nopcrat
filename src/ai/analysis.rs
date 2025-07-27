@@ -913,29 +913,26 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut indexes = FxHashSet::default();
         let mut visited = FxHashSet::default();
         let mut stack = vec![initial_id];
-        loop {
-            if let Some(callee) = stack.pop() {
-                if !visited.insert(callee) {
-                    continue;
-                }
 
-                let globals = info_map[&callee]
-                    .globals
-                    .iter()
-                    .filter_map(|def_id| {
-                        let local_id = def_id.as_local()?;
-                        let start = globals.get(&local_id).copied()?;
-                        let end = self.pre_context.ends[start];
-                        Some(start..=end)
-                    })
-                    .flatten();
-                indexes.extend(globals);
+        while let Some(callee) = stack.pop() {
+            if !visited.insert(callee) {
+                continue;
+            }
 
-                if let Some(callees) = call_graph.get(&callee) {
-                    stack.extend(callees.iter());
-                }
-            } else {
-                break;
+            let globals = info_map[&callee]
+                .globals
+                .iter()
+                .filter_map(|def_id| {
+                    let local_id = def_id.as_local()?;
+                    let start = globals.get(&local_id).copied()?;
+                    let end = self.pre_context.ends[start];
+                    Some(start..=end)
+                })
+                .flatten();
+            indexes.extend(globals);
+
+            if let Some(callees) = call_graph.get(&callee) {
+                stack.extend(callees.iter());
             }
         }
 
