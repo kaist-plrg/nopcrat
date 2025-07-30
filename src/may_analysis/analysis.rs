@@ -499,7 +499,7 @@ pub fn compute_alias<'tcx>(
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
-    let globals = pre.non_fn_globals.iter().fold(
+    let non_fn_globals = pre.non_fn_globals.iter().fold(
         HybridBitSet::new_empty(pre.index_info.len()),
         |mut acc, g| {
             acc.insert(*g);
@@ -510,7 +510,7 @@ pub fn compute_alias<'tcx>(
     for (def_id, inputs) in inputs_map {
         let body = tcx.optimized_mir(def_id);
         let local_def_id = some_or!(def_id.as_local(), continue);
-        let mut params = FxHashSet::default();
+        let mut params = vec![];
         let mut locals = HybridBitSet::new_empty(pre.index_info.len());
         // Aliases of the function parameters
         let mut fun_alias = FxHashSet::default();
@@ -526,25 +526,24 @@ pub fn compute_alias<'tcx>(
                 let TyKind::RawPtr(..) = ty.kind() else {
                     continue;
                 };
-                params.insert((g_index, index));
+                params.push((g_index, index));
             }
             locals.insert(g_index);
         }
 
-        for (index, p) in &params {
+        for (i, (index, p)) in params.iter().enumerate() {
             let mut sol = solutions[*index].clone();
             sol.subtract(&locals);
-            sol.intersect(&globals);
+            sol.intersect(&non_fn_globals);
 
             for s in sol.iter() {
-                if !check_type(&pre, *index, s, tcx) {
-                    continue;
+                if check_type(&pre, *index, s, tcx) {
+                    inv_param.entry(s).or_default().insert(*p);
                 }
-                inv_param.entry(s).or_default().insert(*p);
             }
 
-            for (cand_index, cand_p) in &params {
-                if *cand_index <= *index || !check_type_deref(&pre, *index, *cand_index, tcx) {
+            for (cand_index, cand_p) in params.iter().skip(i + 1) {
+                if !check_type_deref(&pre, *index, *cand_index, tcx) {
                     continue;
                 }
                 let mut cand_sol = solutions[*cand_index].clone();
@@ -566,7 +565,7 @@ pub fn compute_alias<'tcx>(
         inv_params,
         ends: pre.index_info.ends,
         globals: pre.globals,
-        non_fn_globals: globals,
+        non_fn_globals,
     }
 }
 

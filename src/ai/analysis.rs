@@ -173,7 +173,6 @@ pub fn analyze(
     }
 
     let funcs: FxHashSet<_> = call_graph.keys().cloned().collect();
-
     for callees in call_graph.values_mut() {
         callees.retain(|callee| funcs.contains(callee));
     }

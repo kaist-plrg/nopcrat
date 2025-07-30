@@ -148,9 +148,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (func, mut reads) = self.transfer_operand(func, state);
                 let (args, readss): (Vec<_>, Vec<_>) = args
                     .iter()
-                    .map(|arg| (self.transfer_operand(&arg.node, state)))
+                    .map(|arg| self.transfer_operand(&arg.node, state))
                     .unzip();
-
                 for reads2 in readss {
                     reads.extend(reads2);
                 }
@@ -960,11 +959,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
     fn transfer_place(&self, place: &Place<'tcx>, state: &AbsState) -> (AbsValue, Vec<AbsPath>) {
         if place.is_indirect_first_projection() {
-            let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
-            let ptr = state.local.get(local.index());
-            let (v, reads) = self.read_ptr(&ptr.ptrv, &projection, state);
-            (v, reads)
+            let ptr = state.local.get(place.local.index());
+            self.read_ptr(&ptr.ptrv, &projection, state)
         } else {
             let v = state.local.get(place.local.index());
             let projection = self.abstract_projection(place.projection, state);
@@ -1173,9 +1170,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     ) -> (AbsState, Vec<AbsPath>) {
         let mut new_state = state.clone();
         let writes = if place.is_indirect_first_projection() {
-            let local = place.local;
             let projection = self.abstract_projection(&place.projection[1..], state);
-            let ptr = state.local.get(local.index());
+            let ptr = state.local.get(place.local.index());
             self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
             self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {
