@@ -149,7 +149,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (args, readss): (Vec<_>, Vec<_>) = args
                     .iter()
                     .map(|arg| (self.transfer_operand(&arg.node, state)))
-                    .collect();
+                    .unzip();
 
                 for reads2 in readss {
                     reads.extend(reads2);
@@ -885,7 +885,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     let (vs, readss): (Vec<_>, Vec<_>) = fields
                         .iter()
                         .map(|operand| self.transfer_operand(operand, state))
-                        .collect();
+                        .unzip();
                     let v = AbsValue::alpha_list(vs.into_iter().collect());
                     let reads = readss.into_iter().flatten().collect();
                     (v, reads, vec![])
@@ -898,7 +898,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                             let (vs, readss): (Vec<_>, Vec<_>) = fields
                                 .iter()
                                 .map(|operand| self.transfer_operand(operand, state))
-                                .collect();
+                                .unzip();
                             let v = AbsValue::alpha_list(vs.into_iter().collect());
                             let reads = readss.into_iter().flatten().collect();
                             (v, reads, vec![])

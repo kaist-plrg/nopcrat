@@ -116,10 +116,8 @@ pub struct AliasResults {
     pub aliases: FxHashMap<DefId, FxHashSet<usize>>,
     pub inv_params: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
     pub ends: Vec<usize>,
-    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
     pub globals: FxHashMap<LocalDefId, usize>,
     pub non_fn_globals: HybridBitSet<usize>,
-    pub solutions: Solutions,
 }
 
 #[derive(Debug)]
@@ -497,24 +495,17 @@ pub fn compute_alias<'tcx>(
     pre: PreAnalysisData<'tcx>,
     solutions: Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
-    strict: bool,
     tcx: TyCtxt<'tcx>,
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
-    let globals = if !strict {
-        pre.non_fn_globals.iter().fold(
-            HybridBitSet::new_empty(pre.index_info.len()),
-            |mut acc, g| {
-                acc.insert(*g);
-                acc
-            },
-        )
-    } else {
-        let mut filled = HybridBitSet::new_empty(pre.index_info.len());
-        filled.insert_all();
-        filled
-    };
+    let globals = pre.non_fn_globals.iter().fold(
+        HybridBitSet::new_empty(pre.index_info.len()),
+        |mut acc, g| {
+            acc.insert(*g);
+            acc
+        },
+    );
 
     for (def_id, inputs) in inputs_map {
         let body = tcx.optimized_mir(def_id);
@@ -560,7 +551,6 @@ pub fn compute_alias<'tcx>(
                 cand_sol.intersect(&sol);
 
                 if !cand_sol.is_empty() {
-                    // inv_alias.entry(cand_index).or_default().insert(*p);
                     fun_alias.insert(*p);
                     fun_alias.insert(*cand_p);
                 }
@@ -575,10 +565,8 @@ pub fn compute_alias<'tcx>(
         aliases,
         inv_params,
         ends: pre.index_info.ends,
-        var_nodes: pre.var_nodes,
         globals: pre.globals,
         non_fn_globals: globals,
-        solutions,
     }
 }
 

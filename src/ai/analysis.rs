@@ -41,11 +41,7 @@ use super::{
 use crate::{
     compile_util::{self, LoHi},
     graph,
-    may_analysis::{
-        self,
-        analysis::{AliasResults, LocNode},
-        bitset::HybridBitSet,
-    },
+    may_analysis::{self, analysis::AliasResults},
 };
 
 #[derive(Debug, Clone)]
@@ -57,7 +53,6 @@ pub struct AnalysisConfig {
     pub function_times: Option<usize>,
     pub dump_sol: Option<PathBuf>,
     pub use_sol: Option<PathBuf>,
-    pub strict_alias: bool,
 }
 
 impl Default for AnalysisConfig {
@@ -70,7 +65,6 @@ impl Default for AnalysisConfig {
             function_times: None,
             dump_sol: None,
             use_sol: None,
-            strict_alias: false,
         }
     }
 }
@@ -134,23 +128,15 @@ pub struct PreAnalysisContext<'a> {
     pub alias: &'a FxHashSet<usize>,
     pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
     pub ends: &'a Vec<usize>,
-    pub solutions: &'a may_analysis::analysis::Solutions,
-    pub non_fn_globals: &'a HybridBitSet<usize>,
-    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
-    pub strict: bool,
 }
 
 impl<'a> PreAnalysisContext<'a> {
-    fn new(def_id: DefId, pre_data: &'a AliasResults, strict: bool) -> Self {
+    fn new(def_id: DefId, pre_data: &'a AliasResults) -> Self {
         Self {
             local_def_id: def_id.as_local().unwrap(),
             alias: pre_data.aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
-            var_nodes: &pre_data.var_nodes,
             ends: &pre_data.ends,
-            solutions: &pre_data.solutions,
-            non_fn_globals: &pre_data.non_fn_globals,
-            strict,
         }
     }
 
@@ -243,8 +229,7 @@ pub fn analyze(
         std::fs::write(path, arr).unwrap();
     }
 
-    let pre_data =
-        may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, conf.strict_alias, tcx);
+    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, tcx);
 
     let mut ptr_params_map = FxHashMap::default();
     let mut output_params_map = FxHashMap::default();
@@ -280,7 +265,7 @@ pub fn analyze(
             for def_id in def_ids {
                 let start = std::time::Instant::now();
 
-                let pre_context = PreAnalysisContext::new(*def_id, &pre_data, conf.strict_alias);
+                let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
 
                 let mut analyzer =
                     Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -412,8 +397,7 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let pre_context =
-                        PreAnalysisContext::new(*def_id, &pre_data, conf.strict_alias);
+                    let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
