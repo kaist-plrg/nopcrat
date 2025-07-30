@@ -72,7 +72,7 @@ impl TransferedTerminator {
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     pub fn transfer_statement(
-        &mut self,
+        &self,
         stmt: &Statement<'tcx>,
         state: &AbsState,
     ) -> (AbsState, BTreeSet<AbsPath>) {
