@@ -534,13 +534,6 @@ pub fn compute_alias<'tcx>(
         for (i, (index, p)) in params.iter().enumerate() {
             let mut sol = solutions[*index].clone();
             sol.subtract(&locals);
-            sol.intersect(&non_fn_globals);
-
-            for s in sol.iter() {
-                if check_type(&pre, *index, s, tcx) {
-                    inv_param.entry(s).or_default().insert(*p);
-                }
-            }
 
             for (cand_index, cand_p) in params.iter().skip(i + 1) {
                 if !check_type_deref(&pre, *index, *cand_index, tcx) {
@@ -552,6 +545,14 @@ pub fn compute_alias<'tcx>(
                 if !cand_sol.is_empty() {
                     fun_alias.insert(*p);
                     fun_alias.insert(*cand_p);
+                }
+            }
+
+            sol.intersect(&non_fn_globals);
+
+            for s in sol.iter() {
+                if check_type(&pre, *index, s, tcx) {
+                    inv_param.entry(s).or_default().insert(*p);
                 }
             }
         }
