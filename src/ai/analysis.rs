@@ -53,6 +53,8 @@ pub struct AnalysisConfig {
     pub function_times: Option<usize>,
     pub dump_sol: Option<PathBuf>,
     pub use_sol: Option<PathBuf>,
+    pub check_global_alias: bool,
+    pub check_param_alias: bool,
 }
 
 impl Default for AnalysisConfig {
@@ -65,6 +67,8 @@ impl Default for AnalysisConfig {
             function_times: None,
             dump_sol: None,
             use_sol: None,
+            check_global_alias: false,
+            check_param_alias: false,
         }
     }
 }
@@ -213,22 +217,33 @@ pub fn analyze(
         })
         .collect();
 
-    let arena = Arena::new();
-    let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
-    let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
-    let solutions = if let Some(path) = &conf.use_sol {
-        let arr = std::fs::read(path).unwrap();
-        may_analysis::analysis::deserialize_solutions(&arr)
+    let pre_data = if conf.check_global_alias || conf.check_param_alias {
+        let arena = Arena::new();
+        let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
+        let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
+        let solutions = if let Some(path) = &conf.use_sol {
+            let arr = std::fs::read(path).unwrap();
+            may_analysis::analysis::deserialize_solutions(&arr)
+        } else {
+            may_analysis::analysis::analyze(&pre, &tss, tcx)
+        };
+
+        if let Some(path) = &conf.dump_sol {
+            let arr = may_analysis::analysis::serialize_solutions(&solutions);
+            std::fs::write(path, arr).unwrap();
+        }
+
+        Some(may_analysis::analysis::compute_alias(
+            pre,
+            solutions,
+            &inputs_map,
+            tcx,
+            conf.check_global_alias,
+            conf.check_param_alias,
+        ))
     } else {
-        may_analysis::analysis::analyze(&pre, &tss, tcx)
+        None
     };
-
-    if let Some(path) = &conf.dump_sol {
-        let arr = may_analysis::analysis::serialize_solutions(&solutions);
-        std::fs::write(path, arr).unwrap();
-    }
-
-    let pre_data = may_analysis::analysis::compute_alias(pre, solutions, &inputs_map, tcx);
 
     let mut ptr_params_map = FxHashMap::default();
     let mut output_params_map = FxHashMap::default();
@@ -264,7 +279,9 @@ pub fn analyze(
             for def_id in def_ids {
                 let start = std::time::Instant::now();
 
-                let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
+                let pre_context = pre_data
+                    .as_ref()
+                    .map(|pre_data| PreAnalysisContext::new(*def_id, pre_data));
 
                 let mut analyzer =
                     Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -300,13 +317,16 @@ pub fn analyze(
                     &null_checks_map,
                     &call_info_map,
                 );
-                let alias_params = analyzer.check_reachable_globals(
-                    &info_map,
-                    &pre_data.globals,
-                    *def_id,
-                    &call_graph,
-                );
-                nullable_params.extend(alias_params);
+
+                if conf.check_global_alias {
+                    let alias_params = analyzer.check_reachable_globals(
+                        &info_map,
+                        &pre_data.as_ref().unwrap().globals,
+                        *def_id,
+                        &call_graph,
+                    );
+                    nullable_params.extend(alias_params);
+                }
 
                 let exclude_paths: Vec<_> = nullable_params
                     .iter()
@@ -396,7 +416,9 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
+                    let pre_context = pre_data
+                        .as_ref()
+                        .map(|pre_data| PreAnalysisContext::new(*def_id, pre_data));
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
@@ -556,7 +578,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
-    pub pre_context: PreAnalysisContext<'a>,
+    pub pre_context: Option<PreAnalysisContext<'a>>,
 }
 
 struct AnalyzedBody {
@@ -579,7 +601,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         info: &'a FuncInfo,
         conf: &'a AnalysisConfig,
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
-        pre_context: PreAnalysisContext<'a>,
+        pre_context: Option<PreAnalysisContext<'a>>,
     ) -> Self {
         Self {
             tcx,
@@ -883,6 +905,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut indexes = FxHashSet::default();
         let mut visited = FxHashSet::default();
         let mut stack = vec![initial_id];
+        let pre_context = self.pre_context.as_ref().unwrap();
 
         while let Some(callee) = stack.pop() {
             if !visited.insert(callee) {
@@ -895,7 +918,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .filter_map(|def_id| {
                     let local_id = def_id.as_local()?;
                     let start = globals.get(&local_id).copied()?;
-                    let end = self.pre_context.ends[start];
+                    let end = pre_context.ends[start];
                     Some(start..=end)
                 })
                 .flatten();
@@ -908,7 +931,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         indexes
             .into_iter()
-            .flat_map(|index| self.pre_context.check_index_global(index))
+            .flat_map(|index| pre_context.check_index_global(index))
             .collect()
     }
 
@@ -1122,14 +1145,18 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 self.ptr_params.push(i);
-                if self.pre_context.alias.contains(&i) {
-                    start_state.excludes.insert(AbsPath(vec![i]));
-                }
                 AbsValue::arg(idx)
             } else {
                 self.top_value_of_ty(ty)
             };
             start_state.local.set(i, v);
+        }
+
+        if self.conf.check_param_alias {
+            let pre_context = self.pre_context.as_ref().unwrap();
+            for a in pre_context.alias {
+                start_state.excludes.insert(AbsPath(vec![*a]));
+            }
         }
 
         let init_state = start_state.clone();

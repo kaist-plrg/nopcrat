@@ -28,6 +28,10 @@ struct Args {
     max_loop_head_states: Option<usize>,
     #[arg(long)]
     no_widening: bool,
+    #[arg(long)]
+    check_global_alias: bool,
+    #[arg(long)]
+    check_param_alias: bool,
 
     #[arg(short, long)]
     transform: bool,
@@ -99,6 +103,8 @@ fn main() {
         function_times: args.function_times,
         dump_sol: args.dump_sol,
         use_sol: args.use_sol,
+        check_global_alias: args.check_global_alias,
+        check_param_alias: args.check_param_alias,
     };
     let analysis_result = if let Some(dump_file) = &args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();

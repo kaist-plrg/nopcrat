@@ -496,6 +496,8 @@ pub fn compute_alias<'tcx>(
     solutions: Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
     tcx: TyCtxt<'tcx>,
+    check_global_alias: bool,
+    check_param_alias: bool,
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
@@ -535,24 +537,28 @@ pub fn compute_alias<'tcx>(
             let mut sol = solutions[*index].clone();
             sol.subtract(&locals);
 
-            for (cand_index, cand_p) in params.iter().skip(i + 1) {
-                if !check_type_deref(&pre, *index, *cand_index, tcx) {
-                    continue;
-                }
-                let mut cand_sol = solutions[*cand_index].clone();
-                cand_sol.intersect(&sol);
+            if check_param_alias {
+                for (cand_index, cand_p) in params.iter().skip(i + 1) {
+                    if !check_type_deref(&pre, *index, *cand_index, tcx) {
+                        continue;
+                    }
+                    let mut cand_sol = solutions[*cand_index].clone();
+                    cand_sol.intersect(&sol);
 
-                if !cand_sol.is_empty() {
-                    fun_alias.insert(*p);
-                    fun_alias.insert(*cand_p);
+                    if !cand_sol.is_empty() {
+                        fun_alias.insert(*p);
+                        fun_alias.insert(*cand_p);
+                    }
                 }
             }
 
-            sol.intersect(&non_fn_globals);
+            if check_global_alias {
+                sol.intersect(&non_fn_globals);
 
-            for s in sol.iter() {
-                if check_type(&pre, *index, s, tcx) {
-                    inv_param.entry(s).or_default().insert(*p);
+                for s in sol.iter() {
+                    if check_type(&pre, *index, s, tcx) {
+                        inv_param.entry(s).or_default().insert(*p);
+                    }
                 }
             }
         }
