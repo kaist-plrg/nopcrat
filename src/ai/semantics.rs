@@ -335,36 +335,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let callee_excludes: Vec<_> = return_state
                 .excludes
                 .iter()
-                .filter_map(|read| {
-                    let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
-                        ptrs
-                    } else {
-                        return None;
-                    };
-                    Some(ptrs.iter().filter_map(|ptr| {
-                        let (mut path, _) = AbsPath::from_place(ptr, &self.ptr_params)?;
-                        path.0.extend(read.0[1..].to_owned());
-                        Some(path)
-                    }))
-                })
-                .flatten()
+                .flat_map(|exclude| self.get_caller_path(exclude, args))
                 .collect();
             let callee_reads: Vec<_> = return_state
                 .reads
                 .iter()
-                .filter_map(|read| {
-                    let ptrs = if let AbsPtr::Set(ptrs) = &args[read.base() - 1].ptrv {
-                        ptrs
-                    } else {
-                        return None;
-                    };
-                    Some(ptrs.iter().filter_map(|ptr| {
-                        let (mut path, _) = AbsPath::from_place(ptr, &self.ptr_params)?;
-                        path.0.extend(read.0[1..].to_owned());
-                        Some(path)
-                    }))
-                })
-                .flatten()
+                .flat_map(|read| self.get_caller_path(read, args))
                 .collect();
             let mut callee_writes = vec![];
             for write in return_state.writes.iter() {
@@ -1369,5 +1345,20 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 AbsList::Bot => AbsValue::bot(),
             },
         }
+    }
+
+    fn get_caller_path(&self, callee_path: &AbsPath, args: &[AbsValue]) -> Vec<AbsPath> {
+        let ptrs = if let AbsPtr::Set(ptrs) = &args[callee_path.base() - 1].ptrv {
+            ptrs
+        } else {
+            return vec![];
+        };
+        ptrs.iter()
+            .filter_map(|ptr| {
+                let (mut path, _) = AbsPath::from_place(ptr, &self.ptr_params)?;
+                path.0.extend(callee_path.0[1..].to_owned());
+                Some(path)
+            })
+            .collect::<Vec<_>>()
     }
 }

@@ -17,6 +17,10 @@ struct Args {
     dump_analysis_result: Option<PathBuf>,
     #[arg(short, long)]
     use_analysis_result: Option<PathBuf>,
+    #[arg(long)]
+    dump_sol: Option<PathBuf>,
+    #[arg(long)]
+    use_sol: Option<PathBuf>,
 
     #[arg(short, long)]
     verbose: bool,
@@ -24,6 +28,10 @@ struct Args {
     max_loop_head_states: Option<usize>,
     #[arg(long)]
     no_widening: bool,
+    #[arg(long)]
+    check_global_alias: bool,
+    #[arg(long)]
+    check_param_alias: bool,
 
     #[arg(short, long)]
     transform: bool,
@@ -93,6 +101,10 @@ fn main() {
         verbose: args.verbose,
         print_functions: args.print_function.into_iter().collect(),
         function_times: args.function_times,
+        dump_sol: args.dump_sol,
+        use_sol: args.use_sol,
+        check_global_alias: args.check_global_alias,
+        check_param_alias: args.check_param_alias,
     };
     let analysis_result = if let Some(dump_file) = &args.use_analysis_result {
         let dump_file = File::open(dump_file).unwrap();
