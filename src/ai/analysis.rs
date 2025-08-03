@@ -298,7 +298,6 @@ pub fn analyze(
                     states,
                     writes_map,
                     init_state,
-                    null_checks_map,
                     call_info_map,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
@@ -314,7 +313,6 @@ pub fn analyze(
                     &states,
                     body,
                     &writes_map,
-                    &null_checks_map,
                     &call_info_map,
                 );
 
@@ -577,15 +575,15 @@ pub struct Analyzer<'a, 'tcx> {
     conf: &'a AnalysisConfig,
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
     pub ptr_params: Vec<usize>,
+    pub ptr_params_inv: FxHashMap<usize, usize>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
     pub pre_context: Option<PreAnalysisContext<'a>>,
 }
 
 struct AnalyzedBody {
-    states: BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+    states: BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
-    null_checks_map: BTreeMap<usize, BTreeSet<Location>>,
     call_info_map: BTreeMap<Location, Vec<CallKind>>,
 }
 
@@ -609,6 +607,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             conf,
             summaries,
             ptr_params: vec![],
+            ptr_params_inv: FxHashMap::default(),
             call_args: BTreeMap::new(),
             pre_context,
         }
@@ -801,23 +800,46 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_reachable_locs(
         &self,
         body: &Body<'_>,
-        null_checks_map: &'a BTreeMap<usize, BTreeSet<Location>>,
         diff_locs: BTreeSet<Location>,
         param: usize,
     ) -> BTreeMap<BasicBlock, BTreeSet<Location>> {
         let mut reachable_group: BTreeMap<BasicBlock, BTreeSet<Location>> = BTreeMap::new();
-        if let Some(null_checks) = null_checks_map.get(&param) {
-            for loc in diff_locs {
-                if null_checks
-                    .iter()
-                    .rev()
-                    .any(|check_loc| self.is_reachable_from(&loc, check_loc, body))
-                {
-                    reachable_group.entry(loc.block).or_default().insert(loc);
+        // TODO
+        // if let Some(null_checks) = null_checks_map.get(&param) {
+        //     for loc in diff_locs {
+        //         if null_checks
+        //             .iter()
+        //             .rev()
+        //             .any(|check_loc| self.is_reachable_from(&loc, check_loc, body))
+        //         {
+        //             reachable_group.entry(loc.block).or_default().insert(loc);
+        //         }
+        //     }
+        // }
+        reachable_group
+    }
+
+    // Compute locations where the parameters are non-null or null
+    fn compute_nonnull_null_locs(
+        &self,
+        result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
+    ) -> (Vec<BTreeSet<Location>>, Vec<BTreeSet<Location>>) {
+        let inputs = self.info.inputs;
+        let mut nonnull_locs = vec![BTreeSet::new(); inputs];
+        let mut null_locs = vec![BTreeSet::new(); inputs];
+        for (loc, sts) in result {
+            for (_, nulls) in sts.keys() {
+                for i in 0..inputs {
+                    let arg = self.ptr_params_inv.get(&(i + 1)).unwrap();
+                    if nulls.is_null(arg) {
+                        null_locs[i].insert(*loc);
+                    } else {
+                        nonnull_locs[i].insert(*loc);
+                    }
                 }
             }
         }
-        reachable_group
+        (nonnull_locs, null_locs)
     }
 
     // We consider a parameter to be nullable if below sets are not the same:
@@ -826,13 +848,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn find_nullable_params(
         &self,
         tcx: TyCtxt<'tcx>,
-        result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+        result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
-        null_checks_map: &BTreeMap<usize, BTreeSet<Location>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
     ) -> BTreeSet<usize> {
-        let (nonnull_locs, null_locs) = compute_nonnull_null_locs(result, self.info.inputs);
+        let (nonnull_locs, null_locs) = self.compute_nonnull_null_locs(result);
 
         nonnull_locs
             .into_iter()
@@ -845,9 +866,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
                 let param = i + 1;
                 let nonnull_diff =
-                    self.compute_reachable_locs(body, null_checks_map, &nonnull - &null, param);
+                    self.compute_reachable_locs(body, &nonnull - &null, param);
                 let null_diff =
-                    self.compute_reachable_locs(body, null_checks_map, &null - &nonnull, param);
+                    self.compute_reachable_locs(body, &null - &nonnull, param);
                 let nonnull_locs = self.extract_locs(&nonnull_diff);
                 let null_locs = self.extract_locs(&null_diff);
 
@@ -986,7 +1007,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .return_states
                 .values()
                 .filter_map(|st| {
-                    if st.nulls.contains(&AbsPath(vec![i])) {
+                    let arg = self.ptr_params_inv.get(&i).unwrap();
+                    if st.nulls.is_null(arg) {
                         None
                     } else {
                         let writes: BTreeSet<_> = st
@@ -1063,7 +1085,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn find_complete_write(
         &self,
         param: &mut OutputParam,
-        result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+        result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_args: &BTreeMap<Location, BTreeMap<usize, usize>>,
         def_id: DefId,
@@ -1136,7 +1158,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn analyze_body(&mut self, body: &Body<'tcx>) -> AnalyzedBody {
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
-        start_state.nulls = MustPathSet::top();
+        start_state.nulls = AbsNulls::bot();
 
         for i in 1..=self.info.inputs {
             let local = Local::from_usize(i);
@@ -1144,7 +1166,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let v = if let TyKind::RawPtr(ty, ..) = ty.kind() {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
+                start_state.nulls.push_top();
                 self.ptr_params.push(i);
+                self.ptr_params_inv.insert(i, idx);
                 AbsValue::arg(idx)
             } else {
                 self.top_value_of_ty(ty)
@@ -1180,7 +1204,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             BTreeSet::new()
         };
 
-        let (states, writes_map, null_checks_map, call_info_map) = 'analysis_loop: loop {
+        let (states, writes_map, call_info_map) = 'analysis_loop: loop {
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -1190,7 +1214,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 start_state.clone(),
             );
             let mut writes_map: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-            let mut null_checks_map: BTreeMap<usize, BTreeSet<_>> = BTreeMap::new();
             let mut call_info_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
             self.call_args.clear();
@@ -1218,16 +1241,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             next_states,
                             next_locations,
                             writes,
-                            null_check,
                             call_info,
                         } = self.transfer_terminator(bbd.terminator(), state, label.location);
-                        // Record locations and states of is_null checks
-                        if let Some(arg) = null_check {
-                            null_checks_map
-                                .entry(arg)
-                                .or_default()
-                                .insert(label.location);
-                        }
                         // Record locations and call info of function calls
                         call_info_map
                             .entry(label.location)
@@ -1326,14 +1341,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     continue 'analysis_loop;
                 }
             }
-            break (states, writes_map, null_checks_map, call_info_map);
+            break (states, writes_map, call_info_map);
         };
 
         AnalyzedBody {
             states,
             writes_map,
             init_state,
-            null_checks_map,
             call_info_map,
         }
     }
@@ -1354,13 +1368,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 #[derive(Clone, Debug)]
 pub struct FunctionSummary {
     pub init_state: AbsState,
-    pub return_states: BTreeMap<(MustPathSet, MustPathSet), AbsState>,
+    pub return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
 }
 
 impl FunctionSummary {
     fn new(
         init_state: AbsState,
-        return_states: BTreeMap<(MustPathSet, MustPathSet), AbsState>,
+        return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
     ) -> Self {
         Self {
             init_state,
@@ -1566,7 +1580,7 @@ impl<'tcx> MVisitor<'tcx> for GlobalVisitor<'tcx> {
 pub struct Label {
     pub location: Location,
     pub writes: MustPathSet,
-    pub nulls: MustPathSet,
+    pub nulls: AbsNulls,
 }
 
 #[derive(Debug)]
@@ -1646,7 +1660,7 @@ impl TypeInfo {
 
 fn analysis_result_to_string(
     body: &Body<'_>,
-    states: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
+    states: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
     source_map: &SourceMap,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut res = String::new();
@@ -1895,28 +1909,6 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
             })
             .collect()
     }
-}
-
-// Compute locations where the parameters are non-null or null
-fn compute_nonnull_null_locs(
-    result: &BTreeMap<Location, BTreeMap<(MustPathSet, MustPathSet), AbsState>>,
-    inputs: usize,
-) -> (Vec<BTreeSet<Location>>, Vec<BTreeSet<Location>>) {
-    let mut nonnull_locs = vec![BTreeSet::new(); inputs];
-    let mut null_locs = vec![BTreeSet::new(); inputs];
-    for (loc, sts) in result {
-        for (_, nulls) in sts.keys() {
-            for i in 0..inputs {
-                let path = AbsPath(vec![i + 1]);
-                if nulls.contains(&path) {
-                    null_locs[i].insert(*loc);
-                } else {
-                    nonnull_locs[i].insert(*loc);
-                }
-            }
-        }
-    }
-    (nonnull_locs, null_locs)
 }
 
 #[allow(unused)]
