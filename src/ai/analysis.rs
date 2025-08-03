@@ -226,13 +226,8 @@ pub fn analyze(
                         analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
                     );
                 }
-                let nullable_params = analyzer.find_nullable_params(
-                    tcx,
-                    &states,
-                    body,
-                    &writes_map,
-                    &call_info_map,
-                );
+                let nullable_params =
+                    analyzer.find_nullable_params(tcx, &states, body, &writes_map, &call_info_map);
 
                 let nullable_paths: Vec<_> = nullable_params
                     .iter()
@@ -664,46 +659,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect::<BTreeSet<_>>()
     }
 
-    fn is_reachable_from(&self, loc: &Location, check: &Location, body: &Body<'_>) -> bool {
-        if check.block == loc.block {
-            // loc and check should be different
-            return check.statement_index < loc.statement_index;
-        }
-
-        let dominators = body.basic_blocks.dominators();
-
-        if dominators.dominates(check.block, loc.block) {
-            return true;
-        }
-
-        let mut visited = BTreeSet::new();
-        let mut work_list = VecDeque::from(vec![check.block]);
-        while let Some(bb) = work_list.pop_front() {
-            if bb == loc.block {
-                return true;
-            }
-            // If we reach a loop head, stop searching that path
-            if self.info.loop_blocks.contains_key(&bb)
-                && self.info.loop_blocks[&bb].contains(&check.block)
-            {
-                continue;
-            }
-            if visited.insert(bb) {
-                work_list.extend(body.basic_blocks.successors(bb));
-            }
-        }
-        false
-    }
-
     // To derive the set of non-null locations, we check the location is reachable from
     // any null check (is_null) location
-    fn compute_reachable_locs(
-        &self,
-        body: &Body<'_>,
-        diff_locs: BTreeSet<Location>,
-        param: usize,
-    ) -> BTreeMap<BasicBlock, BTreeSet<Location>> {
-        let mut reachable_group: BTreeMap<BasicBlock, BTreeSet<Location>> = BTreeMap::new();
+    fn compute_reachable_locs(&self) -> BTreeMap<BasicBlock, BTreeSet<Location>> {
         // TODO
         // if let Some(null_checks) = null_checks_map.get(&param) {
         //     for loc in diff_locs {
@@ -716,7 +674,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         //         }
         //     }
         // }
-        reachable_group
+        BTreeMap::new()
     }
 
     // Compute locations where the parameters are non-null or null
@@ -759,16 +717,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .into_iter()
             .zip(null_locs)
             .enumerate()
-            .filter_map(|(i, (nonnull, null))| {
+            .filter_map(|(i, (_nonnull, null))| {
                 if null.is_empty() {
                     return None;
                 }
 
                 let param = i + 1;
-                let nonnull_diff =
-                    self.compute_reachable_locs(body, &nonnull - &null, param);
-                let null_diff =
-                    self.compute_reachable_locs(body, &null - &nonnull, param);
+                let nonnull_diff = self.compute_reachable_locs();
+                let null_diff = self.compute_reachable_locs();
                 let nonnull_locs = self.extract_locs(&nonnull_diff);
                 let null_locs = self.extract_locs(&null_diff);
 

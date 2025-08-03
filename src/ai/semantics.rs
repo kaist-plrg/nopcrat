@@ -52,17 +52,17 @@ impl TransferedTerminator {
 
     #[inline]
     fn empty() -> Self {
-        Self::new(vec![], vec![], BTreeSet::new(),vec![])
+        Self::new(vec![], vec![], BTreeSet::new(), vec![])
     }
 
     #[inline]
     fn state_location(st: AbsState, loc: Location) -> Self {
-        Self::new(vec![st], vec![loc], BTreeSet::new(),vec![])
+        Self::new(vec![st], vec![loc], BTreeSet::new(), vec![])
     }
 
     #[inline]
     fn state_locations(st: AbsState, locs: Vec<Location>) -> Self {
-        Self::new(vec![st], locs, BTreeSet::new(),vec![])
+        Self::new(vec![st], locs, BTreeSet::new(), vec![])
     }
 }
 
@@ -151,9 +151,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     reads.extend(reads2);
                 }
 
-                let (new_states, writes, call_info) = if let Some(fns) =
-                    func.fnv.gamma()
-                {
+                let (new_states, writes, call_info) = if let Some(fns) = func.fnv.gamma() {
                     let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
                     let mut ret_writes = BTreeSet::new();
                     let mut call_info = vec![];
@@ -235,25 +233,24 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let mut offsets = vec![];
         let mut writes = vec![];
         let name = self.def_id_to_string(callee);
-        let (vns, call_kind) = if callee.is_local() {
+        let (vs, nulls, call_kind) = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
                 return self
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
                 (
-                    vec![(
-                        self.transfer_c_call(callee, args, &mut state, &mut reads),
-                        None,
-                    )],
+                    vec![self.transfer_c_call(callee, args, &mut state, &mut reads)],
+                    None,
                     CallKind::C,
                 )
             } else if name.contains("{impl#") {
                 (
-                    vec![(self.transfer_method_call(callee, args, &mut reads), None)],
+                    vec![self.transfer_method_call(callee, args, &mut reads)],
+                    None,
                     CallKind::Method,
                 )
             } else {
-                (vec![(AbsValue::top(), None)], CallKind::TOP)
+                (vec![AbsValue::top()], None, CallKind::TOP)
             }
         } else {
             self.transfer_rust_call(
@@ -265,19 +262,30 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 &mut writes,
             )
         };
-        let (new_states, writess): (Vec<_>, Vec<_>) = vns
+        let (mut new_states, writess): (Vec<_>, Vec<_>) = vs
             .into_iter()
-            .map(|(v, null)| {
+            .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
                 let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
-                if let Some((i, n)) = null {
-                    new_state.add_null(i, n);
-                }
                 (new_state, writes)
             })
             .unzip();
+
+        if let Some(nulls) = nulls {
+            assert!(new_states.len() == nulls.len());
+            new_states.iter_mut().zip(nulls).for_each(|(state, n)| {
+                match n {
+                    AbsNull::Null(i) | AbsNull::Nonnull(i) => {
+                        let arg = self.ptr_params_inv.get(&i).unwrap();
+                        state.add_null(*arg, n);
+                    }
+                    AbsNull::Top => (), // Top is not added to nulls
+                }
+            });
+        }
+
         let writes = writess.into_iter().flatten().collect();
         (new_states, writes, call_kind)
     }
@@ -490,7 +498,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         offsets: &mut Vec<AbsPath>,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
-    ) -> (Vec<(AbsValue, Option<(usize, AbsNull)>)>, CallKind) {
+    ) -> (Vec<AbsValue>, Option<Vec<AbsNull>>, CallKind) {
         let name = self.def_id_to_string(callee);
         let mut call_kind = CallKind::RustPure;
         let mut segs: Vec<_> = name.split("::").collect();
@@ -554,10 +562,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     if args.len() == 1 && !t {
                         let arg = *args.first().unwrap();
                         return (
-                            vec![
-                                (AbsValue::bool_true(), Some((arg, AbsNull::Null))),
-                                (AbsValue::bool_false(), Some((arg, AbsNull::Nonnull))),
-                            ],
+                            vec![AbsValue::bool_true(), AbsValue::bool_false()],
+                            Some(vec![AbsNull::null(arg), AbsNull::nonnull(arg)]),
                             call_kind,
                         );
                     }
@@ -700,7 +706,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             _ => todo!("{}", name),
         };
-        (vec![(v, None)], call_kind)
+        (vec![v], None, call_kind)
     }
 
     fn transfer_rvalue(

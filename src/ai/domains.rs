@@ -108,10 +108,15 @@ impl AbsState {
         res
     }
 
-    pub fn add_null(&mut self, i: usize, n: AbsNull) {
+    pub fn add_null(&mut self, arg: usize, n: AbsNull) {
+        let i = match n {
+            AbsNull::Top => return,
+            AbsNull::Null(i) => i,
+            AbsNull::Nonnull(i) => i,
+        };
         let path = AbsPath(vec![i]);
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
-            self.nulls.set(i, n);
+            self.nulls.set(arg, n);
         }
     }
 }
@@ -3213,16 +3218,16 @@ impl MayPathSet {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsNull {
     Top,
-    Null,
-    Nonnull,
+    Null(usize),
+    Nonnull(usize),
 }
 
 impl std::fmt::Debug for AbsNull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Top => write!(f, "⊤"),
-            Self::Null => write!(f, "null"),
-            Self::Nonnull => write!(f, "nonnull"),
+            Self::Null(_) => write!(f, "null"),
+            Self::Nonnull(_) => write!(f, "nonnull"),
         }
     }
 }
@@ -3232,29 +3237,39 @@ impl AbsNull {
         Self::Top
     }
 
-    fn null() -> Self {
-        Self::Null
+    pub fn null(i: usize) -> Self {
+        Self::Null(i)
     }
 
-    fn nonnull() -> Self {
-        Self::Nonnull
+    pub fn nonnull(i: usize) -> Self {
+        Self::Nonnull(i)
     }
 
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
-            (Self::Null, Self::Null) => Self::Null,
-            (Self::Nonnull, Self::Nonnull) => Self::Nonnull,
+            (Self::Null(i1), Self::Null(i2)) => {
+                if i1 == i2 {
+                    Self::Null(*i1)
+                } else {
+                    panic!()
+                }
+            }
+            (Self::Nonnull(i1), Self::Nonnull(i2)) => {
+                if i1 == i2 {
+                    Self::Nonnull(*i1)
+                } else {
+                    panic!()
+                }
+            }
             _ => Self::Top,
         }
     }
 
     fn ord(&self, other: &Self) -> bool {
-        match (self, other) {
-            (_, Self::Top) => true,
-            (Self::Null, Self::Null) => true,
-            (Self::Nonnull, Self::Nonnull) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (_, Self::Top) | (Self::Null(_), Self::Null(_)) | (Self::Nonnull(_), Self::Nonnull(_))
+        )
     }
 
     fn widen(&self, other: &Self) -> Self {
@@ -3290,7 +3305,7 @@ impl AbsNulls {
     }
 
     pub fn widen(&self, other: &Self) -> Self {
-       Self(
+        Self(
             (0..self.0.len().max(other.0.len()))
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(n1), Some(n2)) => n1.widen(n2),
@@ -3302,29 +3317,26 @@ impl AbsNulls {
     }
 
     pub fn ord(&self, other: &Self) -> bool {
-        self.0.len() <= other.0.len() && self
-            .0
-            .iter()
-            .zip(other.0.iter())
-            .all(|(n1, n2)| n1.ord(n2))
+        self.0.len() <= other.0.len()
+            && self.0.iter().zip(other.0.iter()).all(|(n1, n2)| n1.ord(n2))
     }
 
     pub fn push_top(&mut self) {
         self.0.push(AbsNull::top());
     }
 
-    fn get(&self, i: usize) -> &AbsNull {
-        &self.0[i]
+    pub fn get(&self, arg: usize) -> &AbsNull {
+        &self.0[arg]
     }
 
-    pub fn set(&mut self, i: usize, n: AbsNull) {
-        while self.0.len() < i {
+    pub fn set(&mut self, arg: usize, n: AbsNull) {
+        while self.0.len() < arg {
             self.0.push(AbsNull::top());
         }
-        if self.0.len() == i {
+        if self.0.len() == arg {
             self.0.push(n);
         } else {
-            self.0[i] = n;
+            self.0[arg] = n;
         }
     }
 
@@ -3339,11 +3351,9 @@ impl AbsNulls {
 
     pub fn is_null(&self, arg: &usize) -> bool {
         if let Some(n) = self.0.get(*arg) {
-            matches!(n, AbsNull::Null)
+            matches!(n, AbsNull::Null(_))
         } else {
             false
         }
     }
 }
-
-
