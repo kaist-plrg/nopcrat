@@ -95,6 +95,7 @@ pub struct PreAnalysisData<'tcx> {
     alloc_fns: FxHashSet<LocalDefId>,
 
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+    pub call_args: FxHashMap<LocalDefId, Vec<Vec<Option<usize>>>>,
     indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, usize>>,
 
     index_info: IndexInfo<'tcx>,
@@ -237,6 +238,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut index_prefixes = FxHashMap::default();
 
     let mut indirect_calls: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
+    let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
@@ -299,7 +301,10 @@ pub fn pre_analyze<'a, 'tcx>(
 
         for (bb, bbd) in item.body.basic_blocks.iter_enumerated() {
             let TerminatorKind::Call {
-                func, destination, ..
+                func,
+                args,
+                destination,
+                ..
             } = &bbd.terminator().kind
             else {
                 continue;
@@ -328,6 +333,16 @@ pub fn pre_analyze<'a, 'tcx>(
                             .get_mut(&item.local_def_id)
                             .unwrap()
                             .insert(local_def_id);
+                        let args = args
+                            .iter()
+                            .map(|a| {
+                                a.node.place().map(|p| {
+                                    let var = Var::Local(item.local_def_id, p.local);
+                                    vars[&var]
+                                })
+                            })
+                            .collect();
+                        call_args.entry(local_def_id).or_default().push(args)
                     }
                 }
             }
@@ -341,6 +356,7 @@ pub fn pre_analyze<'a, 'tcx>(
             let Var::Alloc(alloc_def_id, _) = alloc else {
                 unreachable!()
             };
+
             index_info.push(len + *end, *ty, alloc_def_id);
         }
     }
@@ -349,6 +365,7 @@ pub fn pre_analyze<'a, 'tcx>(
         bodies,
         alloc_fns,
         call_graph,
+        call_args,
         indirect_calls,
         index_info,
         globals,
@@ -490,6 +507,39 @@ fn check_type<'tcx>(
     }
 }
 
+fn collect_param_alias<'tcx>(
+    pre: &PreAnalysisData<'tcx>,
+    solutions: &Solutions,
+    locals: &HybridBitSet<usize>,
+    args: &[Option<usize>],
+    params: &[(usize, usize)],
+    fun_alias: &mut FxHashSet<usize>,
+    tcx: TyCtxt<'tcx>,
+) {
+    for (skip, (_, i1)) in params.iter().enumerate() {
+        if fun_alias.contains(i1) {
+            continue;
+        }
+        for (_, i2) in params.iter().skip(skip + 1) {
+            let index1 = args[*i1 - 1].unwrap();
+            let index2 = args[*i2 - 1].unwrap();
+            if fun_alias.contains(i2) || !check_type_deref(pre, index1, index2, tcx) {
+                continue;
+            }
+
+            let mut sol1 = solutions[index1].clone();
+
+            sol1.intersect(&solutions[index2]);
+            sol1.subtract(locals);
+
+            if !sol1.is_empty() {
+                fun_alias.insert(*i1);
+                fun_alias.insert(*i2);
+            }
+        }
+    }
+}
+
 // Computes the aliasing information for the function parameters
 pub fn compute_alias<'tcx>(
     pre: PreAnalysisData<'tcx>,
@@ -533,31 +583,34 @@ pub fn compute_alias<'tcx>(
             locals.insert(g_index);
         }
 
-        for (i, (index, p)) in params.iter().enumerate() {
-            let mut sol = solutions[*index].clone();
-            sol.subtract(&locals);
+        if check_param_alias && pre.call_args.contains_key(&local_def_id) {
+            let call_args = pre.call_args.get(&local_def_id).unwrap();
 
-            if check_param_alias {
-                for (cand_index, cand_p) in params.iter().skip(i + 1) {
-                    if !check_type_deref(&pre, *index, *cand_index, tcx) {
-                        continue;
-                    }
-                    let mut cand_sol = solutions[*cand_index].clone();
-                    cand_sol.intersect(&sol);
-
-                    if !cand_sol.is_empty() {
-                        fun_alias.insert(*p);
-                        fun_alias.insert(*cand_p);
-                    }
+            for args in call_args {
+                if fun_alias.len() == params.len() {
+                    break;
                 }
+                collect_param_alias(
+                    &pre,
+                    &solutions,
+                    &locals,
+                    args,
+                    &params,
+                    &mut fun_alias,
+                    tcx,
+                )
             }
+        }
 
-            if check_global_alias {
+        if check_global_alias {
+            for (index, p) in params {
+                let mut sol = solutions[index].clone();
+                sol.subtract(&locals);
                 sol.intersect(&non_fn_globals);
 
                 for s in sol.iter() {
-                    if check_type(&pre, *index, s, tcx) {
-                        inv_param.entry(s).or_default().insert(*p);
+                    if check_type(&pre, index, s, tcx) {
+                        inv_param.entry(s).or_default().insert(p);
                     }
                 }
             }
