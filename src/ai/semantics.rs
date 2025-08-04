@@ -275,15 +275,16 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         if let Some(nulls) = nulls {
             assert!(new_states.len() == nulls.len());
-            new_states.iter_mut().zip(nulls).for_each(|(state, n)| {
-                match n {
+            new_states
+                .iter_mut()
+                .zip(nulls)
+                .for_each(|(state, n)| match n {
                     AbsNull::Null(i) | AbsNull::Nonnull(i) => {
                         let arg = self.ptr_params_inv.get(&i).unwrap();
                         state.add_null(*arg, n);
                     }
-                    AbsNull::Top => (), // Top is not added to nulls
-                }
-            });
+                    AbsNull::Top => unreachable!(),
+                });
         }
 
         let writes = writess.into_iter().flatten().collect();
