@@ -3297,7 +3297,7 @@ impl AbsNulls {
             (0..self.0.len().max(other.0.len()))
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(n1), Some(n2)) => n1.join(n2),
-                    (Some(_), None) | (None, Some(_)) => AbsNull::top(),
+                    (Some(n), None) | (None, Some(n)) => *n,
                     (None, None) => unreachable!(),
                 })
                 .collect(),
@@ -3309,7 +3309,7 @@ impl AbsNulls {
             (0..self.0.len().max(other.0.len()))
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(n1), Some(n2)) => n1.widen(n2),
-                    (Some(_), None) | (None, Some(_)) => AbsNull::top(),
+                    (Some(n), None) | (None, Some(n)) => *n,
                     (None, None) => unreachable!(),
                 })
                 .collect(),
@@ -3352,6 +3352,14 @@ impl AbsNulls {
     pub fn is_null(&self, arg: &usize) -> bool {
         if let Some(n) = self.0.get(*arg) {
             matches!(n, AbsNull::Null(_))
+        } else {
+            false
+        }
+    }
+
+    pub fn is_nonnull(&self, arg: &usize) -> bool {
+        if let Some(n) = self.0.get(*arg) {
+            matches!(n, AbsNull::Nonnull(_))
         } else {
             false
         }
