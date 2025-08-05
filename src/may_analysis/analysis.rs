@@ -517,13 +517,12 @@ fn collect_param_alias<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) {
     for (skip, (_, i1)) in params.iter().enumerate() {
-        if fun_alias.contains(i1) {
-            continue;
-        }
         for (_, i2) in params.iter().skip(skip + 1) {
             let index1 = args[*i1 - 1].unwrap();
             let index2 = args[*i2 - 1].unwrap();
-            if fun_alias.contains(i2) || !check_type_deref(pre, index1, index2, tcx) {
+            if (fun_alias.contains(i1) && fun_alias.contains(i2))
+                || !check_type_deref(pre, index1, index2, tcx)
+            {
                 continue;
             }
 
