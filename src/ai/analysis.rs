@@ -220,10 +220,13 @@ pub fn analyze(
                     init_state,
                     call_info_map,
                 } = analyzer.analyze_body(body);
-                println!(
-                    "{}",
-                    analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
-                );
+                if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
+                    tracing::info!(
+                        "{:?}\n{}",
+                        def_id,
+                        analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
+                    );
+                }
 
                 let nullable_params =
                     analyzer.find_nullable_params(tcx, &states, body, &writes_map, &call_info_map);
@@ -654,28 +657,40 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-    ) -> Vec<(BTreeSet<Location>, BTreeSet<Location>, BTreeSet<Location>)> {
+    ) -> Vec<(BTreeSet<Location>, BTreeSet<Location>)> {
         let inputs = self.info.inputs;
         let mut locs = vec![];
 
         for i in 1..=inputs {
             let mut nonnull_locs = BTreeSet::new();
             let mut null_locs = BTreeSet::new();
-            let mut top_locs = BTreeSet::new();
+            // collection of locations except non-null or null
+            let mut non_nonnull_locs = BTreeSet::new();
+            let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
                     if let Some(arg) = self.ptr_params_inv.get(&i) {
-                        if nulls.is_null(arg) {
-                            null_locs.insert(*loc);
-                        } else if nulls.is_nonnull(arg) {
-                            nonnull_locs.insert(*loc);
-                        } else {
-                            top_locs.insert(*loc);
+                        match nulls.get(*arg) {
+                            AbsNull::Null(_) => {
+                                null_locs.insert(*loc);
+                                non_nonnull_locs.insert(*loc);
+                            }
+                            AbsNull::Nonnull(_) => {
+                                nonnull_locs.insert(*loc);
+                                non_null_locs.insert(*loc);
+                            }
+                            AbsNull::Top => {
+                                non_nonnull_locs.insert(*loc);
+                                non_null_locs.insert(*loc);
+                            }
                         }
                     }
                 }
             }
-            locs.push((nonnull_locs, null_locs, top_locs));
+
+            let nonnull_locs = nonnull_locs.difference(&non_nonnull_locs).cloned().collect();
+            let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
+            locs.push((nonnull_locs, null_locs));
         }
         locs
     }
@@ -694,15 +709,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         self.compute_nonnull_null_locs(result)
             .into_iter()
             .enumerate()
-            .filter_map(|(i, (nonnull, null, top))| {
+            .filter_map(|(i, (nonnull, null))| {
                 if null.is_empty() && nonnull.is_empty() {
                     return None;
                 }
 
                 let param = i + 1;
-                let comp_null = nonnull.union(&null).cloned().collect::<BTreeSet<_>>();
-                let comp_nonnull = null.union(&top).cloned().collect::<BTreeSet<_>>();
-                let nonnull_diff = nonnull.difference(&comp_nonnull).cloned().fold(
+                let nonnull_diff = nonnull.into_iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
                         acc.entry(loc.block).or_default().insert(loc);
@@ -710,7 +723,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     },
                 );
                 let nonnull_locs = nonnull_diff.values().flatten().collect::<BTreeSet<_>>();
-                let null_diff = null.difference(&comp_null).cloned().fold(
+                let null_diff = null.into_iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
                         acc.entry(loc.block).or_default().insert(loc);
@@ -718,8 +731,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     },
                 );
                 let null_locs = null_diff.values().flatten().collect::<BTreeSet<_>>();
-                println!("{:?}", null_locs);
-                println!("{:?}", nonnull_locs);
 
                 let check = |block, locs: &BTreeSet<_>, diff_locs| {
                     let mut local_writes = BTreeSet::new();
