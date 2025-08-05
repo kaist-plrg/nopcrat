@@ -504,7 +504,7 @@ fn test_bitfields() {
         #[derive(BitfieldStruct)]
         struct S {
             #[bitfield(name = \"x\", ty = \"libc::c_uint\", bits = \"0..=0\")]
-            a: [u8; 1],
+            x: [u8; 1],
         }
         unsafe fn f(s: *mut S) -> libc::c_uint {
             (*s).x()
@@ -528,7 +528,7 @@ fn test_bitfields_set() {
         #[derive(BitfieldStruct)]
         struct S {
             #[bitfield(name = \"x\", ty = \"libc::c_uint\", bits = \"0..=0\")]
-            a: [u8; 1],
+            x: [u8; 1],
         }
         unsafe fn f(s: *mut S) {
             (*s).set_x(0)
