@@ -570,7 +570,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                                 return (
                                     vec![AbsValue::bool_true(), AbsValue::bool_false()],
                                     vec![(i, arg, AbsNull::null()), (i, arg, AbsNull::nonnull())],
-                                call_kind,
+                                    call_kind,
                                 );
                             }
                         }
