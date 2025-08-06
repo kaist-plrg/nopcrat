@@ -309,13 +309,8 @@ pub fn analyze(
                     );
                 }
 
-                let mut nullable_params = analyzer.find_nullable_params(
-                    tcx,
-                    &states,
-                    body,
-                    &writes_map,
-                    &call_info_map,
-                );
+                let mut nullable_params =
+                    analyzer.find_nullable_params(tcx, &states, body, &writes_map, &call_info_map);
 
                 if conf.check_global_alias {
                     let alias_params = analyzer.check_reachable_globals(
