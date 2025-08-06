@@ -671,11 +671,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 for (_, nulls) in sts.keys() {
                     if let Some(arg) = self.ptr_params_inv.get(&i) {
                         match nulls.get(*arg) {
-                            AbsNull::Null(_) => {
+                            AbsNull::Null => {
                                 null_locs.insert(*loc);
                                 non_nonnull_locs.insert(*loc);
                             }
-                            AbsNull::Nonnull(_) => {
+                            AbsNull::Nonnull => {
                                 nonnull_locs.insert(*loc);
                                 non_null_locs.insert(*loc);
                             }

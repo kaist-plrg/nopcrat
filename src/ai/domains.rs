@@ -108,13 +108,7 @@ impl AbsState {
         res
     }
 
-    pub fn add_null(&mut self, arg: usize, n: AbsNull) {
-        let i = match n {
-            AbsNull::Top => return,
-            AbsNull::Null(i) => i,
-            AbsNull::Nonnull(i) => i,
-        };
-        let path = AbsPath(vec![i]);
+    pub fn add_null(&mut self, path: AbsPath, arg: usize, n: AbsNull) {
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
             self.nulls.set(arg, n);
         }
@@ -3218,16 +3212,16 @@ impl MayPathSet {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsNull {
     Top,
-    Null(usize),
-    Nonnull(usize),
+    Null,
+    Nonnull,
 }
 
 impl std::fmt::Debug for AbsNull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Top => write!(f, "⊤"),
-            Self::Null(_) => write!(f, "null"),
-            Self::Nonnull(_) => write!(f, "nonnull"),
+            Self::Null => write!(f, "null"),
+            Self::Nonnull => write!(f, "nonnull"),
         }
     }
 }
@@ -3237,30 +3231,18 @@ impl AbsNull {
         Self::Top
     }
 
-    pub fn null(i: usize) -> Self {
-        Self::Null(i)
+    pub fn null() -> Self {
+        Self::Null
     }
 
-    pub fn nonnull(i: usize) -> Self {
-        Self::Nonnull(i)
+    pub fn nonnull() -> Self {
+        Self::Nonnull
     }
 
     fn join(&self, other: &Self) -> Self {
         match (self, other) {
-            (Self::Null(i1), Self::Null(i2)) => {
-                if i1 == i2 {
-                    Self::Null(*i1)
-                } else {
-                    panic!()
-                }
-            }
-            (Self::Nonnull(i1), Self::Nonnull(i2)) => {
-                if i1 == i2 {
-                    Self::Nonnull(*i1)
-                } else {
-                    panic!()
-                }
-            }
+            (Self::Null, Self::Null) => Self::Null,
+            (Self::Nonnull, Self::Nonnull) => Self::Nonnull,
             _ => Self::Top,
         }
     }
@@ -3268,7 +3250,7 @@ impl AbsNull {
     fn ord(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (_, Self::Top) | (Self::Null(_), Self::Null(_)) | (Self::Nonnull(_), Self::Nonnull(_))
+            (_, Self::Top) | (Self::Null, Self::Null) | (Self::Nonnull, Self::Nonnull)
         )
     }
 
@@ -3351,7 +3333,7 @@ impl AbsNulls {
 
     pub fn is_null(&self, arg: &usize) -> bool {
         if let Some(n) = self.0.get(*arg) {
-            matches!(n, AbsNull::Null(_))
+            matches!(n, AbsNull::Null)
         } else {
             false
         }
@@ -3359,7 +3341,7 @@ impl AbsNulls {
 
     pub fn is_nonnull(&self, arg: &usize) -> bool {
         if let Some(n) = self.0.get(*arg) {
-            matches!(n, AbsNull::Nonnull(_))
+            matches!(n, AbsNull::Nonnull)
         } else {
             false
         }

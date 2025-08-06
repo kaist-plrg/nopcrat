@@ -240,17 +240,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             } else if name.contains("{extern#0}") {
                 (
                     vec![self.transfer_c_call(callee, args, &mut state, &mut reads)],
-                    None,
+                    vec![],
                     CallKind::C,
                 )
             } else if name.contains("{impl#") {
                 (
                     vec![self.transfer_method_call(callee, args, &mut reads)],
-                    None,
+                    vec![],
                     CallKind::Method,
                 )
             } else {
-                (vec![AbsValue::top()], None, CallKind::TOP)
+                (vec![AbsValue::top()], vec![], CallKind::TOP)
             }
         } else {
             self.transfer_rust_call(
@@ -273,17 +273,17 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             })
             .unzip();
 
-        if let Some(nulls) = nulls {
+        if !nulls.is_empty() {
             assert!(new_states.len() == nulls.len());
             new_states
                 .iter_mut()
                 .zip(nulls)
-                .for_each(|(state, n)| match n {
-                    AbsNull::Null(i) | AbsNull::Nonnull(i) => {
-                        let arg = self.ptr_params_inv.get(&i).unwrap();
-                        state.add_null(*arg, n);
-                    }
+                .for_each(|(state, (i, arg, n))| match n {
                     AbsNull::Top => unreachable!(),
+                    AbsNull::Null | AbsNull::Nonnull => {
+                        let path = AbsPath(vec![i]);
+                        state.add_null(path, arg, n);
+                    }
                 });
         }
 
@@ -499,7 +499,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         offsets: &mut Vec<AbsPath>,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
-    ) -> (Vec<AbsValue>, Option<Vec<AbsNull>>, CallKind) {
+    ) -> (Vec<AbsValue>, Vec<(usize, usize, AbsNull)>, CallKind) {
         let name = self.def_id_to_string(callee);
         let mut call_kind = CallKind::RustPure;
         let mut segs: Vec<_> = name.split("::").collect();
@@ -561,18 +561,26 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         })
                         .collect();
                     if args.len() == 1 && !t {
-                        let arg = *args.first().unwrap();
-                        return (
-                            vec![AbsValue::bool_true(), AbsValue::bool_false()],
-                            Some(vec![AbsNull::null(arg), AbsNull::nonnull(arg)]),
-                            call_kind,
-                        );
-                    }
-                    match (t, f) {
-                        (true, true) => AbsValue::top_bool(),
-                        (true, false) => AbsValue::bool_true(),
-                        (false, true) => AbsValue::bool_false(),
-                        (false, false) => AbsValue::bot(),
+                        let i = *args.first().unwrap();
+                        let arg = *self.ptr_params_inv.get(&i).unwrap();
+                        match state.nulls.get(arg) {
+                            AbsNull::Null => AbsValue::bool_true(),
+                            AbsNull::Nonnull => AbsValue::bool_false(),
+                            AbsNull::Top => {
+                                return (
+                                    vec![AbsValue::bool_true(), AbsValue::bool_false()],
+                                    vec![(i, arg, AbsNull::null()), (i, arg, AbsNull::nonnull())],
+                                call_kind,
+                                );
+                            }
+                        }
+                    } else {
+                        match (t, f) {
+                            (true, true) => AbsValue::top_bool(),
+                            (true, false) => AbsValue::bool_true(),
+                            (false, true) => AbsValue::bool_false(),
+                            (false, false) => AbsValue::bot(),
+                        }
                     }
                 } else {
                     AbsValue::top_bool()
@@ -707,7 +715,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             _ => todo!("{}", name),
         };
-        (vec![v], None, call_kind)
+        (vec![v], vec![], call_kind)
     }
 
     fn transfer_rvalue(
