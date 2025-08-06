@@ -792,7 +792,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 }
             }
 
-            let nonnull_locs = nonnull_locs.difference(&non_nonnull_locs).cloned().collect();
+            let nonnull_locs = nonnull_locs
+                .difference(&non_nonnull_locs)
+                .cloned()
+                .collect();
             let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
             locs.push((nonnull_locs, null_locs));
         }
