@@ -18,7 +18,7 @@ pub struct AbsState {
     pub excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
-    pub nulls: MustPathSet,
+    pub nulls: AbsNulls,
 }
 
 impl AbsState {
@@ -30,7 +30,7 @@ impl AbsState {
             excludes: MayPathSet::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
-            nulls: MustPathSet::bot(),
+            nulls: AbsNulls::bot(),
         }
     }
 
@@ -108,10 +108,9 @@ impl AbsState {
         res
     }
 
-    pub fn add_null(&mut self, i: usize) {
-        let path = AbsPath(vec![i]);
+    pub fn add_null(&mut self, path: AbsPath, arg: usize, n: AbsNull) {
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
-            self.nulls.insert(path)
+            self.nulls.set(arg, n);
         }
     }
 }
@@ -3207,5 +3206,144 @@ impl MayPathSet {
     #[inline]
     pub fn as_vec(&self) -> Vec<&AbsPath> {
         self.0.iter().collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AbsNull {
+    Top,
+    Null,
+    Nonnull,
+}
+
+impl std::fmt::Debug for AbsNull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Top => write!(f, "⊤"),
+            Self::Null => write!(f, "null"),
+            Self::Nonnull => write!(f, "nonnull"),
+        }
+    }
+}
+
+impl AbsNull {
+    fn top() -> Self {
+        Self::Top
+    }
+
+    pub fn null() -> Self {
+        Self::Null
+    }
+
+    pub fn nonnull() -> Self {
+        Self::Nonnull
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Null, Self::Null) => Self::Null,
+            (Self::Nonnull, Self::Nonnull) => Self::Nonnull,
+            _ => Self::Top,
+        }
+    }
+
+    fn ord(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (_, Self::Top) | (Self::Null, Self::Null) | (Self::Nonnull, Self::Nonnull)
+        )
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        self.join(other)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AbsNulls(Vec<AbsNull>);
+
+impl std::fmt::Debug for AbsNulls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl AbsNulls {
+    #[inline]
+    pub fn bot() -> Self {
+        Self(vec![])
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        Self(
+            (0..self.0.len().max(other.0.len()))
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(n1), Some(n2)) => n1.join(n2),
+                    (Some(n), None) | (None, Some(n)) => *n,
+                    (None, None) => unreachable!(),
+                })
+                .collect(),
+        )
+    }
+
+    pub fn widen(&self, other: &Self) -> Self {
+        Self(
+            (0..self.0.len().max(other.0.len()))
+                .map(|i| match (self.0.get(i), other.0.get(i)) {
+                    (Some(n1), Some(n2)) => n1.widen(n2),
+                    (Some(n), None) | (None, Some(n)) => *n,
+                    (None, None) => unreachable!(),
+                })
+                .collect(),
+        )
+    }
+
+    pub fn ord(&self, other: &Self) -> bool {
+        self.0.len() <= other.0.len()
+            && self.0.iter().zip(other.0.iter()).all(|(n1, n2)| n1.ord(n2))
+    }
+
+    pub fn push_top(&mut self) {
+        self.0.push(AbsNull::top());
+    }
+
+    pub fn get(&self, arg: usize) -> &AbsNull {
+        &self.0[arg]
+    }
+
+    pub fn set(&mut self, arg: usize, n: AbsNull) {
+        while self.0.len() < arg {
+            self.0.push(AbsNull::top());
+        }
+        if self.0.len() == arg {
+            self.0.push(n);
+        } else {
+            self.0[arg] = n;
+        }
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AbsNull> {
+        self.0.iter()
+    }
+
+    pub fn is_null(&self, arg: &usize) -> bool {
+        if let Some(n) = self.0.get(*arg) {
+            matches!(n, AbsNull::Null)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_nonnull(&self, arg: &usize) -> bool {
+        if let Some(n) = self.0.get(*arg) {
+            matches!(n, AbsNull::Nonnull)
+        } else {
+            false
+        }
     }
 }

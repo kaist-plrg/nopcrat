@@ -21,7 +21,6 @@ pub struct TransferedTerminator {
     pub next_states: Vec<AbsState>,
     pub next_locations: Vec<Location>,
     pub writes: BTreeSet<AbsPath>,
-    pub null_check: Option<usize>,
     pub call_info: Vec<CallKind>,
 }
 
@@ -41,31 +40,29 @@ impl TransferedTerminator {
         next_states: Vec<AbsState>,
         next_locations: Vec<Location>,
         writes: BTreeSet<AbsPath>,
-        null_check: Option<usize>,
         call_info: Vec<CallKind>,
     ) -> Self {
         Self {
             next_states,
             next_locations,
             writes,
-            null_check,
             call_info,
         }
     }
 
     #[inline]
     fn empty() -> Self {
-        Self::new(vec![], vec![], BTreeSet::new(), None, vec![])
+        Self::new(vec![], vec![], BTreeSet::new(), vec![])
     }
 
     #[inline]
     fn state_location(st: AbsState, loc: Location) -> Self {
-        Self::new(vec![st], vec![loc], BTreeSet::new(), None, vec![])
+        Self::new(vec![st], vec![loc], BTreeSet::new(), vec![])
     }
 
     #[inline]
     fn state_locations(st: AbsState, locs: Vec<Location>) -> Self {
-        Self::new(vec![st], locs, BTreeSet::new(), None, vec![])
+        Self::new(vec![st], locs, BTreeSet::new(), vec![])
     }
 }
 
@@ -154,15 +151,12 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     reads.extend(reads2);
                 }
 
-                let (new_states, writes, null_check, call_info) = if let Some(fns) =
-                    func.fnv.gamma()
-                {
+                let (new_states, writes, call_info) = if let Some(fns) = func.fnv.gamma() {
                     let mut new_states_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
                     let mut ret_writes = BTreeSet::new();
                     let mut call_info = vec![];
-                    let mut null_check = None;
                     for def_id in fns {
-                        let (states, writes, null_arg, call_kind) = self.transfer_call(
+                        let (states, writes, call_kind) = self.transfer_call(
                             *def_id,
                             &args,
                             destination,
@@ -173,10 +167,6 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         ret_writes.extend(writes);
                         call_info.push(call_kind);
 
-                        if let Some(arg) = null_arg {
-                            null_check = Some(arg);
-                        }
-
                         for state in states {
                             let wn = (state.writes.clone(), state.nulls.clone());
                             new_states_map.entry(wn).or_default().push(state);
@@ -186,7 +176,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .into_values()
                         .map(|states| states.into_iter().reduce(|a, b| a.join(&b)).unwrap())
                         .collect();
-                    (new_states, ret_writes, null_check, call_info)
+                    (new_states, ret_writes, call_info)
                 } else {
                     let (mut new_state, writes) = self.assign(destination, AbsValue::top(), state);
                     let reads2 = args
@@ -198,7 +188,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
-                    (vec![new_state], writes, None, vec![])
+                    (vec![new_state], writes, vec![])
                 };
                 let locations = if new_states.is_empty() {
                     vec![]
@@ -208,7 +198,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .map(|target| vec![target.start_location()])
                         .unwrap_or(vec![])
                 };
-                TransferedTerminator::new(new_states, locations, writes, null_check, call_info)
+                TransferedTerminator::new(new_states, locations, writes, call_info)
             }
             TerminatorKind::TailCall { .. } => todo!("{:?}", terminator.kind),
             TerminatorKind::Assert { cond, target, .. } => {
@@ -239,30 +229,28 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         location: Location,
         mut state: AbsState,
         mut reads: Vec<AbsPath>,
-    ) -> (Vec<AbsState>, BTreeSet<AbsPath>, Option<usize>, CallKind) {
+    ) -> (Vec<AbsState>, BTreeSet<AbsPath>, CallKind) {
         let mut offsets = vec![];
         let mut writes = vec![];
-        let mut null_check = None;
         let name = self.def_id_to_string(callee);
-        let (vns, call_kind) = if callee.is_local() {
+        let (vs, nulls, call_kind) = if callee.is_local() {
             if let Some(summary) = self.summaries.get(&callee) {
                 return self
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
                 (
-                    vec![(
-                        self.transfer_c_call(callee, args, &mut state, &mut reads),
-                        None,
-                    )],
+                    vec![self.transfer_c_call(callee, args, &mut state, &mut reads)],
+                    vec![],
                     CallKind::C,
                 )
             } else if name.contains("{impl#") {
                 (
-                    vec![(self.transfer_method_call(callee, args, &mut reads), None)],
+                    vec![self.transfer_method_call(callee, args, &mut reads)],
+                    vec![],
                     CallKind::Method,
                 )
             } else {
-                (vec![(AbsValue::top(), None)], CallKind::TOP)
+                (vec![AbsValue::top()], vec![], CallKind::TOP)
             }
         } else {
             self.transfer_rust_call(
@@ -274,22 +262,32 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 &mut writes,
             )
         };
-        let (new_states, writess): (Vec<_>, Vec<_>) = vns
+        let (mut new_states, writess): (Vec<_>, Vec<_>) = vs
             .into_iter()
-            .map(|(v, null)| {
+            .map(|v| {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
                 let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
-                if let Some(null) = null {
-                    new_state.add_null(null);
-                    null_check = Some(null);
-                }
                 (new_state, writes)
             })
             .unzip();
+
+        if !nulls.is_empty() {
+            assert!(new_states.len() == nulls.len());
+            for (state, (i, arg, n)) in new_states.iter_mut().zip(nulls) {
+                match n {
+                    AbsNull::Top => unreachable!(),
+                    AbsNull::Null | AbsNull::Nonnull => {
+                        let path = AbsPath(vec![i]);
+                        state.add_null(path, arg, n);
+                    }
+                }
+            }
+        }
+
         let writes = writess.into_iter().flatten().collect();
-        (new_states, writes, null_check, call_kind)
+        (new_states, writes, call_kind)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,9 +300,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         state: AbsState,
         location: Location,
         mut reads: Vec<AbsPath>,
-    ) -> (Vec<AbsState>, BTreeSet<AbsPath>, Option<usize>, CallKind) {
+    ) -> (Vec<AbsState>, BTreeSet<AbsPath>, CallKind) {
         if summary.return_states.is_empty() {
-            return (vec![], BTreeSet::new(), None, CallKind::Intra);
+            return (vec![], BTreeSet::new(), CallKind::Intra);
         }
 
         let mut ptr_maps = BTreeMap::new();
@@ -371,7 +369,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             ret_writes.extend(writes);
             states.push(state)
         }
-        (states, ret_writes, None, CallKind::Intra)
+        (states, ret_writes, CallKind::Intra)
     }
 
     fn transfer_method_call(
@@ -476,7 +474,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         offsets: &mut Vec<AbsPath>,
         reads: &mut Vec<AbsPath>,
         writes: &mut Vec<AbsPath>,
-    ) -> (Vec<(AbsValue, Option<usize>)>, CallKind) {
+    ) -> (Vec<AbsValue>, Vec<(usize, usize, AbsNull)>, CallKind) {
         let name = self.def_id_to_string(callee);
         let mut call_kind = CallKind::RustPure;
         let mut segs: Vec<_> = name.split("::").collect();
@@ -538,20 +536,26 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         })
                         .collect();
                     if args.len() == 1 && !t {
-                        let arg = *args.first().unwrap();
-                        return (
-                            vec![
-                                (AbsValue::bool_true(), Some(arg)),
-                                (AbsValue::bool_false(), None),
-                            ],
-                            call_kind,
-                        );
-                    }
-                    match (t, f) {
-                        (true, true) => AbsValue::top_bool(),
-                        (true, false) => AbsValue::bool_true(),
-                        (false, true) => AbsValue::bool_false(),
-                        (false, false) => AbsValue::bot(),
+                        let i = *args.first().unwrap();
+                        let arg = *self.ptr_params_inv.get(&i).unwrap();
+                        match state.nulls.get(arg) {
+                            AbsNull::Null => AbsValue::bool_true(),
+                            AbsNull::Nonnull => AbsValue::bool_false(),
+                            AbsNull::Top => {
+                                return (
+                                    vec![AbsValue::bool_true(), AbsValue::bool_false()],
+                                    vec![(i, arg, AbsNull::null()), (i, arg, AbsNull::nonnull())],
+                                    call_kind,
+                                );
+                            }
+                        }
+                    } else {
+                        match (t, f) {
+                            (true, true) => AbsValue::top_bool(),
+                            (true, false) => AbsValue::bool_true(),
+                            (false, true) => AbsValue::bool_false(),
+                            (false, false) => AbsValue::bot(),
+                        }
                     }
                 } else {
                     AbsValue::top_bool()
@@ -686,7 +690,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             _ => todo!("{}", name),
         };
-        (vec![(v, None)], call_kind)
+        (vec![v], vec![], call_kind)
     }
 
     fn transfer_rvalue(
