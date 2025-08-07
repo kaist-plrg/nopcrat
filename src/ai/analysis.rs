@@ -629,7 +629,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
         block: &BasicBlock,
-        locs: &BTreeSet<&Location>,
+        locs: &BTreeSet<Location>,
         locals: &BTreeSet<Local>,
     ) -> bool {
         if locals.is_empty() {
@@ -817,22 +817,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 }
 
                 let param = i + 1;
-                let nonnull_diff = nonnull.into_iter().fold(
+                let nonnull_diff = nonnull.iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(loc);
+                        acc.entry(loc.block).or_default().insert(*loc);
                         acc
                     },
                 );
-                let nonnull_locs = nonnull_diff.values().flatten().collect::<BTreeSet<_>>();
-                let null_diff = null.into_iter().fold(
+                let null_diff = null.iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
-                        acc.entry(loc.block).or_default().insert(loc);
+                        acc.entry(loc.block).or_default().insert(*loc);
                         acc
                     },
                 );
-                let null_locs = null_diff.values().flatten().collect::<BTreeSet<_>>();
 
                 let check = |block, locs: &BTreeSet<_>, diff_locs| {
                     let mut local_writes = BTreeSet::new();
@@ -865,8 +863,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 };
                 if nonnull_diff
                     .iter()
-                    .all(|(b, locs)| check(b, locs, &nonnull_locs))
-                    && null_diff.iter().all(|(b, locs)| check(b, locs, &null_locs))
+                    .all(|(b, locs)| check(b, locs, &nonnull))
+                    && null_diff.iter().all(|(b, locs)| check(b, locs, &null))
                 {
                     None
                 } else {

@@ -275,16 +275,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
 
         if !nulls.is_empty() {
             assert!(new_states.len() == nulls.len());
-            new_states
-                .iter_mut()
-                .zip(nulls)
-                .for_each(|(state, (i, arg, n))| match n {
+            for (state, (i, arg, n)) in new_states.iter_mut().zip(nulls) {
+                match n {
                     AbsNull::Top => unreachable!(),
                     AbsNull::Null | AbsNull::Nonnull => {
                         let path = AbsPath(vec![i]);
                         state.add_null(path, arg, n);
                     }
-                });
+                }
+            }
         }
 
         let writes = writess.into_iter().flatten().collect();
