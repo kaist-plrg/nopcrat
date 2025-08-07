@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use rustc_index::Idx;
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::{
     mir::{BasicBlock, Location},
     ty::TyCtxt,
@@ -159,7 +159,14 @@ fn find(name: &str, tcx: TyCtxt<'_>) -> LocalDefId {
 }
 
 fn sol(res: &AnalysisResults, i: usize) -> Vec<usize> {
-    res.solutions[i].iter().collect()
+    res.solutions[Loc::from_usize(i)]
+        .iter()
+        .map(|l| l.index())
+        .collect()
+}
+
+fn ends_to_vec(ends: &IndexVec<Loc, Loc>) -> Vec<usize> {
+    ends.iter().map(|l| l.index()).collect()
 }
 
 fn v(i: usize) -> Vec<usize> {
@@ -181,7 +188,7 @@ fn test_eq_ref() {
         let mut y: *mut libc::c_int = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(3));
+            assert_eq!(ends_to_vec(&res.ends), v(3));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -205,7 +212,7 @@ fn test_eq() {
         z = y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(4));
+            assert_eq!(ends_to_vec(&res.ends), v(4));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -234,7 +241,7 @@ fn test_eq_two() {
         z = &mut y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(7));
+            assert_eq!(ends_to_vec(&res.ends), v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -267,7 +274,7 @@ fn test_eq_propagate() {
         y = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(6));
+            assert_eq!(ends_to_vec(&res.ends), v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -295,7 +302,7 @@ fn test_eq_deref() {
         let mut w: *mut libc::c_int = *z;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(6));
+            assert_eq!(ends_to_vec(&res.ends), v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -329,7 +336,7 @@ fn test_eq_deref_subset() {
         v = *w;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(9));
+            assert_eq!(ends_to_vec(&res.ends), v(9));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -365,7 +372,7 @@ fn test_eq_deref_propagate() {
         w = *z;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -396,7 +403,7 @@ fn test_deref_eq() {
         *z = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(6));
+            assert_eq!(ends_to_vec(&res.ends), v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -428,7 +435,7 @@ fn test_deref_eq_subset() {
         *w = &mut y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -464,7 +471,7 @@ fn test_deref_eq_propagate() {
         *z = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -494,7 +501,7 @@ fn test_array_aggregate() {
         let mut p: [*mut libc::c_int; 2] = [&mut x, &mut y];
         ",
         |res, _| {
-            assert_eq!(res.ends, v(7));
+            assert_eq!(ends_to_vec(&res.ends), v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -532,7 +539,7 @@ fn test_array_eq_ref() {
         p[1 as libc::c_int as usize] = &mut y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(12));
+            assert_eq!(ends_to_vec(&res.ends), v(12));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![3, 4]);
             assert_eq!(sol(&res, 2), e());
@@ -583,7 +590,7 @@ fn test_struct_aggregate() {
         };
         ",
         |res, _| {
-            assert_eq!(res.ends, vec![0, 1, 2, 5, 4, 5, 6, 7, 8, 9]);
+            assert_eq!(ends_to_vec(&res.ends), vec![0, 1, 2, 5, 4, 5, 6, 7, 8, 9]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -688,7 +695,7 @@ fn test_struct_eq_ref() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     0, 1, 2, 3, 4, 6, 6, 7, 8, 10, 10, 11, 12, 14, 14, 15, 16, 17, 18, 20, 20, 21,
                     22, 23, 24, 28, 26, 28, 28, 30, 30, 31, 32, 34, 34, 35, 36, 40, 38, 40, 40
@@ -805,7 +812,7 @@ fn test_struct_deref_eq() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     0, 1, 2, 3, 4, 8, 6, 8, 8, 10, 10, 11, 12, 14, 14, 15, 16, 17, 18, 19, 20, 21,
                     22, 23, 24, 25, 26
@@ -908,7 +915,7 @@ fn test_struct_eq_deref() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     0, 1, 2, 3, 4, 8, 6, 8, 8, 12, 10, 12, 12, 14, 14, 15, 16, 17, 18, 20, 20, 21,
                     22, 23, 24, 25, 26, 27, 28, 29, 30
@@ -1000,7 +1007,7 @@ fn test_struct_field_ref() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![0, 4, 2, 4, 4, 6, 6, 7, 8, 10, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
             );
             assert_eq!(sol(&res, 0), e());
@@ -1085,7 +1092,7 @@ fn test_struct_field_deref_ref() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     0, 4, 2, 4, 4, 6, 6, 7, 8, 10, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
                     22, 23, 24
@@ -1155,7 +1162,7 @@ fn test_struct_deref_eq_ends() {
         (*v).y = &mut y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(11));
+            assert_eq!(ends_to_vec(&res.ends), v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1205,7 +1212,7 @@ fn test_struct_eq_deref_ends() {
         let mut t: *mut libc::c_int = (*v).y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(11));
+            assert_eq!(ends_to_vec(&res.ends), v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1249,7 +1256,7 @@ fn test_struct_ref_deref_ends() {
         let mut w: *mut *mut libc::c_int = &mut (*y).y;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -1284,7 +1291,7 @@ fn test_union_aggregate() {
         let mut y: u = u { y: &mut x };
         ",
         |res, _| {
-            assert_eq!(res.ends, vec![0, 1, 3, 3, 4, 5]);
+            assert_eq!(ends_to_vec(&res.ends), vec![0, 1, 3, 3, 4, 5]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1324,7 +1331,7 @@ fn test_copy_for_deref() {
         **w = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(9));
+            assert_eq!(ends_to_vec(&res.ends), v(9));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -1353,7 +1360,7 @@ fn test_static() {
         let mut y: *mut libc::c_int = &mut x;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(4));
+            assert_eq!(ends_to_vec(&res.ends), v(4));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![0]);
@@ -1403,7 +1410,7 @@ fn test_static_struct_field_eq() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
             );
             assert_eq!(sol(&res, 0), vec![7]);
@@ -1451,7 +1458,7 @@ fn test_static_struct_field_ref() {
         let mut y: *mut libc::c_int = &mut s.y;
         ",
         |res, _| {
-            assert_eq!(res.ends, vec![1, 1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(ends_to_vec(&res.ends), vec![1, 1, 2, 3, 4, 5, 6, 7, 8]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1482,7 +1489,7 @@ fn test_static_ref() {
         "
         ",
         |res, _| {
-            assert_eq!(res.ends, v(5));
+            assert_eq!(ends_to_vec(&res.ends), v(5));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![0]);
             assert_eq!(sol(&res, 2), vec![0]);
@@ -1530,7 +1537,7 @@ fn test_static_struct_ref() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![0, 1, 3, 3, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
             );
             assert_eq!(sol(&res, 0), e());
@@ -1574,7 +1581,7 @@ fn test_cycle() {
         w = z;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1615,7 +1622,7 @@ fn test_cycle_propagate_eq() {
         v = w;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(10));
+            assert_eq!(ends_to_vec(&res.ends), v(10));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1657,7 +1664,7 @@ fn test_cycle_propagate_eq_deref() {
         let mut u: *mut libc::c_int = *w;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(10));
+            assert_eq!(ends_to_vec(&res.ends), v(10));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -1704,7 +1711,7 @@ fn test_cycle_propagate_deref_eq() {
         *w = &mut x1;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(12));
+            assert_eq!(ends_to_vec(&res.ends), v(12));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1756,7 +1763,10 @@ fn test_cycle_propagate_ref_deref() {
         let mut w: *mut libc::c_int = &mut (*y).y;
         ",
         |res, _| {
-            assert_eq!(res.ends, vec![0, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(
+                ends_to_vec(&res.ends),
+                vec![0, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            );
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -1803,7 +1813,7 @@ fn test_cycle_twice() {
         w = *v;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(11));
+            assert_eq!(ends_to_vec(&res.ends), v(11));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -1853,7 +1863,7 @@ fn test_call() {
         z = &mut w;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(12));
+            assert_eq!(ends_to_vec(&res.ends), v(12));
             assert_eq!(sol(&res, 0), vec![2, 6]);
             assert_eq!(sol(&res, 1), vec![2, 6]);
             assert_eq!(sol(&res, 2), e());
@@ -1924,7 +1934,7 @@ fn test_call_struct() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     1, 1, 2, 3, 6, 5, 6, 7, 8, 9, 10, 11, 12, 14, 14, 15, 16, 17, 18, 21, 20, 21,
                     22, 23
@@ -2017,7 +2027,7 @@ fn test_call_fn_ptr() {
         ",
         |res, _| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![
                     6, 1, 2, 3, 6, 5, 6, 7, 8, 9, 10, 11, 12, 14, 14, 15, 16, 17, 18, 19, 20, 23,
                     22, 23, 24, 25, 26
@@ -2071,7 +2081,7 @@ fn test_array_offset() {
             as *mut libc::c_int;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -2098,7 +2108,7 @@ fn test_malloc() {
         ) as *mut libc::c_int;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(5));
+            assert_eq!(ends_to_vec(&res.ends), v(5));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![5]);
             assert_eq!(sol(&res, 2), vec![5]);
@@ -2188,7 +2198,7 @@ fn test_malloc_struct() {
         |res, _| {
             let mut v = v(28);
             v.extend([32, 30, 32, 32, 36, 34, 36, 36]);
-            assert_eq!(res.ends, v);
+            assert_eq!(ends_to_vec(&res.ends), v);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -2261,7 +2271,7 @@ fn test_custom_malloc() {
         ) as *mut libc::c_int;
         ",
         |res, _| {
-            assert_eq!(res.ends, v(16));
+            assert_eq!(ends_to_vec(&res.ends), v(16));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), vec![14]);
             assert_eq!(sol(&res, 2), e());
@@ -2291,7 +2301,7 @@ fn l(block: usize, statement_index: usize) -> Location {
 }
 
 fn wg(
-    writes: &FxHashMap<Location, HybridBitSet<usize>>,
+    writes: &FxHashMap<Location, HybridBitSet<Loc>>,
     block: usize,
     statement_index: usize,
 ) -> Vec<usize> {
@@ -2299,6 +2309,7 @@ fn wg(
         .get(&l(block, statement_index))
         .unwrap()
         .iter()
+        .map(|loc| loc.index())
         .collect()
 }
 
@@ -2356,7 +2367,7 @@ fn test_writes_compound() {
         ",
         |mut res, tcx| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![0, 1, 2, 3, 6, 5, 6, 8, 8, 9, 10, 11, 12, 13, 14, 15, 16]
             );
             assert_eq!(sol(&res, 0), e());
@@ -2427,7 +2438,7 @@ fn test_writes_multiple() {
         x = 1 as libc::c_int;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, v(12));
+            assert_eq!(ends_to_vec(&res.ends), v(12));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -2489,7 +2500,7 @@ fn test_writes_ambiguous() {
         let mut z: *mut *mut libc::c_int = &mut y.x;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, v(7));
+            assert_eq!(ends_to_vec(&res.ends), v(7));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -2531,7 +2542,7 @@ fn test_writes_double() {
         *z = 1 as libc::c_int;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, v(6));
+            assert_eq!(ends_to_vec(&res.ends), v(6));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -2574,7 +2585,7 @@ fn test_writes_malloc() {
         *z = y;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, v(8));
+            assert_eq!(ends_to_vec(&res.ends), v(8));
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), vec![1]);
@@ -2621,7 +2632,7 @@ fn test_writes_field_taken() {
         x.y = 1 as libc::c_int;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, vec![0, 2, 2, 3, 4]);
+            assert_eq!(ends_to_vec(&res.ends), vec![0, 2, 2, 3, 4]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -2660,7 +2671,7 @@ fn test_writes_field_untaken() {
         x.x = 2 as libc::c_int;
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, vec![0, 2, 2, 3, 4]);
+            assert_eq!(ends_to_vec(&res.ends), vec![0, 2, 2, 3, 4]);
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());
@@ -2715,7 +2726,7 @@ fn test_writes_bitfield() {
         ",
         |mut res, tcx| {
             assert_eq!(
-                res.ends,
+                ends_to_vec(&res.ends),
                 vec![0, 5, 2, 3, 4, 5, 6, 7, 12, 9, 10, 11, 12, 13, 14, 15, 16]
             );
             assert_eq!(sol(&res, 0), e());
@@ -2791,7 +2802,10 @@ fn test_writes_struct_bitfield() {
         x.set_y(1 as libc::c_int);
         ",
         |mut res, tcx| {
-            assert_eq!(res.ends, vec![0, 6, 2, 3, 4, 5, 6, 8, 8, 9, 10, 11, 12],);
+            assert_eq!(
+                ends_to_vec(&res.ends),
+                vec![0, 6, 2, 3, 4, 5, 6, 8, 8, 9, 10, 11, 12],
+            );
             assert_eq!(sol(&res, 0), e());
             assert_eq!(sol(&res, 1), e());
             assert_eq!(sol(&res, 2), e());

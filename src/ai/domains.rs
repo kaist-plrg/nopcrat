@@ -5,8 +5,9 @@ use std::{
 };
 
 use lazy_static::lazy_static;
+use rustc_abi::FieldIdx;
 use rustc_hash::FxHashSet;
-use rustc_index::bit_set::DenseBitSet;
+use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
 use serde::{Deserialize, Serialize};
@@ -108,15 +109,21 @@ impl AbsState {
         res
     }
 
-    pub fn add_null(&mut self, path: AbsPath, arg: usize, n: AbsNull) {
+    pub fn add_null(&mut self, path: AbsPath, arg: ArgIdx, n: AbsNull) {
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
             self.nulls.set(arg, n);
         }
     }
 }
 
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "arg{}"]
+    pub struct ArgIdx {}
+}
+
 #[derive(Clone)]
-pub struct AbsArgs(Vec<AbsValue>);
+pub struct AbsArgs(IndexVec<ArgIdx, AbsValue>);
 
 impl std::fmt::Debug for AbsArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,12 +134,17 @@ impl std::fmt::Debug for AbsArgs {
 impl AbsArgs {
     #[inline]
     fn bot() -> Self {
-        Self(vec![])
+        Self(IndexVec::new())
     }
 
     fn join(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(v1), Some(v2)) => v1.join(v2),
                     (Some(v), None) | (None, Some(v)) => v.clone(),
@@ -143,8 +155,13 @@ impl AbsArgs {
     }
 
     fn widen(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(v1), Some(v2)) => v1.widen(v2),
                     (Some(v), None) | (None, Some(v)) => v.clone(),
@@ -158,16 +175,17 @@ impl AbsArgs {
         self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(x, y)| x.ord(y))
     }
 
-    pub fn push(&mut self, v: AbsValue) -> usize {
+    pub fn push(&mut self, v: AbsValue) -> ArgIdx {
+        let idx = self.0.next_index();
         self.0.push(v);
-        self.0.len() - 1
+        idx
     }
 
-    pub fn get(&self, i: usize) -> &AbsValue {
+    pub fn get(&self, i: ArgIdx) -> &AbsValue {
         &self.0[i]
     }
 
-    pub fn get_mut(&mut self, i: usize) -> &mut AbsValue {
+    pub fn get_mut(&mut self, i: ArgIdx) -> &mut AbsValue {
         &mut self.0[i]
     }
 
@@ -176,13 +194,21 @@ impl AbsArgs {
         self.0.len()
     }
 
+    pub fn next_index(&self) -> ArgIdx {
+        self.0.next_index()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &AbsValue> {
         self.0.iter()
+    }
+
+    pub fn iter_enumerated(&self) -> impl Iterator<Item = (ArgIdx, &AbsValue)> {
+        self.0.iter_enumerated()
     }
 }
 
 #[derive(Clone)]
-pub struct AbsLocal(Vec<AbsValue>);
+pub struct AbsLocal(IndexVec<Local, AbsValue>);
 
 impl std::fmt::Debug for AbsLocal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -193,12 +219,17 @@ impl std::fmt::Debug for AbsLocal {
 impl AbsLocal {
     #[inline]
     fn bot() -> Self {
-        Self(vec![])
+        Self(IndexVec::new())
     }
 
     fn join(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(v1), Some(v2)) => v1.join(v2),
                     (Some(v), None) | (None, Some(v)) => v.clone(),
@@ -209,8 +240,13 @@ impl AbsLocal {
     }
 
     fn widen(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(v1), Some(v2)) => v1.widen(v2),
                     (Some(v), None) | (None, Some(v)) => v.clone(),
@@ -221,29 +257,34 @@ impl AbsLocal {
     }
 
     fn ord(&self, other: &Self) -> bool {
-        (0..self.0.len().max(other.0.len())).all(|i| {
+        let mut indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
+        indices.all(|i| {
             let v1 = self.0.get(i).unwrap_or(&V_BOT);
             let v2 = other.0.get(i).unwrap_or(&V_BOT);
             v1.ord(v2)
         })
     }
 
-    pub fn get(&self, i: usize) -> &AbsValue {
+    pub fn get(&self, i: Local) -> &AbsValue {
         self.0.get(i).unwrap_or(&V_BOT)
     }
 
-    pub fn get_mut(&mut self, i: usize) -> &mut AbsValue {
-        while self.0.len() <= i {
+    pub fn get_mut(&mut self, i: Local) -> &mut AbsValue {
+        while self.0.next_index() <= i {
             self.0.push(AbsValue::bot());
         }
         &mut self.0[i]
     }
 
-    pub fn set(&mut self, i: usize, v: AbsValue) {
-        while self.0.len() < i {
+    pub fn set(&mut self, i: Local, v: AbsValue) {
+        while self.0.next_index() < i {
             self.0.push(AbsValue::bot());
         }
-        if self.0.len() == i {
+        if self.0.next_index() == i {
             self.0.push(v);
         } else {
             self.0[i] = v;
@@ -256,11 +297,10 @@ impl AbsLocal {
 
     pub fn clear_dead_locals(&mut self, dead_locals: &DenseBitSet<Local>) {
         for l in dead_locals.iter() {
-            let i = l.as_usize();
-            if i >= self.0.len() {
+            if l >= self.0.next_index() {
                 break;
             }
-            self.0[i] = AbsValue::bot();
+            self.0[l] = AbsValue::bot();
         }
     }
 }
@@ -504,7 +544,7 @@ impl AbsValue {
         Self::new(AbsVal::some(v))
     }
 
-    pub fn arg(i: usize) -> Self {
+    pub fn arg(i: ArgIdx) -> Self {
         Self::ptr(AbsPtr::arg(i))
     }
 
@@ -746,7 +786,7 @@ impl AbsValue {
         }
     }
 
-    pub fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+    pub fn subst(&self, map: &BTreeMap<ArgIdx, AbsPtr>) -> Self {
         Self::new(self.0.subst(map))
     }
 
@@ -1392,7 +1432,7 @@ impl AbsVal {
     }
 
     #[inline]
-    fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+    fn subst(&self, map: &BTreeMap<ArgIdx, AbsPtr>) -> Self {
         Self {
             ptrv: self.ptrv.subst(map),
             listv: self.listv.subst(map),
@@ -2525,7 +2565,7 @@ impl AbsList {
         }
     }
 
-    fn subst(&self, map: &BTreeMap<usize, AbsPtr>) -> Self {
+    fn subst(&self, map: &BTreeMap<ArgIdx, AbsPtr>) -> Self {
         match self {
             Self::Top => Self::Top,
             Self::List(l) => Self::List(l.iter().map(|v| v.subst(map)).collect()),
@@ -2537,13 +2577,13 @@ impl AbsList {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AbsPlace {
     pub base: AbsBase,
-    pub projection: Vec<AbsProjElem>,
+    pub projections: Vec<AbsProjElem>,
 }
 
 impl std::fmt::Debug for AbsPlace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.base)?;
-        for elem in &self.projection {
+        for elem in &self.projections {
             write!(f, "{:?}", elem)?;
         }
         Ok(())
@@ -2555,7 +2595,7 @@ impl AbsPlace {
     fn heap() -> Self {
         Self {
             base: AbsBase::Heap,
-            projection: Vec::new(),
+            projections: Vec::new(),
         }
     }
 
@@ -2563,14 +2603,14 @@ impl AbsPlace {
     fn null() -> Self {
         Self {
             base: AbsBase::Null,
-            projection: Vec::new(),
+            projections: Vec::new(),
         }
     }
 
-    fn arg(i: usize) -> Self {
+    fn arg(i: ArgIdx) -> Self {
         Self {
             base: AbsBase::Arg(i),
-            projection: Vec::new(),
+            projections: Vec::new(),
         }
     }
 
@@ -2582,8 +2622,8 @@ impl AbsPlace {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsBase {
-    Local(usize),
-    Arg(usize),
+    Local(Local),
+    Arg(ArgIdx),
     Heap,
     Null,
 }
@@ -2591,8 +2631,8 @@ pub enum AbsBase {
 impl std::fmt::Debug for AbsBase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local(i) => write!(f, "_{}", i),
-            Self::Arg(i) => write!(f, "A{}", i),
+            Self::Local(i) => write!(f, "_{}", i.index()),
+            Self::Arg(i) => write!(f, "A{}", i.index()),
             Self::Heap => write!(f, "H"),
             Self::Null => write!(f, "null"),
         }
@@ -2601,14 +2641,14 @@ impl std::fmt::Debug for AbsBase {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AbsProjElem {
-    Field(usize),
+    Field(FieldIdx),
     Index(AbsUint),
 }
 
 impl std::fmt::Debug for AbsProjElem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Field(i) => write!(f, ".{}", i),
+            Self::Field(i) => write!(f, ".{}", i.index()),
             Self::Index(i) => write!(f, "[{:?}]", i),
         }
     }
@@ -2740,7 +2780,7 @@ impl AbsPtr {
     }
 
     #[inline]
-    pub fn arg(i: usize) -> Self {
+    pub fn arg(i: ArgIdx) -> Self {
         Self::alpha(AbsPlace::arg(i))
     }
 
@@ -2753,7 +2793,7 @@ impl AbsPtr {
         matches!(ptrs.first().unwrap().base, AbsBase::Null)
     }
 
-    pub fn get_arg(&self) -> Option<usize> {
+    pub fn get_arg(&self) -> Option<ArgIdx> {
         if let Self::Set(ptrs) = self {
             if ptrs.len() == 1 {
                 if let AbsBase::Arg(i) = &ptrs.first().unwrap().base {
@@ -2764,7 +2804,7 @@ impl AbsPtr {
         None
     }
 
-    fn subst(&self, map: &BTreeMap<usize, Self>) -> Self {
+    fn subst(&self, map: &BTreeMap<ArgIdx, Self>) -> Self {
         if let Self::Set(ptrs) = self {
             ptrs.iter()
                 .map(|place| {
@@ -2783,7 +2823,7 @@ impl AbsPtr {
                         ptrs.iter()
                             .cloned()
                             .map(|mut new_place| {
-                                new_place.projection.extend(place.projection.clone());
+                                new_place.projections.extend(place.projections.clone());
                                 new_place
                             })
                             .collect(),
@@ -2974,38 +3014,39 @@ impl AbsFn {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AbsPath(pub Vec<usize>);
+pub struct AbsPath {
+    pub base: Local,
+    pub projections: Vec<FieldIdx>,
+}
 
 impl std::fmt::Debug for AbsPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        for idx in self.0.iter() {
-            if first {
-                first = false;
-            } else {
-                write!(f, ".")?;
-            }
-            write!(f, "{}", idx)?;
+        write!(f, "{}", self.base.index())?;
+        for idx in self.projections.iter() {
+            write!(f, ".{}", idx.index())?;
         }
         Ok(())
     }
 }
 
 impl AbsPath {
-    pub fn base(&self) -> usize {
-        self.0[0]
+    pub fn new(base: Local, projections: Vec<FieldIdx>) -> Self {
+        Self { base, projections }
     }
 
-    pub fn from_place(place: &AbsPlace, ptr_params: &[usize]) -> Option<(Self, bool)> {
+    pub fn from_place(
+        place: &AbsPlace,
+        ptr_params: &IndexVec<ArgIdx, Local>,
+    ) -> Option<(Self, bool)> {
         let arg = if let AbsBase::Arg(arg) = place.base {
             arg
         } else {
             return None;
         };
         let param = ptr_params[arg];
-        let mut projections = vec![param];
+        let mut projections = vec![];
         let mut array_access = false;
-        for proj in place.projection.iter() {
+        for proj in place.projections.iter() {
             match proj {
                 AbsProjElem::Field(idx) => projections.push(*idx),
                 AbsProjElem::Index(_) => {
@@ -3014,7 +3055,13 @@ impl AbsPath {
                 }
             }
         }
-        Some((Self(projections), array_access))
+        Some((Self::new(param, projections), array_access))
+    }
+
+    pub fn as_vec(&self) -> Vec<usize> {
+        let mut v = vec![self.base.index()];
+        v.extend(self.projections.iter().map(|idx| idx.index()));
+        v
     }
 }
 
@@ -3076,9 +3123,9 @@ impl MustPathSet {
     }
 
     #[inline]
-    pub fn remove(&mut self, base: &BTreeSet<usize>) {
+    pub fn remove(&mut self, base: &BTreeSet<Local>) {
         if let Self::Set(set) = self {
-            set.retain(|p| !base.contains(&p.base()));
+            set.retain(|p| !base.contains(&p.base));
         }
     }
 
@@ -3259,8 +3306,20 @@ impl AbsNull {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct AbsNulls(Vec<AbsNull>);
+#[derive(Clone, PartialEq, Eq)]
+pub struct AbsNulls(IndexVec<ArgIdx, AbsNull>);
+
+impl PartialOrd for AbsNulls {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AbsNulls {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.raw.cmp(&other.0.raw)
+    }
+}
 
 impl std::fmt::Debug for AbsNulls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3271,12 +3330,17 @@ impl std::fmt::Debug for AbsNulls {
 impl AbsNulls {
     #[inline]
     pub fn bot() -> Self {
-        Self(vec![])
+        Self(IndexVec::new())
     }
 
     pub fn join(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(n1), Some(n2)) => n1.join(n2),
                     (Some(n), None) | (None, Some(n)) => *n,
@@ -3287,8 +3351,13 @@ impl AbsNulls {
     }
 
     pub fn widen(&self, other: &Self) -> Self {
+        let indices = if self.0.len() > other.0.len() {
+            self.0.indices()
+        } else {
+            other.0.indices()
+        };
         Self(
-            (0..self.0.len().max(other.0.len()))
+            indices
                 .map(|i| match (self.0.get(i), other.0.get(i)) {
                     (Some(n1), Some(n2)) => n1.widen(n2),
                     (Some(n), None) | (None, Some(n)) => *n,
@@ -3307,15 +3376,15 @@ impl AbsNulls {
         self.0.push(AbsNull::top());
     }
 
-    pub fn get(&self, arg: usize) -> &AbsNull {
+    pub fn get(&self, arg: ArgIdx) -> &AbsNull {
         &self.0[arg]
     }
 
-    pub fn set(&mut self, arg: usize, n: AbsNull) {
-        while self.0.len() < arg {
+    pub fn set(&mut self, arg: ArgIdx, n: AbsNull) {
+        while self.0.next_index() < arg {
             self.0.push(AbsNull::top());
         }
-        if self.0.len() == arg {
+        if self.0.next_index() == arg {
             self.0.push(n);
         } else {
             self.0[arg] = n;
@@ -3327,20 +3396,28 @@ impl AbsNulls {
         self.0.len()
     }
 
+    pub fn next_index(&self) -> ArgIdx {
+        self.0.next_index()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &AbsNull> {
         self.0.iter()
     }
 
-    pub fn is_null(&self, arg: &usize) -> bool {
-        if let Some(n) = self.0.get(*arg) {
+    pub fn iter_enumerated(&self) -> impl Iterator<Item = (ArgIdx, &AbsNull)> {
+        self.0.iter_enumerated()
+    }
+
+    pub fn is_null(&self, arg: ArgIdx) -> bool {
+        if let Some(n) = self.0.get(arg) {
             matches!(n, AbsNull::Null)
         } else {
             false
         }
     }
 
-    pub fn is_nonnull(&self, arg: &usize) -> bool {
-        if let Some(n) = self.0.get(*arg) {
+    pub fn is_nonnull(&self, arg: ArgIdx) -> bool {
+        if let Some(n) = self.0.get(arg) {
             matches!(n, AbsNull::Nonnull)
         } else {
             false
