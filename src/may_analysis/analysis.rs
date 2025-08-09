@@ -31,19 +31,25 @@ pub struct BodyItem<'tcx> {
     is_fn: bool,
 }
 
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "L{}"]
+    pub struct Loc {}
+}
+
 #[derive(Debug)]
 struct IndexInfo<'tcx> {
-    pub ends: Vec<usize>,
-    tys: Vec<Ty<'tcx>>,
-    owners: Vec<LocalDefId>,
+    pub ends: IndexVec<Loc, Loc>,
+    tys: IndexVec<Loc, Ty<'tcx>>,
+    owners: IndexVec<Loc, LocalDefId>,
 }
 
 impl<'tcx> IndexInfo<'tcx> {
     fn new() -> Self {
         IndexInfo {
-            ends: vec![],
-            tys: vec![],
-            owners: vec![],
+            ends: IndexVec::new(),
+            tys: IndexVec::new(),
+            owners: IndexVec::new(),
         }
     }
 
@@ -53,39 +59,47 @@ impl<'tcx> IndexInfo<'tcx> {
         self.ends.len()
     }
 
-    fn push(&mut self, end: usize, ty: Ty<'tcx>, owner: LocalDefId) {
+    fn next_index(&self) -> Loc {
+        assert!(self.ends.len() == self.tys.len());
+        assert!(self.ends.len() == self.owners.len());
+        self.ends.next_index()
+    }
+
+    fn push(&mut self, end: Loc, ty: Ty<'tcx>, owner: LocalDefId) {
         self.ends.push(end);
         self.tys.push(ty);
         self.owners.push(owner);
     }
 
-    fn get_end(&self, index: usize) -> usize {
-        assert!(index < self.ends.len());
+    fn get_end(&self, index: Loc) -> Loc {
         self.ends[index]
     }
 
-    fn get_ty(&self, index: usize) -> Ty<'tcx> {
-        assert!(index < self.tys.len());
+    fn get_ty(&self, index: Loc) -> Ty<'tcx> {
         self.tys[index]
     }
 
-    fn get_owner(&self, index: usize) -> LocalDefId {
-        assert!(index < self.owners.len());
+    fn get_owner(&self, index: Loc) -> LocalDefId {
         self.owners[index]
     }
 
-    fn modify_end(&mut self, index: usize, new: usize) {
-        assert!(index < self.ends.len());
+    fn modify_end(&mut self, index: Loc, new: Loc) {
         self.ends[index] = new;
     }
 
-    fn modify_ty(&mut self, index: usize, new: Ty<'tcx>) {
-        assert!(index < self.tys.len());
+    fn modify_ty(&mut self, index: Loc, new: Ty<'tcx>) {
         self.tys[index] = new;
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&usize, &Ty<'tcx>)> {
-        self.ends.iter().zip(self.tys.iter())
+    fn iter(&self) -> impl Iterator<Item = (Loc, Ty<'tcx>)> + '_ {
+        self.ends.iter().copied().zip(self.tys.iter().copied())
+    }
+
+    fn iter_enumerated(&self) -> impl Iterator<Item = (Loc, (Loc, Ty<'tcx>))> + '_ {
+        self.ends
+            .iter_enumerated()
+            .zip(self.tys.iter())
+            .map(|((i, l), t)| (i, (*l, *t)))
     }
 }
 
@@ -95,36 +109,36 @@ pub struct PreAnalysisData<'tcx> {
     alloc_fns: FxHashSet<LocalDefId>,
 
     pub call_graph: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
-    pub call_args: FxHashMap<LocalDefId, Vec<Vec<Option<usize>>>>,
-    indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, usize>>,
+    pub call_args: FxHashMap<LocalDefId, Vec<Vec<Option<Loc>>>>,
+    indirect_calls: FxHashMap<LocalDefId, FxHashMap<BasicBlock, Loc>>,
 
     index_info: IndexInfo<'tcx>,
-    pub globals: FxHashMap<LocalDefId, usize>,
-    pub non_fn_globals: FxHashSet<usize>,
-    pub inv_fns: FxHashMap<usize, LocalDefId>,
-    vars: FxHashMap<Var, usize>,
+    pub globals: FxHashMap<LocalDefId, Loc>,
+    pub non_fn_globals: FxHashSet<Loc>,
+    pub inv_fns: FxHashMap<Loc, LocalDefId>,
+    vars: FxHashMap<Var, Loc>,
 
-    index_prefixes: FxHashMap<usize, u8>,
-    union_offsets: FxHashMap<usize, Vec<usize>>,
+    index_prefixes: FxHashMap<Loc, u8>,
+    union_offsets: FxHashMap<Loc, Vec<usize>>,
     graph: FxHashMap<LocNode, LocEdges>,
     var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 }
 
-pub type Solutions = Vec<HybridBitSet<usize>>; // Send not implemented for HybridBitSet
+pub type Solutions = IndexVec<Loc, HybridBitSet<Loc>>; // Send not implemented for HybridBitSet
 
 #[derive(Debug)]
 pub struct AliasResults {
-    pub aliases: FxHashMap<DefId, FxHashSet<usize>>,
-    pub inv_params: FxHashMap<DefId, FxHashMap<usize, FxHashSet<usize>>>,
-    pub ends: Vec<usize>,
-    pub globals: FxHashMap<LocalDefId, usize>,
-    pub non_fn_globals: HybridBitSet<usize>,
+    pub aliases: FxHashMap<DefId, FxHashSet<Local>>,
+    pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>,
+    pub ends: IndexVec<Loc, Loc>,
+    pub globals: FxHashMap<LocalDefId, Loc>,
+    pub non_fn_globals: HybridBitSet<Loc>,
 }
 
 #[derive(Debug)]
 pub struct AnalysisResults {
-    pub ends: Vec<usize>,
-    pub union_offsets: FxHashMap<usize, Vec<usize>>,
+    pub ends: IndexVec<Loc, Loc>,
+    pub union_offsets: FxHashMap<Loc, Vec<usize>>,
     pub graph: LocGraph,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 
@@ -136,13 +150,13 @@ pub struct AnalysisResults {
     pub fn_sccs: FxHashMap<LocalDefId, graph::Id>,
     pub reachables: RefCell<FxHashMap<usize, FxHashSet<usize>>>,
 
-    pub writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<usize>>>,
-    pub bitfield_writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<usize>>>,
-    pub fn_writes: FxHashMap<LocalDefId, HybridBitSet<usize>>,
+    pub writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<Loc>>>,
+    pub bitfield_writes: FxHashMap<LocalDefId, FxHashMap<Location, HybridBitSet<Loc>>>,
+    pub fn_writes: FxHashMap<LocalDefId, HybridBitSet<Loc>>,
 }
 
 impl AnalysisResults {
-    pub fn call_writes(&self, def_id: LocalDefId) -> HybridBitSet<usize> {
+    pub fn call_writes(&self, def_id: LocalDefId) -> HybridBitSet<Loc> {
         self.with_reachables(self.fn_sccs[&def_id].index(), |sccs| {
             let mut writes = HybridBitSet::new_empty(self.ends.len());
             for scc in sccs {
@@ -242,7 +256,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut var_nodes = FxHashMap::default();
     for item in &bodies {
         let fn_ptr = fn_ptrs.contains(&item.local_def_id);
-        let global_index = index_info.len();
+        let global_index = index_info.next_index();
         globals.insert(item.local_def_id, global_index);
 
         if item.is_fn {
@@ -261,11 +275,14 @@ pub fn pre_analyze<'a, 'tcx>(
             .chain(local_decls);
 
         for (local, local_decl) in local_decls {
-            vars.insert(Var::Local(item.local_def_id, local), index_info.len());
+            vars.insert(
+                Var::Local(item.local_def_id, local),
+                index_info.next_index(),
+            );
             let ty = tss.tys[&local_decl.ty];
             let node = add_edges(
                 ty,
-                index_info.len(),
+                index_info.next_index(),
                 &mut graph,
                 &mut index_prefixes,
                 &mut union_offsets,
@@ -274,22 +291,22 @@ pub fn pre_analyze<'a, 'tcx>(
             compute_ends(ty, &mut index_info, item.local_def_id);
 
             if fn_ptr && local.index() == 0 {
-                index_info.modify_end(global_index, index_info.len() - 1);
+                index_info.modify_end(global_index, Loc::from_usize(index_info.len() - 1));
             }
 
             if let Some(ty) = unwrap_ptr(local_decl.ty) {
                 let mut index_info = IndexInfo::new();
                 let ty = tss.tys[&ty];
                 compute_ends(ty, &mut index_info, item.local_def_id);
-                for (i, (end, pty)) in index_info.iter().enumerate() {
-                    if alloc_info.len() > i {
+                for (i, (end, pty)) in index_info.iter_enumerated() {
+                    if alloc_info.next_index() > i {
                         let prev_end = alloc_info.get_end(i);
-                        if prev_end < *end {
-                            alloc_info.modify_end(i, *end);
-                            alloc_info.modify_ty(i, *pty);
+                        if prev_end < end {
+                            alloc_info.modify_end(i, end);
+                            alloc_info.modify_ty(i, pty);
                         }
                     } else {
-                        alloc_info.push(*end, *pty, item.local_def_id);
+                        alloc_info.push(end, pty, item.local_def_id);
                     }
                 }
             }
@@ -350,14 +367,14 @@ pub fn pre_analyze<'a, 'tcx>(
     }
 
     for alloc in allocs {
-        let len = index_info.len();
+        let len = index_info.next_index();
         vars.insert(alloc, len);
         for (end, ty) in alloc_info.iter() {
             let Var::Alloc(alloc_def_id, _) = alloc else {
                 unreachable!()
             };
 
-            index_info.push(len + *end, *ty, alloc_def_id);
+            index_info.push(len + end.index(), ty, alloc_def_id);
         }
     }
 
@@ -408,7 +425,8 @@ pub fn analyze<'a, 'tcx>(
 pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
     let mut arr = vec![];
     for v in solutions {
-        for mut i in v.iter() {
+        for i in v.iter() {
+            let mut i = i.index();
             while i > 0 {
                 arr.push((i & 127) as u8);
                 i >>= 7;
@@ -423,18 +441,18 @@ pub fn serialize_solutions(solutions: &Solutions) -> Vec<u8> {
 
 pub fn deserialize_solutions(arr: &[u8]) -> Solutions {
     let size = arr.iter().filter(|n| **n == 255).count() + 1;
-    let mut solutions: Solutions = vec![HybridBitSet::new_empty(size)];
-    let mut s = &mut solutions[0];
+    let mut solutions: Solutions = IndexVec::from_raw(vec![HybridBitSet::new_empty(size)]);
+    let mut s = &mut solutions[Loc::ZERO];
     let mut i = 0;
     let mut len = 0;
     for n in arr {
         match *n {
             255 => {
                 solutions.push(HybridBitSet::new_empty(size));
-                s = solutions.last_mut().unwrap();
+                s = solutions.raw.last_mut().unwrap();
             }
             254 => {
-                s.insert(i);
+                s.insert(Loc::from_usize(i));
                 i = 0;
                 len = 0;
             }
@@ -451,8 +469,8 @@ fn check_type_inner<'tcx>(
     pre: &PreAnalysisData<'tcx>,
     ty1: &Ty<'tcx>,
     ty2: &Ty<'tcx>,
-    index1: usize,
-    index2: usize,
+    index1: Loc,
+    index2: Loc,
     tcx: TyCtxt<'tcx>,
 ) -> bool {
     if ty1 == ty2 {
@@ -475,8 +493,8 @@ fn check_type_inner<'tcx>(
 // Filter out the cases where the sizes of types of two global indices are not compatible
 fn check_type_deref<'tcx>(
     pre: &PreAnalysisData<'tcx>,
-    index1: usize,
-    index2: usize,
+    index1: Loc,
+    index2: Loc,
     tcx: TyCtxt<'tcx>,
 ) -> bool {
     let ty1 = pre.index_info.get_ty(index1);
@@ -493,8 +511,8 @@ fn check_type_deref<'tcx>(
 
 fn check_type<'tcx>(
     pre: &PreAnalysisData<'tcx>,
-    index1: usize,
-    index2: usize,
+    index1: Loc,
+    index2: Loc,
     tcx: TyCtxt<'tcx>,
 ) -> bool {
     let ty1 = pre.index_info.get_ty(index1);
@@ -510,16 +528,16 @@ fn check_type<'tcx>(
 fn collect_param_alias<'tcx>(
     pre: &PreAnalysisData<'tcx>,
     solutions: &Solutions,
-    locals: &HybridBitSet<usize>,
-    args: &[Option<usize>],
-    params: &[(usize, usize)],
-    fun_alias: &mut FxHashSet<usize>,
+    locals: &HybridBitSet<Loc>,
+    args: &[Option<Loc>],
+    params: &[(Loc, Local)],
+    fun_alias: &mut FxHashSet<Local>,
     tcx: TyCtxt<'tcx>,
 ) {
     for (skip, (_, i1)) in params.iter().enumerate() {
         for (_, i2) in params.iter().skip(skip + 1) {
-            let index1 = args[*i1 - 1].unwrap();
-            let index2 = args[*i2 - 1].unwrap();
+            let index1 = args[i1.index() - 1].unwrap();
+            let index2 = args[i2.index() - 1].unwrap();
             if (fun_alias.contains(i1) && fun_alias.contains(i2))
                 || !check_type_deref(pre, index1, index2, tcx)
             {
@@ -548,8 +566,8 @@ pub fn compute_alias<'tcx>(
     check_global_alias: bool,
     check_param_alias: bool,
 ) -> AliasResults {
-    let mut aliases: FxHashMap<_, FxHashSet<usize>> = FxHashMap::default();
-    let mut inv_params: FxHashMap<_, FxHashMap<usize, FxHashSet<usize>>> = FxHashMap::default();
+    let mut aliases: FxHashMap<_, FxHashSet<Local>> = FxHashMap::default();
+    let mut inv_params: FxHashMap<_, FxHashMap<_, FxHashSet<Local>>> = FxHashMap::default();
     let non_fn_globals = pre.non_fn_globals.iter().fold(
         HybridBitSet::new_empty(pre.index_info.len()),
         |mut acc, g| {
@@ -569,15 +587,14 @@ pub fn compute_alias<'tcx>(
         let mut inv_param: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
 
         for (local, decl) in body.local_decls.iter_enumerated() {
-            let index = local.index();
             let g_index = pre.var_nodes[&(local_def_id, local)].index;
 
-            if (1..=*inputs).contains(&index) {
+            if (1..=*inputs).contains(&local.index()) {
                 let ty = decl.ty;
                 let TyKind::RawPtr(..) = ty.kind() else {
                     continue;
                 };
-                params.push((g_index, index));
+                params.push((g_index, local));
             }
             locals.insert(g_index);
         }
@@ -634,7 +651,7 @@ pub fn post_analyze<'a, 'tcx>(
     tss: &'a TyShapes<'a, 'tcx>,
     tcx: TyCtxt<'tcx>,
 ) -> AnalysisResults {
-    for (index, sols) in solutions.iter().enumerate() {
+    for (index, sols) in solutions.iter_enumerated() {
         let node = LocNode::new(0, index);
         let mut succs = vec![];
         for succ in sols.iter() {
@@ -647,7 +664,7 @@ pub fn post_analyze<'a, 'tcx>(
     for indices in &solutions {
         address_taken_indices.union(indices);
     }
-    for (i, _) in pre.index_info.ends.iter().enumerate() {
+    for (i, _) in pre.index_info.ends.iter_enumerated() {
         if address_taken_indices.contains(i) {
             for j in (i + 1)..=pre.index_info.ends[i] {
                 address_taken_indices.insert(j);
@@ -785,15 +802,15 @@ pub fn post_analyze<'a, 'tcx>(
 fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id: LocalDefId) {
     match ty {
         TyShape::Primitive(pty) => {
-            ends.push(ends.len(), *pty, def_id);
+            ends.push(ends.next_index(), *pty, def_id);
         }
         TyShape::Array(t, _) => compute_ends(t, ends, def_id),
         TyShape::Struct(len, ts, _) => {
-            let end = ends.len();
+            let end = ends.next_index();
             for (_, t) in ts {
                 compute_ends(t, ends, def_id);
             }
-            ends.modify_end(end, end + *len - 1);
+            ends.modify_end(end, end + (*len - 1));
         }
     }
 }
@@ -802,11 +819,11 @@ fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id
 fn compute_writes<'tcx>(
     l: Place<'tcx>,
     location: Location,
-    ends: &[usize],
-    solutions: &[HybridBitSet<usize>],
+    ends: &IndexVec<Loc, Loc>,
+    solutions: &IndexVec<Loc, HybridBitSet<Loc>>,
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut FxHashMap<Location, HybridBitSet<usize>>,
+    writes: &mut FxHashMap<Location, HybridBitSet<Loc>>,
 ) {
     let writes = writes
         .entry(location)
@@ -841,11 +858,11 @@ fn compute_bitfield_writes<'tcx>(
     location: Location,
     tss: &TyShapes<'_, 'tcx>,
     tcx: TyCtxt<'tcx>,
-    ends: &[usize],
-    solutions: &[HybridBitSet<usize>],
+    ends: &IndexVec<Loc, Loc>,
+    solutions: &IndexVec<Loc, HybridBitSet<Loc>>,
     ctx: Context<'_, 'tcx>,
     analyzer: &Analyzer<'_, '_, 'tcx>,
-    writes: &mut FxHashMap<Location, HybridBitSet<usize>>,
+    writes: &mut FxHashMap<Location, HybridBitSet<Loc>>,
 ) {
     if args.len() != 2 {
         return;
@@ -909,10 +926,10 @@ pub fn receiver_and_method(
 
 fn add_edges(
     ty: &TyShape<'_, '_>,
-    index: usize, // global index
+    index: Loc, // global index
     graph: &mut LocGraph,
-    index_prefixes: &mut FxHashMap<usize, u8>,
-    union_offsets: &mut FxHashMap<usize, Vec<usize>>,
+    index_prefixes: &mut FxHashMap<Loc, u8>,
+    union_offsets: &mut FxHashMap<Loc, Vec<usize>>,
 ) -> LocNode {
     let node = match ty {
         TyShape::Primitive(_) => return LocNode::new(0, index),
@@ -926,7 +943,7 @@ fn add_edges(
             let succs: IndexVec<FieldIdx, _> = ts
                 .iter()
                 .map(|(offset, t)| {
-                    add_edges(t, index + offset, graph, index_prefixes, union_offsets)
+                    add_edges(t, index + *offset, graph, index_prefixes, union_offsets)
                 })
                 .collect();
             let node = succs[FieldIdx::from_u32(0)].parent();
@@ -948,12 +965,12 @@ pub type LocGraph = FxHashMap<LocNode, LocEdges>;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LocNode {
     pub prefix: u8,
-    pub index: usize,
+    pub index: Loc,
 }
 
 impl std::fmt::Debug for LocNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.index)?;
+        write!(f, "{}", self.index.index())?;
         if self.prefix != 0 {
             write!(f, ":{}", self.prefix)?;
         }
@@ -962,7 +979,7 @@ impl std::fmt::Debug for LocNode {
 }
 
 impl LocNode {
-    fn new(prefix: u8, index: usize) -> Self {
+    fn new(prefix: u8, index: Loc) -> Self {
         Self { prefix, index }
     }
 
@@ -1168,8 +1185,9 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         let TyKind::FnDef(def_id, _) = ty.kind() else {
                             unreachable!()
                         };
-                        let var =
-                            Loc::new_root(self.pre.globals.get(&def_id.as_local()?).copied()?);
+                        let var = ProjectedLoc::new_root(
+                            self.pre.globals.get(&def_id.as_local()?).copied()?,
+                        );
                         Some(PrefixedLoc::new_ref(var))
                     }
                     ConstValue::Slice { .. } => None,
@@ -1242,24 +1260,24 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     } else if is_extern {
                         if output.is_raw_ptr() {
                             let var = Var::Alloc(ctx.owner, block);
-                            let loc = Loc::new_root(self.pre.vars[&var]);
+                            let loc = ProjectedLoc::new_root(self.pre.vars[&var]);
                             self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                         }
                     } else if self.pre.alloc_fns.contains(&local_def_id) {
                         let var = Var::Alloc(ctx.owner, block);
-                        let loc = Loc::new_root(self.pre.vars[&var]);
+                        let loc = ProjectedLoc::new_root(self.pre.vars[&var]);
                         self.transfer_assign(dst, PrefixedLoc::new_ref(loc), output);
                     } else {
                         let mut index = self.pre.globals[&local_def_id];
                         for (arg, arg_loc) in args.iter().zip(arg_locs) {
                             let ty = arg.node.ty(ctx.locals, self.tcx);
                             if let Some(arg) = arg_loc {
-                                let loc = Loc::new_root(index);
+                                let loc = ProjectedLoc::new_root(index);
                                 self.transfer_assign(PrefixedLoc::new(loc), arg, ty);
                             }
-                            index += self.tss.tys[&ty].len();
+                            index = index + self.tss.tys[&ty].len();
                         }
-                        let loc = Loc::new_root(index);
+                        let loc = ProjectedLoc::new_root(index);
                         self.transfer_assign(dst, PrefixedLoc::new(loc), output);
                     }
                 } else {
@@ -1280,7 +1298,7 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
 
     fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
         let var = Var::Local(def_id.as_local()?, Local::new(0));
-        let loc = Loc::new_root(self.pre.vars.get(&var).copied()?);
+        let loc = ProjectedLoc::new_root(self.pre.vars.get(&var).copied()?);
         Some(PrefixedLoc::new_ref(loc))
     }
 
@@ -1313,16 +1331,16 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
             }
         }
         let var = Var::Local(ctx.owner, place.local);
-        let loc = Loc::new(self.pre.vars[&var], index);
+        let loc = ProjectedLoc::new(self.pre.vars[&var], index);
         PrefixedLoc::new(loc).with_deref(place.is_indirect_first_projection())
     }
 }
 
-type WeightedGraph = FxHashMap<usize, FxHashMap<usize, FxHashSet<usize>>>;
+type WeightedGraph = FxHashMap<Loc, FxHashMap<Loc, FxHashSet<usize>>>;
 
 struct Graph {
     solutions: Solutions,
-    zero_weight_edges: Vec<HybridBitSet<usize>>,
+    zero_weight_edges: IndexVec<Loc, HybridBitSet<Loc>>,
     pos_weight_edges: WeightedGraph,
     deref_eqs: WeightedGraph,
     eq_derefs: WeightedGraph,
@@ -1344,22 +1362,29 @@ impl std::fmt::Debug for Graph {
     }
 }
 
+rustc_index::newtype_index! {
+    #[orderable]
+    #[debug_format = "scc{}"]
+    /// A unique identifier for a strongly connected component (SCC).
+    pub struct SccId {}
+}
+
 impl Graph {
     fn new(size: usize) -> Self {
         Self {
-            solutions: vec![HybridBitSet::new_empty(size); size],
-            zero_weight_edges: vec![HybridBitSet::new_empty(size); size],
+            solutions: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
+            zero_weight_edges: IndexVec::from_raw(vec![HybridBitSet::new_empty(size); size]),
             pos_weight_edges: FxHashMap::default(),
             deref_eqs: FxHashMap::default(),
             eq_derefs: FxHashMap::default(),
         }
     }
 
-    fn add_solution(&mut self, v: usize, sol: usize) {
-        self.solutions[v.index()].insert(sol);
+    fn add_solution(&mut self, v: Loc, sol: Loc) {
+        self.solutions[v].insert(sol);
     }
 
-    fn add_edge(&mut self, l: usize, r: usize, weight: usize) {
+    fn add_edge(&mut self, l: Loc, r: Loc, weight: usize) {
         if weight == 0 {
             self.zero_weight_edges[r].insert(l);
         } else {
@@ -1372,7 +1397,7 @@ impl Graph {
         }
     }
 
-    fn add_deref_eq(&mut self, v: usize, proj: usize, i: usize) {
+    fn add_deref_eq(&mut self, v: Loc, proj: usize, i: Loc) {
         self.deref_eqs
             .entry(v)
             .or_default()
@@ -1381,7 +1406,7 @@ impl Graph {
             .insert(proj);
     }
 
-    fn add_eq_deref(&mut self, i: usize, v: usize, proj: usize) {
+    fn add_eq_deref(&mut self, i: Loc, v: Loc, proj: usize) {
         self.eq_derefs
             .entry(v)
             .or_default()
@@ -1390,7 +1415,7 @@ impl Graph {
             .insert(proj);
     }
 
-    fn solve(self, ends: &[usize]) -> Solutions {
+    fn solve(self, ends: &IndexVec<Loc, Loc>) -> Solutions {
         let Self {
             mut solutions,
             mut zero_weight_edges,
@@ -1401,18 +1426,19 @@ impl Graph {
         let len = solutions.len();
 
         let mut deltas = solutions.clone();
-        let mut id_to_rep = Vec::from_iter(0..len);
+        let mut id_to_rep: IndexVec<Loc, Loc> = solutions.indices().collect();
 
         while deltas.iter().any(|s| !s.is_empty()) {
-            let sccs: Sccs<_, usize> = Sccs::new(&VecBitSet(&zero_weight_edges));
+            let sccs: Sccs<_, SccId> = Sccs::new(&VecBitSet(&zero_weight_edges));
 
-            let mut components = vec![HybridBitSet::new_empty(len); sccs.num_sccs()];
-            for i in 0..len {
+            let mut components =
+                IndexVec::from_raw(vec![HybridBitSet::new_empty(len); sccs.num_sccs()]);
+            for i in solutions.indices() {
                 let scc = sccs.scc(i);
-                components[scc.index()].insert(i);
+                components[scc].insert(i);
             }
 
-            let mut scc_to_rep = vec![];
+            let mut scc_to_rep = IndexVec::new();
             let mut cycles = vec![];
             let mut new_id_to_rep = FxHashMap::default();
             for component in components.iter() {
@@ -1470,8 +1496,8 @@ impl Graph {
                 }
 
                 // update zero_weight_edges
-                zero_weight_edges = vec![HybridBitSet::new_empty(len); len];
-                for (scc, rep) in scc_to_rep.iter().enumerate() {
+                zero_weight_edges = IndexVec::from_raw(vec![HybridBitSet::new_empty(len); len]);
+                for (scc, rep) in scc_to_rep.iter_enumerated() {
                     let succs = &mut zero_weight_edges[*rep];
                     for succ in sccs.successors(scc) {
                         succs.insert(scc_to_rep[*succ]);
@@ -1530,7 +1556,7 @@ impl Graph {
                     for (l, projs) in pos_weight_edges {
                         for proj in projs {
                             for i in delta.iter() {
-                                let f = i + proj;
+                                let f = i + *proj;
                                 if f > ends[i] {
                                     continue;
                                 }
@@ -1545,7 +1571,7 @@ impl Graph {
             }
         }
 
-        for (id, rep) in id_to_rep.iter().enumerate() {
+        for (id, rep) in id_to_rep.iter_enumerated() {
             if id != *rep {
                 solutions[id] = solutions[*rep].clone();
             }
@@ -1555,7 +1581,7 @@ impl Graph {
     }
 }
 
-fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &HybridBitSet<usize>)]) {
+fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(Loc, &HybridBitSet<Loc>)]) {
     for (rep, ids) in cycles {
         let mut rep_edges = graph.remove(rep).unwrap_or_default();
         for id in ids.iter() {
@@ -1594,21 +1620,21 @@ fn update_weighted_graph(graph: &mut WeightedGraph, cycles: &[(usize, &HybridBit
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn propagate_deref(
-    v: usize,
+    v: Loc,
     derefs: &WeightedGraph,
-    delta: &HybridBitSet<usize>,
-    ends: &[usize],
-    id_to_rep: &[usize],
-    zero_weight_edges: &mut [HybridBitSet<usize>],
-    solutions: &mut [HybridBitSet<usize>],
-    deltas: &mut [HybridBitSet<usize>],
+    delta: &HybridBitSet<Loc>,
+    ends: &IndexVec<Loc, Loc>,
+    id_to_rep: &IndexVec<Loc, Loc>,
+    zero_weight_edges: &mut IndexVec<Loc, HybridBitSet<Loc>>,
+    solutions: &mut IndexVec<Loc, HybridBitSet<Loc>>,
+    deltas: &mut IndexVec<Loc, HybridBitSet<Loc>>,
     deref_eq: bool,
 ) {
     let derefs = some_or!(derefs.get(&v), return);
     for (w, projs) in derefs {
         for proj in projs {
             for i in delta.iter() {
-                let f = i + proj;
+                let f = i + *proj;
                 if f > ends[i] {
                     continue;
                 }
@@ -1644,14 +1670,14 @@ impl std::fmt::Debug for Var {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Loc {
-    root: usize,
+struct ProjectedLoc {
+    root: Loc,
     proj: usize,
 }
 
-impl std::fmt::Debug for Loc {
+impl std::fmt::Debug for ProjectedLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.root)?;
+        write!(f, "{}", self.root.index())?;
         if self.proj != 0 {
             write!(f, "+{}", self.proj)?;
         }
@@ -1659,14 +1685,14 @@ impl std::fmt::Debug for Loc {
     }
 }
 
-impl Loc {
+impl ProjectedLoc {
     #[inline]
-    fn new(root: usize, proj: usize) -> Self {
+    fn new(root: Loc, proj: usize) -> Self {
         Self { root, proj }
     }
 
     #[inline]
-    fn new_root(root: usize) -> Self {
+    fn new_root(root: Loc) -> Self {
         Self { root, proj: 0 }
     }
 
@@ -1679,7 +1705,7 @@ impl Loc {
     }
 
     #[inline]
-    fn index(self) -> usize {
+    fn index(self) -> Loc {
         self.root + self.proj
     }
 }
@@ -1688,12 +1714,12 @@ impl Loc {
 struct PrefixedLoc {
     deref: bool,
     r#ref: bool,
-    var: Loc,
+    var: ProjectedLoc,
 }
 
 impl PrefixedLoc {
     #[inline]
-    fn new(var: Loc) -> Self {
+    fn new(var: ProjectedLoc) -> Self {
         Self {
             deref: false,
             r#ref: false,
@@ -1702,7 +1728,7 @@ impl PrefixedLoc {
     }
 
     #[inline]
-    fn new_ref(var: Loc) -> Self {
+    fn new_ref(var: ProjectedLoc) -> Self {
         Self {
             deref: false,
             r#ref: true,
@@ -1729,7 +1755,7 @@ impl PrefixedLoc {
     }
 
     #[inline]
-    fn index(self) -> usize {
+    fn index(self) -> Loc {
         self.var.index()
     }
 }
@@ -1836,7 +1862,7 @@ impl<'tcx> Visitor<'tcx> for FnPtrVisitor<'tcx> {
 }
 
 #[repr(transparent)]
-struct VecBitSet<'a, T: Idx>(&'a Vec<HybridBitSet<T>>);
+struct VecBitSet<'a, T: Idx>(&'a IndexVec<T, HybridBitSet<T>>);
 
 impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
     type Node = T;
@@ -1848,6 +1874,6 @@ impl<T: Idx> DirectedGraph for VecBitSet<'_, T> {
 
 impl<T: Idx> Successors for VecBitSet<'_, T> {
     fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
-        self.0[node.index()].iter()
+        self.0[node].iter()
     }
 }

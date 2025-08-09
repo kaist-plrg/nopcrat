@@ -1,4 +1,5 @@
 use rustc_hir::def_id::DefId;
+use rustc_middle::mir::Local;
 
 use super::{analysis, domains::*};
 use crate::*;
@@ -37,7 +38,15 @@ fn analyze(code: &str) -> Vec<AbsState> {
 }
 
 fn ret(st: &AbsState) -> &AbsVal {
-    st.local.get(0)
+    st.local.get(Local::ZERO)
+}
+
+fn read_path(st: &AbsState, i: usize) -> Vec<usize> {
+    st.reads.as_vec()[i].as_vec()
+}
+
+fn write_path(st: &AbsState, i: usize) -> Vec<usize> {
+    st.writes.as_vec()[i].as_vec()
 }
 
 fn as_int(v: &AbsVal) -> Vec<i128> {

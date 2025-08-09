@@ -5,7 +5,7 @@ use std::{
 };
 
 use etrace::some_or;
-use rustc_abi::VariantIdx;
+use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_const_eval::interpret::{GlobalAlloc, Scalar};
 use rustc_data_structures::graph::Successors;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -14,7 +14,7 @@ use rustc_hir::{
     intravisit::Visitor as HVisitor,
     Expr, ExprKind, HirId, QPath,
 };
-use rustc_index::bit_set::DenseBitSet;
+use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::{
     hir::nested_filter,
     mir::{
@@ -41,7 +41,10 @@ use super::{
 use crate::{
     compile_util::{self, LoHi},
     graph,
-    may_analysis::{self, analysis::AliasResults},
+    may_analysis::{
+        self,
+        analysis::{AliasResults, Loc},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -129,9 +132,9 @@ enum Write {
 #[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
     pub local_def_id: LocalDefId,
-    pub alias: &'a FxHashSet<usize>,
-    pub inv_param: &'a FxHashMap<usize, FxHashSet<usize>>,
-    pub ends: &'a Vec<usize>,
+    pub alias: &'a FxHashSet<Local>,
+    pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>,
+    pub ends: &'a IndexVec<Loc, Loc>,
 }
 
 impl<'a> PreAnalysisContext<'a> {
@@ -144,7 +147,7 @@ impl<'a> PreAnalysisContext<'a> {
         }
     }
 
-    pub fn check_index_global(&self, index: usize) -> FxHashSet<usize> {
+    pub fn check_index_global(&self, index: Loc) -> FxHashSet<Local> {
         if self.inv_param.contains_key(&index) {
             let params = self.inv_param.get(&index).unwrap();
             return params.clone();
@@ -324,7 +327,7 @@ pub fn analyze(
 
                 let exclude_paths: Vec<_> = nullable_params
                     .iter()
-                    .flat_map(|p| analyzer.expands_path(&AbsPath(vec![*p])))
+                    .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
 
                 let ret_location = return_location(body);
@@ -367,10 +370,13 @@ pub fn analyze(
                             })
                             .unwrap_or_default()
                             .iter()
-                            .map(|p| p.base() - 1)
+                            .map(|p| p.base.index() - 1)
                             .collect();
-                        let mays: BTreeSet<_> =
-                            writes.into_iter().flatten().map(|p| p.base() - 1).collect();
+                        let mays: BTreeSet<_> = writes
+                            .into_iter()
+                            .flatten()
+                            .map(|p| p.base.index() - 1)
+                            .collect();
                         let span = LoHi::from_span(*sp);
                         bb_must.insert(loc.block, musts.clone());
                         wbr.push(WriteBeforeReturn { span, mays, musts });
@@ -550,20 +556,28 @@ pub enum ReturnValues {
 #[derive(Debug, Clone)]
 struct FuncInfo {
     inputs: usize,
-    param_tys: Vec<TypeInfo>,
+    param_tys: IndexVec<Local, TypeInfo>,
     loop_blocks: BTreeMap<BasicBlock, BTreeSet<BasicBlock>>,
     rpo_map: BTreeMap<BasicBlock, usize>,
-    dead_locals: Vec<DenseBitSet<Local>>,
+    dead_locals: IndexVec<BasicBlock, DenseBitSet<Local>>,
     fn_ptr: bool,
     globals: FxHashSet<DefId>,
 }
 
 impl FuncInfo {
     fn expands_path(&self, place: &AbsPath) -> Vec<AbsPath> {
-        expands_path(&place.0, &self.param_tys, vec![])
-            .into_iter()
-            .map(AbsPath)
-            .collect()
+        if let Some(ty) = self.param_tys.get(place.base) {
+            if let TypeInfo::Struct(fields) = ty {
+                expand_projections(&place.projections, fields, vec![])
+                    .into_iter()
+                    .map(|projections| AbsPath::new(place.base, projections))
+                    .collect()
+            } else {
+                vec![AbsPath::new(place.base, vec![])]
+            }
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -572,8 +586,8 @@ pub struct Analyzer<'a, 'tcx> {
     info: &'a FuncInfo,
     conf: &'a AnalysisConfig,
     pub summaries: &'a FxHashMap<DefId, FunctionSummary>,
-    pub ptr_params: Vec<usize>,
-    pub ptr_params_inv: FxHashMap<usize, usize>,
+    pub ptr_params: IndexVec<ArgIdx, Local>,
+    pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
     pub pre_context: Option<PreAnalysisContext<'a>>,
 }
@@ -604,22 +618,22 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             info,
             conf,
             summaries,
-            ptr_params: vec![],
+            ptr_params: IndexVec::new(),
             ptr_params_inv: FxHashMap::default(),
             call_args: BTreeMap::new(),
             pre_context,
         }
     }
 
-    fn get_return_ptrs(&self, summary: &FunctionSummary) -> BTreeSet<usize> {
+    fn get_return_ptrs(&self, summary: &FunctionSummary) -> BTreeSet<Local> {
         summary
             .return_states
             .values()
             .flat_map(|st| {
-                let v = st.local.get(0);
+                let v = st.local.get(Local::ZERO);
                 self.get_read_paths_of_ptr(&v.ptrv, &[])
             })
-            .map(|p| p.base())
+            .map(|p| p.base)
             .collect()
     }
 
@@ -691,19 +705,18 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         loc: &Location,
         local_writes: &mut BTreeSet<Local>,
-        param: usize,
+        param: Local,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
         term: &Terminator<'_>,
     ) -> bool {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
                 let call_info = call_info_map.get(loc).unwrap();
-                let idx = destination.local.index();
                 // check the destination of call
-                if idx == 0 {
+                if destination.local == Local::ZERO {
                     return false;
                 }
-                if idx != param || !destination.is_indirect_first_projection() {
+                if destination.local != param || !destination.is_indirect_first_projection() {
                     local_writes.insert(destination.local);
                 }
 
@@ -717,7 +730,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         bases.iter().all(|p| match p {
                             AbsBase::Local(idx) => {
                                 // Defer the check to the caller
-                                local_writes.insert(Local::from_usize(*idx));
+                                local_writes.insert(*idx);
                                 true
                             }
                             AbsBase::Heap => false,
@@ -734,15 +747,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn check_assign_pure(
         &self,
         locs: &mut BTreeSet<Local>,
-        param: usize,
+        param: Local,
         stmt: &StatementKind<'_>,
     ) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            let idx = place.local.index();
-            if idx == param && place.is_indirect_first_projection() {
+            if place.local == param && place.is_indirect_first_projection() {
                 return true;
             }
-            if idx == 0 {
+            if place.local == Local::ZERO {
                 return false;
             }
             locs.insert(place.local);
@@ -768,7 +780,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
-                    if let Some(arg) = self.ptr_params_inv.get(&i) {
+                    if let Some(arg) = self.ptr_params_inv.get(&Local::from_usize(i)) {
                         match nulls.get(*arg) {
                             AbsNull::Null => {
                                 null_locs.insert(*loc);
@@ -807,7 +819,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
-    ) -> BTreeSet<usize> {
+    ) -> BTreeSet<Local> {
         self.compute_nonnull_null_locs(result)
             .into_iter()
             .enumerate()
@@ -816,7 +828,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     return None;
                 }
 
-                let param = i + 1;
+                let param = Local::from_usize(i + 1);
                 let nonnull_diff = nonnull.iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
@@ -841,7 +853,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                             statement_index,
                         } = loc;
 
-                        if writes.iter().any(|p| p.base() != param) {
+                        if writes.iter().any(|p| p.base != param) {
                             return false;
                         }
 
@@ -879,10 +891,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn check_reachable_globals(
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
-        globals: &FxHashMap<LocalDefId, usize>,
+        globals: &FxHashMap<LocalDefId, Loc>,
         initial_id: DefId,
         call_graph: &FxHashMap<DefId, FxHashSet<DefId>>,
-    ) -> BTreeSet<usize> {
+    ) -> BTreeSet<Local> {
         let mut indexes = FxHashSet::default();
         let mut visited = FxHashSet::default();
         let mut stack = vec![initial_id];
@@ -919,7 +931,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn find_output_params(
         &self,
         summary: &FunctionSummary,
-        return_ptrs: &BTreeSet<usize>,
+        return_ptrs: &BTreeSet<Local>,
         def_id: DefId,
     ) -> Vec<OutputParam> {
         if self.info.fn_ptr || summary.return_states.values().any(|st| st.writes.is_bot()) {
@@ -930,18 +942,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .return_states
             .values()
             .flat_map(|st| st.reads.as_set())
-            .map(|p| p.base())
+            .map(|p| p.base)
             .collect();
         let excludes: BTreeSet<_> = summary
             .return_states
             .values()
             .flat_map(|st| st.excludes.as_set())
-            .map(|p| p.base())
+            .map(|p| p.base)
             .collect();
 
         let body = self.tcx.optimized_mir(def_id);
         let mut writes = vec![];
         for i in 1..=self.info.inputs {
+            let i = Local::from_usize(i);
             if reads.contains(&i)
                 || excludes.contains(&i)
                 || return_ptrs.contains(&i)
@@ -950,7 +963,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 continue;
             }
 
-            let ty = &body.local_decls[Local::from_usize(i)].ty;
+            let ty = &body.local_decls[i].ty;
             let TyKind::RawPtr(ty, ..) = ty.kind() else {
                 continue;
             };
@@ -959,28 +972,21 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             }
 
             let expanded: BTreeSet<_> = self
-                .expands_path(&AbsPath(vec![i]))
+                .expands_path(&AbsPath::new(i, vec![]))
                 .into_iter()
-                .map(|p| p.0)
                 .collect();
             let wrs: Vec<_> = summary
                 .return_states
                 .values()
                 .filter_map(|st| {
                     let arg = self.ptr_params_inv.get(&i).unwrap();
-                    if st.nulls.is_null(arg) {
+                    if st.nulls.is_null(*arg) {
                         None
                     } else {
                         let writes: BTreeSet<_> = st
                             .writes
                             .iter()
-                            .filter_map(|p| {
-                                if p.base() == i {
-                                    Some(p.0.clone())
-                                } else {
-                                    None
-                                }
-                            })
+                            .filter_map(|p| if p.base == i { Some(p.clone()) } else { None })
                             .collect();
                         let w = if writes.is_empty() {
                             Write::None
@@ -989,7 +995,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                         } else {
                             Write::Partial
                         };
-                        let rv = st.local.get(0).clone();
+                        let rv = st.local.get(Local::ZERO).clone();
                         Some((w, rv))
                     }
                 })
@@ -1033,7 +1039,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     ReturnValues::None
                 };
                 OutputParam {
-                    index: index - 1,
+                    index: index.index() - 1,
                     must,
                     return_values,
                     complete_writes: vec![],
@@ -1054,7 +1060,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             return;
         }
 
-        let paths = self.expands_path(&AbsPath(vec![param.index + 1]));
+        let paths = self.expands_path(&AbsPath::new(Local::from_usize(param.index + 1), vec![]));
 
         let body = self.tcx.optimized_mir(def_id);
         let predecessors = body.basic_blocks.predecessors();
@@ -1127,19 +1133,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 let v = self.top_value_of_ty(ty);
                 let idx = start_state.args.push(v);
                 start_state.nulls.push_top();
-                self.ptr_params.push(i);
-                self.ptr_params_inv.insert(i, idx);
+                self.ptr_params.push(local);
+                self.ptr_params_inv.insert(local, idx);
                 AbsValue::arg(idx)
             } else {
                 self.top_value_of_ty(ty)
             };
-            start_state.local.set(i, v);
+            start_state.local.set(local, v);
         }
 
         if self.conf.check_param_alias {
             let pre_context = self.pre_context.as_ref().unwrap();
             for a in pre_context.alias {
-                start_state.excludes.insert(AbsPath(vec![*a]));
+                start_state.excludes.insert(AbsPath::new(*a, vec![]));
             }
         }
 
@@ -1213,7 +1219,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 writes_map.entry(label.location).or_default().extend(writes);
 
                 for location in &next_locations {
-                    let dead_locals = &self.info.dead_locals[location.block.as_usize()];
+                    let dead_locals = &self.info.dead_locals[location.block];
                     if merging_blocks.contains(&location.block) {
                         let next_state = if let Some(states) = states.get(location) {
                             assert_eq!(states.len(), 1);
@@ -1590,9 +1596,9 @@ impl<'a> WorkList<'a> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeInfo {
-    Struct(Vec<TypeInfo>),
+    Struct(IndexVec<FieldIdx, TypeInfo>),
     Union,
     NonStruct,
 }
@@ -1662,10 +1668,14 @@ fn analysis_result_to_string(
     Ok(res)
 }
 
-fn get_param_tys<'tcx>(body: &Body<'tcx>, inputs: usize, tcx: TyCtxt<'tcx>) -> Vec<TypeInfo> {
-    let mut param_tys = vec![];
-    for (i, local) in body.local_decls.iter().enumerate() {
-        if i > inputs {
+fn get_param_tys<'tcx>(
+    body: &Body<'tcx>,
+    inputs: usize,
+    tcx: TyCtxt<'tcx>,
+) -> IndexVec<Local, TypeInfo> {
+    let mut param_tys = IndexVec::new();
+    for (i, local) in body.local_decls.iter_enumerated() {
+        if i.index() > inputs {
             break;
         }
         let ty = if let TyKind::RawPtr(ty, ..) = local.ty.kind() {
@@ -1824,7 +1834,10 @@ fn compute_rpo_map(
     rpo.into_iter().enumerate().map(|(i, bb)| (bb, i)).collect()
 }
 
-fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSet<Local>> {
+fn get_dead_locals<'tcx>(
+    body: &Body<'tcx>,
+    tcx: TyCtxt<'tcx>,
+) -> IndexVec<BasicBlock, DenseBitSet<Local>> {
     let mut borrowed_locals = rustc_mir_dataflow::impls::borrowed_locals(body);
     borrowed_locals.insert(Local::from_usize(0));
     let mut cursor = rustc_mir_dataflow::impls::MaybeLiveLocals
@@ -1844,12 +1857,16 @@ fn get_dead_locals<'tcx>(body: &Body<'tcx>, tcx: TyCtxt<'tcx>) -> Vec<DenseBitSe
         .collect()
 }
 
-fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<Vec<usize>> {
-    if let Some(first) = path.first() {
+fn expand_projections(
+    projections: &[FieldIdx],
+    tys: &IndexVec<FieldIdx, TypeInfo>,
+    mut curr: Vec<FieldIdx>,
+) -> Vec<Vec<FieldIdx>> {
+    if let Some(first) = projections.first() {
         curr.push(*first);
         if let Some(ty) = tys.get(*first) {
             if let TypeInfo::Struct(fields) = ty {
-                expands_path(&path[1..], fields, curr)
+                expand_projections(&projections[1..], fields, curr)
             } else {
                 vec![curr]
             }
@@ -1857,13 +1874,12 @@ fn expands_path(path: &[usize], tys: &[TypeInfo], mut curr: Vec<usize>) -> Vec<V
             vec![]
         }
     } else {
-        tys.iter()
-            .enumerate()
+        tys.iter_enumerated()
             .flat_map(|(n, ty)| {
                 let mut curr = curr.clone();
                 curr.push(n);
                 if let TypeInfo::Struct(fields) = ty {
-                    expands_path(path, fields, curr)
+                    expand_projections(projections, fields, curr)
                 } else {
                     vec![curr]
                 }
