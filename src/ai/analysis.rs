@@ -722,10 +722,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
                 // check the writes of callee
                 call_info.iter().all(|kind| match kind {
-                    CallKind::Method | CallKind::RustPure => true,
-                    CallKind::C | CallKind::TOP | CallKind::RustEffect(None) | CallKind::Intra => {
-                        false
-                    }
+                    CallKind::Method | CallKind::RustPure | CallKind::CPure => true,
+                    CallKind::CEffect
+                    | CallKind::TOP
+                    | CallKind::RustEffect(None)
+                    | CallKind::Intra => false,
                     CallKind::RustEffect(Some(bases)) => {
                         bases.iter().all(|p| match p {
                             AbsBase::Local(idx) => {

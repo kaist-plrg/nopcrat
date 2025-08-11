@@ -30,7 +30,8 @@ pub enum CallKind {
     Method,
     RustEffect(Option<Vec<AbsBase>>),
     RustPure,
-    C,
+    CEffect,
+    CPure,
     TOP,
 }
 
@@ -238,11 +239,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 return self
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
-                (
-                    vec![self.transfer_c_call(callee, args, &mut state, &mut reads)],
-                    vec![],
-                    CallKind::C,
-                )
+                self.transfer_c_call(callee, args, &mut state, &mut reads)
             } else if name.contains("{impl#") {
                 (
                     vec![self.transfer_method_call(callee, args, &mut reads)],
@@ -417,7 +414,24 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         args: &[AbsValue],
         state: &mut AbsState,
         reads: &mut Vec<AbsPath>,
-    ) -> AbsValue {
+    ) -> (Vec<AbsValue>, Vec<(Local, ArgIdx, AbsNull)>, CallKind) {
+        let name = self.def_id_to_string(callee);
+        let mut segs: Vec<_> = name.split("::").collect();
+        let segs0 = segs.pop().unwrap_or_default();
+        // let segs1 = segs.pop().unwrap_or_default();
+        // let segs2 = segs.pop().unwrap_or_default();
+        // let segs3 = segs.pop().unwrap_or_default();
+
+        let call_kind = match segs0 {
+            "__ctype_toupper_loc"
+            | "gettimeofday"
+            | "strlen"
+            | "strspn"
+            | "strerror"
+            | "__errno_location" => CallKind::CPure,
+            _ => CallKind::CEffect,
+        };
+
         let sig = self.tcx.fn_sig(callee).skip_binder();
         let inputs = sig.inputs().skip_binder();
         let output = sig.output().skip_binder();
@@ -457,13 +471,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             self.indirect_assign(&args[arg].ptrv, &AbsValue::top(), &[], state);
         }
 
-        if output.is_primitive() || output.is_unit() || output.is_never() {
+        let v = if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
         } else if output.is_raw_ptr() {
             AbsValue::heap_or_null()
         } else {
             AbsValue::top()
-        }
+        };
+
+        (vec![v], vec![], call_kind)
     }
 
     fn transfer_rust_call(
