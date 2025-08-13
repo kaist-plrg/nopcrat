@@ -607,15 +607,7 @@ pub fn compute_alias<'tcx>(
                 if fun_alias.len() == params.len() {
                     break;
                 }
-                collect_param_alias(
-                    &pre,
-                    solutions,
-                    &locals,
-                    args,
-                    &params,
-                    &mut fun_alias,
-                    tcx,
-                )
+                collect_param_alias(&pre, solutions, &locals, args, &params, &mut fun_alias, tcx)
             }
         }
 
