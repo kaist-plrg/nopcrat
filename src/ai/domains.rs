@@ -6,7 +6,7 @@ use std::{
 
 use lazy_static::lazy_static;
 use rustc_abi::FieldIdx;
-use rustc_hash::{FxHashSet, FxHashMap};
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
@@ -103,7 +103,11 @@ impl AbsState {
         }
     }
 
-    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I, ptr_params_inv: &FxHashMap<Local, ArgIdx>) -> BTreeSet<AbsPath> {
+    pub fn add_writes<I: Iterator<Item = AbsPath>>(
+        &mut self,
+        paths: I,
+        ptr_params_inv: &FxHashMap<Local, ArgIdx>,
+    ) -> BTreeSet<AbsPath> {
         let mut res = BTreeSet::new();
         let locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
         for path in paths {

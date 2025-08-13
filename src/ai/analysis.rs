@@ -42,7 +42,9 @@ use crate::{
     compile_util::{self, body_to_str, LoHi},
     graph,
     may_analysis::{
-        self, analysis::{AliasResults, Loc, LocNode, Solutions}, bitset::HybridBitSet
+        self,
+        analysis::{AliasResults, Loc, LocNode, Solutions},
+        bitset::HybridBitSet,
     },
 };
 
@@ -217,12 +219,11 @@ pub fn analyze(
                 dead_locals,
                 fn_ptr,
                 globals,
-                tran_callees
+                tran_callees,
             };
             (*def_id, info)
         })
         .collect();
-
 
     let arena = Arena::new();
     let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
@@ -321,7 +322,9 @@ pub fn analyze(
 
                 // If there is a merged block, always check if every parameter is nullable
                 let candidates = if is_merged {
-                    (1..=(analyzer.info.inputs)).map(|i| Local::from_usize(i)).collect::<Vec<Local>>()
+                    (1..=(analyzer.info.inputs))
+                        .map(Local::from_usize)
+                        .collect::<Vec<Local>>()
                 } else {
                     // If not, we filter the parameters which are implicity non-null
                     analyzer.get_nullable_candidates(&return_states)
@@ -334,7 +337,6 @@ pub fn analyze(
                     &writes_map,
                     &call_info_map,
                     candidates,
-                    debug_f
                 );
 
                 if debug_f {
@@ -346,10 +348,8 @@ pub fn analyze(
                 }
 
                 if conf.check_global_alias {
-                    let alias_params = analyzer.check_reachable_globals(
-                        &info_map,
-                        &pre_data.globals,
-                    );
+                    let alias_params =
+                        analyzer.check_reachable_globals(&info_map, &pre_data.globals);
                     unremovable_params.extend(alias_params);
                 }
 
@@ -418,16 +418,18 @@ pub fn analyze(
                     st.add_excludes(exclude_paths.iter().cloned());
                 }
 
-                let mut has_side_effects =
-                    call_info_map
-                        .values()
-                        .flatten()
-                        .any(|kind| matches!(kind, CallKind::TOP | CallKind::RustEffect(_) | CallKind::CEffect | CallKind::IntraEffect));
+                let mut has_side_effects = call_info_map.values().flatten().any(|kind| {
+                    matches!(
+                        kind,
+                        CallKind::TOP
+                            | CallKind::RustEffect(_)
+                            | CallKind::CEffect
+                            | CallKind::IntraEffect
+                    )
+                });
 
-                has_side_effects = has_side_effects || analyzer.check_global_writes(
-                    &solutions,
-                    &pre_data.var_nodes,
-                );
+                has_side_effects = has_side_effects
+                    || analyzer.check_global_writes(&solutions, &pre_data.var_nodes);
 
                 let summary = FunctionSummary::new(init_state, return_states, has_side_effects);
                 results.insert(*def_id, states);
@@ -744,7 +746,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         param: Local,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
         term: &Terminator<'_>,
-        debug_f: bool,
     ) -> bool {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
@@ -759,7 +760,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
                 // check the writes of callee
                 call_info.iter().all(|kind| match kind {
-                    CallKind::Method | CallKind::RustPure | CallKind::CPure | CallKind::IntraPure => true,
+                    CallKind::Method
+                    | CallKind::RustPure
+                    | CallKind::CPure
+                    | CallKind::IntraPure => true,
                     CallKind::CEffect
                     | CallKind::TOP
                     | CallKind::RustEffect(None)
@@ -858,16 +862,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
         candidates: Vec<Local>,
-        debug_f: bool,
     ) -> BTreeSet<Local> {
         self.compute_nonnull_null_locs(result, candidates)
             .into_iter()
             .filter_map(|(param, nonnull, null)| {
-                if debug_f {
-                    println!("Checking parameter {}", param.index());
-                    println!("nonnull: {:?}", nonnull);
-                    println!("null: {:?}", null);
-                }
                 if null.is_empty() && nonnull.is_empty() {
                     return None;
                 }
@@ -912,7 +910,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                                 param,
                                 call_info_map,
                                 term,
-                                debug_f,
                             )
                         }
                     }) && self.check_local_uses(tcx, body, block, diff_locs, &local_writes)
@@ -937,21 +934,23 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         return_states: &BTreeMap<(MustPathSet, AbsNulls), AbsState>,
     ) -> Vec<Local> {
-        (1..=self.info.inputs).filter_map(|i| {
-            let l = Local::from_usize(i);
-            let Some(arg) = self.ptr_params_inv.get(&l) else {
-                return None;
-            };
+        (1..=self.info.inputs)
+            .filter_map(|i| {
+                let l = Local::from_usize(i);
+                let arg = self.ptr_params_inv.get(&l)?;
 
-            for st in return_states.values() {
-                let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
-                if (!writes.contains(&l) && st.nulls.is_top(*arg)) || (writes.contains(&l) && st.nonnulls.contains(l)) {
-                    continue;
+                for st in return_states.values() {
+                    let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+                    if (!writes.contains(&l) && st.nulls.is_top(*arg))
+                        || (writes.contains(&l) && st.nonnulls.contains(l))
+                    {
+                        continue;
+                    }
+                    return Some(l);
                 }
-                return Some(l);
-            }
-            None
-        }).collect()
+                None
+            })
+            .collect()
     }
 
     // Check if the global variables that is reachable from the function
@@ -989,16 +988,18 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         solutions: &Solutions,
         var_nodes: &FxHashMap<(LocalDefId, Local), LocNode>,
     ) -> bool {
-        self.write_locals.iter().flat_map(|local| {
-            let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
-            let end = self.pre_context.ends[start];
-            start..=end
-        })
-        .any(|loc| {
-            let mut sol = solutions[loc].clone();
-            sol.intersect(self.pre_context.globals);
-            !sol.is_empty()
-        })
+        self.write_locals
+            .iter()
+            .flat_map(|local| {
+                let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
+                let end = self.pre_context.ends[start];
+                start..=end
+            })
+            .any(|loc| {
+                let mut sol = solutions[loc].clone();
+                sol.intersect(self.pre_context.globals);
+                !sol.is_empty()
+            })
     }
 
     fn find_output_params(
@@ -1457,12 +1458,13 @@ impl FunctionSummary {
     }
 
     fn ord(&self, other: &Self) -> bool {
-        self.init_state.ord(&other.init_state) && {
-            self.return_states
-                .iter()
-                .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
-        } &&
-        self.has_side_effects == other.has_side_effects
+        self.init_state.ord(&other.init_state)
+            && {
+                self.return_states
+                    .iter()
+                    .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
+            }
+            && self.has_side_effects == other.has_side_effects
     }
 }
 

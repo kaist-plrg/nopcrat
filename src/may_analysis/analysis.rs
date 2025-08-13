@@ -609,7 +609,7 @@ pub fn compute_alias<'tcx>(
                 }
                 collect_param_alias(
                     &pre,
-                    &solutions,
+                    solutions,
                     &locals,
                     args,
                     &params,
