@@ -544,7 +544,7 @@ fn test_nullable_effect_call2() {
     ";
     let result = analyze(code);
     assert_eq!(result.len(), 2);
-    assert_eq!(result[1].excludes.len(), 1);
+    assert_eq!(result[1].excludes.len(), 0);
 }
 
 #[test]

@@ -133,6 +133,7 @@ pub struct AliasResults {
     pub ends: IndexVec<Loc, Loc>,
     pub globals: FxHashMap<LocalDefId, Loc>,
     pub non_fn_globals: HybridBitSet<Loc>,
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 }
 
 #[derive(Debug)]
@@ -560,7 +561,7 @@ fn collect_param_alias<'tcx>(
 // Computes the aliasing information for the function parameters
 pub fn compute_alias<'tcx>(
     pre: PreAnalysisData<'tcx>,
-    solutions: Solutions,
+    solutions: &Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
     tcx: TyCtxt<'tcx>,
     check_global_alias: bool,
@@ -642,6 +643,7 @@ pub fn compute_alias<'tcx>(
         ends: pre.index_info.ends,
         globals: pre.globals,
         non_fn_globals,
+        var_nodes: pre.var_nodes,
     }
 }
 
