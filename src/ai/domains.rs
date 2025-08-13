@@ -6,7 +6,7 @@ use std::{
 
 use lazy_static::lazy_static;
 use rustc_abi::FieldIdx;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashSet, FxHashMap};
 use rustc_index::{bit_set::DenseBitSet, IndexVec};
 use rustc_middle::mir::Local;
 use rustc_span::def_id::DefId;
@@ -20,6 +20,7 @@ pub struct AbsState {
     pub reads: MayPathSet,
     pub writes: MustPathSet,
     pub nulls: AbsNulls,
+    pub nonnulls: MustLocalSet,
 }
 
 impl AbsState {
@@ -32,6 +33,7 @@ impl AbsState {
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
             nulls: AbsNulls::bot(),
+            nonnulls: MustLocalSet::bot(),
         }
     }
 
@@ -43,6 +45,7 @@ impl AbsState {
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
             nulls: self.nulls.join(&other.nulls),
+            nonnulls: self.nonnulls.join(&other.nonnulls),
         }
     }
 
@@ -54,6 +57,7 @@ impl AbsState {
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
             nulls: self.nulls.widen(&other.nulls),
+            nonnulls: self.nonnulls.widen(&other.nonnulls),
         }
     }
 
@@ -64,6 +68,7 @@ impl AbsState {
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
             && self.nulls.ord(&other.nulls)
+            && self.nonnulls.ord(&other.nonnulls)
     }
 
     pub fn get(&self, base: AbsBase) -> Option<&AbsValue> {
@@ -98,10 +103,16 @@ impl AbsState {
         }
     }
 
-    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) -> BTreeSet<AbsPath> {
+    pub fn add_writes<I: Iterator<Item = AbsPath>>(&mut self, paths: I, ptr_params_inv: &FxHashMap<Local, ArgIdx>) -> BTreeSet<AbsPath> {
         let mut res = BTreeSet::new();
+        let locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
         for path in paths {
             if !self.reads.contains(&path) && !self.excludes.contains(&path) {
+                let l = path.base;
+                let arg = ptr_params_inv.get(&l).unwrap();
+                if !locals.contains(&l) && self.nulls.is_top(*arg) {
+                    self.nonnulls.insert(l);
+                }
                 self.writes.insert(path.clone());
                 res.insert(path);
             }
@@ -3421,6 +3432,112 @@ impl AbsNulls {
             matches!(n, AbsNull::Nonnull)
         } else {
             false
+        }
+    }
+
+    pub fn is_top(&self, arg: ArgIdx) -> bool {
+        if let Some(n) = self.0.get(arg) {
+            matches!(n, AbsNull::Top)
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum MustLocalSet {
+    All,
+    Set(BTreeSet<Local>),
+}
+
+impl std::fmt::Debug for MustLocalSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MustLocalSet::All => write!(f, "All"),
+            MustLocalSet::Set(s) => write!(f, "{:?}", s),
+        }
+    }
+}
+
+impl MustLocalSet {
+    #[inline]
+    pub fn top() -> Self {
+        Self::Set(BTreeSet::new())
+    }
+
+    #[inline]
+    fn bot() -> Self {
+        Self::All
+    }
+
+    #[inline]
+    pub fn is_bot(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn join(&self, other: &Self) -> Self {
+        match (self, other) {
+            (s, Self::All) | (Self::All, s) => s.clone(),
+            (Self::Set(s1), Self::Set(s2)) => Self::Set(s1.intersection(s2).cloned().collect()),
+        }
+    }
+
+    fn widen(&self, other: &Self) -> Self {
+        self.join(other)
+    }
+
+    fn ord(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::All, _) => true,
+            (_, Self::All) => false,
+            (Self::Set(s1), Self::Set(s2)) => s2.is_subset(s1),
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, l: Local) {
+        if let Self::Set(set) = self {
+            set.insert(l);
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, l: Local) -> bool {
+        match self {
+            Self::All => true,
+            Self::Set(set) => set.contains(&l),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Set(set) => set.is_empty(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set.len(),
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Local> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set.iter(),
+        }
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> BTreeSet<Local> {
+        match self {
+            Self::All => panic!(),
+            Self::Set(set) => set,
         }
     }
 }

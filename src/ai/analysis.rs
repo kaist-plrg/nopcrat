@@ -302,6 +302,7 @@ pub fn analyze(
                     writes_map,
                     init_state,
                     call_info_map,
+                    is_merged,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
@@ -311,19 +312,30 @@ pub fn analyze(
                     );
                 }
 
-                let mut has_side_effects =
-                    call_info_map
-                        .values()
-                        .flatten()
-                        .any(|kind| matches!(kind, CallKind::TOP | CallKind::RustEffect(_) | CallKind::CEffect | CallKind::IntraEffect));
+                let ret_location = return_location(body);
 
-                has_side_effects = has_side_effects || analyzer.check_global_writes(
-                    &solutions,
-                    &pre_data.var_nodes,
+                let mut return_states = ret_location
+                    .and_then(|ret| states.get(&ret))
+                    .cloned()
+                    .unwrap_or_default();
+
+                // If there is a merged block, always check if every parameter is nullable
+                let candidates = if is_merged {
+                    (1..=(analyzer.info.inputs)).map(|i| Local::from_usize(i)).collect::<Vec<Local>>()
+                } else {
+                    // If not, we filter the parameters which are implicity non-null
+                    analyzer.get_nullable_candidates(&return_states)
+                };
+
+                let mut unremovable_params = analyzer.find_nullable_params(
+                    tcx,
+                    &states,
+                    body,
+                    &writes_map,
+                    &call_info_map,
+                    candidates,
+                    debug_f
                 );
-
-                let mut nullable_params =
-                    analyzer.find_nullable_params(tcx, &states, body, &writes_map, &call_info_map, debug_f);
 
                 if debug_f {
                     println!("{}", body_to_str(body));
@@ -338,15 +350,13 @@ pub fn analyze(
                         &info_map,
                         &pre_data.globals,
                     );
-                    nullable_params.extend(alias_params);
+                    unremovable_params.extend(alias_params);
                 }
 
-                let exclude_paths: Vec<_> = nullable_params
+                let exclude_paths: Vec<_> = unremovable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
-
-                let ret_location = return_location(body);
 
                 let mut wbr = vec![];
                 let mut bb_must = BTreeMap::new();
@@ -403,14 +413,22 @@ pub fn analyze(
                 bb_musts.insert(*def_id, bb_must);
                 is_units.insert(*def_id, stack.is_empty());
 
-                let mut return_states = ret_location
-                    .and_then(|ret| states.get(&ret))
-                    .cloned()
-                    .unwrap_or_default();
                 for st in return_states.values_mut() {
-                    st.writes.remove(&nullable_params);
+                    st.writes.remove(&unremovable_params);
                     st.add_excludes(exclude_paths.iter().cloned());
                 }
+
+                let mut has_side_effects =
+                    call_info_map
+                        .values()
+                        .flatten()
+                        .any(|kind| matches!(kind, CallKind::TOP | CallKind::RustEffect(_) | CallKind::CEffect | CallKind::IntraEffect));
+
+                has_side_effects = has_side_effects || analyzer.check_global_writes(
+                    &solutions,
+                    &pre_data.var_nodes,
+                );
+
                 let summary = FunctionSummary::new(init_state, return_states, has_side_effects);
                 results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
@@ -613,6 +631,7 @@ struct AnalyzedBody {
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
     call_info_map: BTreeMap<Location, Vec<CallKind>>,
+    is_merged: bool,
 }
 
 enum StatementCheck {
@@ -787,11 +806,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-    ) -> Vec<(BTreeSet<Location>, BTreeSet<Location>)> {
-        let inputs = self.info.inputs;
+        candidates: Vec<Local>,
+    ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut locs = vec![];
 
-        for i in 1..=inputs {
+        for l in candidates {
             let mut nonnull_locs = BTreeSet::new();
             let mut null_locs = BTreeSet::new();
             // collection of locations except non-null or null
@@ -799,7 +818,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
-                    if let Some(arg) = self.ptr_params_inv.get(&Local::from_usize(i)) {
+                    if let Some(arg) = self.ptr_params_inv.get(&l) {
                         match nulls.get(*arg) {
                             AbsNull::Null => {
                                 null_locs.insert(*loc);
@@ -823,7 +842,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .cloned()
                 .collect();
             let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
-            locs.push((nonnull_locs, null_locs));
+            locs.push((l, nonnull_locs, null_locs));
         }
         locs
     }
@@ -838,14 +857,14 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
+        candidates: Vec<Local>,
         debug_f: bool,
     ) -> BTreeSet<Local> {
-        self.compute_nonnull_null_locs(result)
+        self.compute_nonnull_null_locs(result, candidates)
             .into_iter()
-            .enumerate()
-            .filter_map(|(i, (nonnull, null))| {
+            .filter_map(|(param, nonnull, null)| {
                 if debug_f {
-                    println!("Checking parameter {}", i + 1);
+                    println!("Checking parameter {}", param.index());
                     println!("nonnull: {:?}", nonnull);
                     println!("null: {:?}", null);
                 }
@@ -853,7 +872,6 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                     return None;
                 }
 
-                let param = Local::from_usize(i + 1);
                 let nonnull_diff = nonnull.iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
@@ -910,6 +928,30 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 }
             })
             .collect::<BTreeSet<_>>()
+    }
+
+    // We consider a parameter p is implicitly non-null if every execution either:
+    // 1. effectively writes to the parameter when p -> Top
+    // 2. does not write to the parameter
+    fn get_nullable_candidates(
+        &self,
+        return_states: &BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+    ) -> Vec<Local> {
+        (1..=self.info.inputs).filter_map(|i| {
+            let l = Local::from_usize(i);
+            let Some(arg) = self.ptr_params_inv.get(&l) else {
+                return None;
+            };
+
+            for st in return_states.values() {
+                let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+                if (!writes.contains(&l) && st.nulls.is_top(*arg)) || (writes.contains(&l) && st.nonnulls.contains(l)) {
+                    continue;
+                }
+                return Some(l);
+            }
+            None
+        }).collect()
     }
 
     // Check if the global variables that is reachable from the function
@@ -1346,6 +1388,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             writes_map,
             init_state,
             call_info_map,
+            is_merged: !merging_blocks.is_empty(),
         }
     }
 

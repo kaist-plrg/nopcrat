@@ -80,7 +80,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.into_iter());
-            let writes = new_state.add_writes(writes.into_iter());
+            let writes = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
             (new_state, writes)
         } else {
             (state.clone(), BTreeSet::new())
@@ -186,7 +186,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
                     new_state.add_reads(reads.into_iter());
-                    let writes = new_state.add_writes(writes.into_iter());
+                    let writes = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
@@ -266,7 +266,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
-                let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
+                let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret), &self.ptr_params_inv);
                 (new_state, writes)
             })
             .unzip();
@@ -368,7 +368,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             state.add_excludes(callee_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
-            let writes = state.add_writes(callee_writes.into_iter().chain(writes));
+            let writes = state.add_writes(callee_writes.into_iter().chain(writes), &self.ptr_params_inv);
             ret_writes.extend(writes);
             states.push(state)
         }
