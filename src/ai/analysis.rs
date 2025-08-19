@@ -933,7 +933,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     // We consider a parameter p is implicitly non-null if every execution either:
     // 1. effectively writes to the parameter when p -> Top
-    // 2. does not write to the parameter
+    // 2. does not write to the parameter and p -> Top (no null check)
     fn get_nullable_candidates(
         &self,
         return_states: &BTreeMap<(MustPathSet, AbsNulls), AbsState>,
@@ -942,7 +942,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut nonnull_params = BTreeSet::new();
         'outer: for i in 1..=(self.info.inputs) {
             let l = Local::from_usize(i);
-            let arg = self.ptr_params_inv.get(&l).unwrap();
+            let Some(arg) = self.ptr_params_inv.get(&l) else {
+                continue;
+            };
 
             for st in return_states.values() {
                 let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
