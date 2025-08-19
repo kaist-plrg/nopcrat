@@ -17,6 +17,7 @@ pub struct AbsState {
     pub local: AbsLocal,
     pub args: AbsArgs,
     pub excludes: MayPathSet,
+    pub null_excludes: MayPathSet,
     pub reads: MayPathSet,
     pub writes: MustPathSet,
     pub nulls: AbsNulls,
@@ -30,6 +31,7 @@ impl AbsState {
             local: AbsLocal::bot(),
             args: AbsArgs::bot(),
             excludes: MayPathSet::bot(),
+            null_excludes: MayPathSet::bot(),
             reads: MayPathSet::bot(),
             writes: MustPathSet::bot(),
             nulls: AbsNulls::bot(),
@@ -42,6 +44,7 @@ impl AbsState {
             local: self.local.join(&other.local),
             args: self.args.join(&other.args),
             excludes: self.excludes.join(&other.excludes),
+            null_excludes: self.null_excludes.join(&other.null_excludes),
             reads: self.reads.join(&other.reads),
             writes: self.writes.join(&other.writes),
             nulls: self.nulls.join(&other.nulls),
@@ -54,6 +57,7 @@ impl AbsState {
             local: self.local.widen(&other.local),
             args: self.args.widen(&other.args),
             excludes: self.excludes.widen(&other.excludes),
+            null_excludes: self.null_excludes.widen(&other.null_excludes),
             reads: self.reads.widen(&other.reads),
             writes: self.writes.widen(&other.writes),
             nulls: self.nulls.widen(&other.nulls),
@@ -65,6 +69,7 @@ impl AbsState {
         self.local.ord(&other.local)
             && self.args.ord(&other.args)
             && self.excludes.ord(&other.excludes)
+            && self.null_excludes.ord(&other.null_excludes)
             && self.reads.ord(&other.reads)
             && self.writes.ord(&other.writes)
             && self.nulls.ord(&other.nulls)
@@ -92,6 +97,12 @@ impl AbsState {
     pub fn add_excludes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
         for path in paths {
             self.excludes.insert(path);
+        }
+    }
+
+    pub fn add_null_excludes<I: Iterator<Item = AbsPath>>(&mut self, paths: I) {
+        for path in paths {
+            self.null_excludes.insert(path);
         }
     }
 
@@ -3233,6 +3244,11 @@ impl MayPathSet {
     #[inline]
     pub fn insert(&mut self, place: AbsPath) {
         self.0.insert(place);
+    }
+
+    #[inline]
+    pub fn remove(&mut self, base: &BTreeSet<Local>) {
+        self.0.retain(|p| !base.contains(&p.base));
     }
 
     #[inline]

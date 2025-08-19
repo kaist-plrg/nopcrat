@@ -321,10 +321,13 @@ pub fn analyze(
                     .unwrap_or_default();
 
                 // If there is a merged block, always check if every parameter is nullable
-                let candidates = if is_merged {
-                    (1..=(analyzer.info.inputs))
-                        .map(Local::from_usize)
-                        .collect::<Vec<Local>>()
+                let (candidates, nonnull_params) = if is_merged {
+                    (
+                        (1..=(analyzer.info.inputs))
+                            .map(Local::from_usize)
+                            .collect::<BTreeSet<Local>>(),
+                        BTreeSet::new(),
+                    )
                 } else {
                     // If not, we filter the parameters which are implicity non-null
                     analyzer.get_nullable_candidates(&return_states)
@@ -415,6 +418,7 @@ pub fn analyze(
 
                 for st in return_states.values_mut() {
                     st.writes.remove(&unremovable_params);
+                    st.null_excludes.remove(&nonnull_params);
                     st.add_excludes(exclude_paths.iter().cloned());
                 }
 
@@ -810,7 +814,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-        candidates: Vec<Local>,
+        candidates: BTreeSet<Local>,
     ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut locs = vec![];
 
@@ -861,7 +865,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
-        candidates: Vec<Local>,
+        candidates: BTreeSet<Local>,
     ) -> BTreeSet<Local> {
         self.compute_nonnull_null_locs(result, candidates)
             .into_iter()
@@ -933,24 +937,26 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn get_nullable_candidates(
         &self,
         return_states: &BTreeMap<(MustPathSet, AbsNulls), AbsState>,
-    ) -> Vec<Local> {
-        (1..=self.info.inputs)
-            .filter_map(|i| {
-                let l = Local::from_usize(i);
-                let arg = self.ptr_params_inv.get(&l)?;
+    ) -> (BTreeSet<Local>, BTreeSet<Local>) {
+        let mut candidates = BTreeSet::new();
+        let mut nonnull_params = BTreeSet::new();
+        'outer: for i in 1..=(self.info.inputs) {
+            let l = Local::from_usize(i);
+            let arg = self.ptr_params_inv.get(&l).unwrap();
 
-                for st in return_states.values() {
-                    let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
-                    if (!writes.contains(&l) && st.nulls.is_top(*arg))
-                        || (writes.contains(&l) && st.nonnulls.contains(l))
-                    {
-                        continue;
-                    }
-                    return Some(l);
+            for st in return_states.values() {
+                let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+                if (!writes.contains(&l) && st.nulls.is_top(*arg))
+                    || (writes.contains(&l) && st.nonnulls.contains(l))
+                {
+                    continue;
                 }
-                None
-            })
-            .collect()
+                candidates.insert(l);
+                continue 'outer;
+            }
+            nonnull_params.insert(l);
+        }
+        (candidates, nonnull_params)
     }
 
     // Check if the global variables that is reachable from the function
@@ -1018,6 +1024,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .flat_map(|st| st.reads.as_set())
             .map(|p| p.base)
             .collect();
+        let null_excludes: BTreeSet<_> = summary
+            .return_states
+            .values()
+            .flat_map(|st| st.null_excludes.as_set())
+            .map(|p| p.base)
+            .collect();
         let excludes: BTreeSet<_> = summary
             .return_states
             .values()
@@ -1031,6 +1043,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let i = Local::from_usize(i);
             if reads.contains(&i)
                 || excludes.contains(&i)
+                || null_excludes.contains(&i)
                 || return_ptrs.contains(&i)
                 || self.info.param_tys[i] == TypeInfo::Union
             {

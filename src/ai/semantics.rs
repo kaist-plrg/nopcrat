@@ -336,6 +336,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             let ret_v = ret_v.subst(&ptr_maps);
             let (mut state, writes) = self.assign(dst, ret_v, &state);
+            let callee_null_excludes: Vec<_> = return_state
+                .null_excludes
+                .iter()
+                .flat_map(|exclude| self.get_caller_path(exclude, args))
+                .collect();
             let callee_excludes: Vec<_> = return_state
                 .excludes
                 .iter()
@@ -369,6 +374,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     .insert(path.base.index() - 1, idx);
             }
             state.add_excludes(callee_excludes.into_iter());
+            state.add_null_excludes(callee_null_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
             let writes = state.add_writes(
