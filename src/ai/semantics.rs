@@ -436,12 +436,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let name = self.def_id_to_string(callee);
         let mut segs: Vec<_> = name.split("::").collect();
         let segs0 = segs.pop().unwrap_or_default();
-        // let segs1 = segs.pop().unwrap_or_default();
-        // let segs2 = segs.pop().unwrap_or_default();
-        // let segs3 = segs.pop().unwrap_or_default();
 
         let call_kind = match segs0 {
             "__ctype_toupper_loc"
+            | "towlower"
+            | "towupper"
             | "gettimeofday"
             | "strlen"
             | "strspn"
