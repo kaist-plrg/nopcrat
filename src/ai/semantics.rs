@@ -80,7 +80,8 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.into_iter());
-            let writes = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            new_state.add_nonnulls(nonnulls.into_iter());
             (new_state, writes)
         } else {
             (state.clone(), BTreeSet::new())
@@ -186,7 +187,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
                     new_state.add_reads(reads.into_iter());
-                    let writes = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+                    let (writes, nonnulls) =
+                        new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+                    new_state.add_nonnulls(nonnulls.into_iter());
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
@@ -266,10 +269,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
-                let writes = new_state.add_writes(
+                let (writes, nonnulls) = new_state.add_writes(
                     writes.iter().cloned().chain(writes_ret),
                     &self.ptr_params_inv,
                 );
+                new_state.add_nonnulls(nonnulls.into_iter());
                 (new_state, writes)
             })
             .unzip();
@@ -352,8 +356,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .flat_map(|read| self.get_caller_path(read, args))
                 .collect();
             let mut callee_writes = vec![];
+            let mut callee_nonnulls = BTreeSet::new();
             for write in return_state.writes.iter() {
-                let idx = write.base.index() - 1;
+                let idx: usize = write.base.index() - 1;
                 let AbsPtr::Set(ptrs) = &args[idx].ptrv else {
                     continue;
                 };
@@ -366,6 +371,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if array_access {
                     continue;
                 }
+                let local = Local::from_usize(idx);
+                if return_state.nonnulls.contains(local) {
+                    callee_nonnulls.insert(path.base);
+                }
+
                 path.projections.extend(write.projections.clone());
                 callee_writes.push(path.clone());
                 self.call_args
@@ -377,11 +387,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             state.add_null_excludes(callee_null_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
-            let writes = state.add_writes(
-                callee_writes.into_iter().chain(writes),
-                &self.ptr_params_inv,
-            );
-            ret_writes.extend(writes);
+
+            let (callee_writes, callee_nonnull_cands) =
+                state.add_writes(callee_writes.into_iter(), &self.ptr_params_inv);
+            let (writes, nonnulls) = state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+
+            state.add_nonnulls(nonnulls.into_iter());
+            state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
+
+            ret_writes.extend(callee_writes.into_iter().chain(writes));
             states.push(state)
         }
         (states, ret_writes, call_kind)

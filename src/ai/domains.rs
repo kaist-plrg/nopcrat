@@ -118,27 +118,34 @@ impl AbsState {
         &mut self,
         paths: I,
         ptr_params_inv: &FxHashMap<Local, ArgIdx>,
-    ) -> BTreeSet<AbsPath> {
+    ) -> (BTreeSet<AbsPath>, BTreeSet<Local>) {
         let mut res = BTreeSet::new();
+        let mut nonnull_cands = BTreeSet::new();
         let locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+
         for path in paths {
             if !self.reads.contains(&path) && !self.excludes.contains(&path) {
                 let l = path.base;
                 let arg = ptr_params_inv.get(&l).unwrap();
                 if !locals.contains(&l) && self.nulls.is_top(*arg) {
-                    self.nonnulls.insert(l);
+                    nonnull_cands.insert(l);
                 }
                 self.writes.insert(path.clone());
                 res.insert(path);
             }
         }
-        res
+
+        (res, nonnull_cands)
     }
 
     pub fn add_null(&mut self, path: AbsPath, arg: ArgIdx, n: AbsNull) {
         if !self.reads.contains(&path) && !self.excludes.contains(&path) {
             self.nulls.set(arg, n);
         }
+    }
+
+    pub fn add_nonnulls<I: Iterator<Item = Local>>(&mut self, locals: I) {
+        self.nonnulls.extend(locals);
     }
 }
 
@@ -3518,6 +3525,13 @@ impl MustLocalSet {
     pub fn insert(&mut self, l: Local) {
         if let Self::Set(set) = self {
             set.insert(l);
+        }
+    }
+
+    #[inline]
+    pub fn extend(&mut self, locals: impl IntoIterator<Item = Local>) {
+        if let Self::Set(set) = self {
+            set.extend(locals);
         }
     }
 
