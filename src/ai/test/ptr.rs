@@ -487,7 +487,7 @@ fn test_nullable_empty() {
     let result = analyze(code);
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].writes.len(), 1);
-    assert_eq!(result[0].excludes.len(), 0);
+    assert_eq!(result[0].null_excludes.len(), 0);
 }
 
 #[test]
@@ -503,9 +503,9 @@ fn test_nullable_write() {
     let result = analyze(code);
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].writes.len(), 0);
-    assert_eq!(result[0].excludes.len(), 0);
+    assert_eq!(result[0].null_excludes.len(), 0);
     assert_eq!(result[1].writes.len(), 1);
-    assert_eq!(result[0].excludes.len(), 0);
+    assert_eq!(result[0].null_excludes.len(), 0);
 }
 
 #[test]
@@ -524,8 +524,9 @@ fn test_nullable_effect_call1() {
         }
     ";
     let result = analyze(code);
+    println!("{:?}", result);
     assert_eq!(result.len(), 2);
-    assert_eq!(result[1].excludes.len(), 1);
+    assert_eq!(result[1].null_excludes.len(), 1);
 }
 
 #[test]
@@ -544,7 +545,7 @@ fn test_nullable_effect_call2() {
     ";
     let result = analyze(code);
     assert_eq!(result.len(), 2);
-    assert_eq!(result[1].excludes.len(), 0);
+    assert_eq!(result[1].null_excludes.len(), 0);
 }
 
 #[test]
