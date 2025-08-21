@@ -297,7 +297,7 @@ pub fn analyze(
                         body.local_decls.len()
                     );
                 }
-                let debug_f = tcx.def_path_str(*def_id).contains("fd_read_body");
+                let debug_f = tcx.def_path_str(*def_id).contains("try_device");
                 let AnalyzedBody {
                     states,
                     writes_map,
@@ -333,7 +333,12 @@ pub fn analyze(
                     analyzer.get_nullable_candidates(&return_states)
                 };
 
-                let mut unremovable_params = analyzer.find_nullable_params(
+                if debug_f {
+                    println!("Candidates: {:?}", candidates);
+                    println!("Nonnull Params: {:?}", nonnull_params);
+                }
+
+                let nullable_params = analyzer.find_nullable_params(
                     tcx,
                     &states,
                     body,
@@ -343,6 +348,7 @@ pub fn analyze(
                 );
 
                 if debug_f {
+                    println!("Nullable Params: {:?}", nullable_params);
                     println!("{}", body_to_str(body));
                     println!(
                         "{}",
@@ -350,13 +356,17 @@ pub fn analyze(
                     );
                 }
 
-                if conf.check_global_alias {
-                    let alias_params =
-                        analyzer.check_reachable_globals(&info_map, &pre_data.globals);
-                    unremovable_params.extend(alias_params);
-                }
+                let alias_params = if conf.check_global_alias {
+                    analyzer.check_reachable_globals(&info_map, &pre_data.globals)
+                } else {
+                    BTreeSet::new()
+                };
 
-                let exclude_paths: Vec<_> = unremovable_params
+                let null_exclude_paths: Vec<_> = nullable_params
+                    .iter()
+                    .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
+                    .collect();
+                let exclude_paths: Vec<_> = alias_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
@@ -416,10 +426,15 @@ pub fn analyze(
                 bb_musts.insert(*def_id, bb_must);
                 is_units.insert(*def_id, stack.is_empty());
 
+                // Handle unremovable parameters
                 for st in return_states.values_mut() {
-                    st.writes.remove(&unremovable_params);
-                    st.null_excludes.remove(&nonnull_params);
+                    st.writes.remove(&nullable_params);
+                    st.writes.remove(&alias_params);
+
                     st.add_excludes(exclude_paths.iter().cloned());
+                    st.add_null_excludes(null_exclude_paths.iter().cloned());
+
+                    st.null_excludes.remove(&nonnull_params);
                 }
 
                 let mut has_side_effects = call_info_map.values().flatten().any(|kind| {
@@ -1214,6 +1229,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
         start_state.nulls = AbsNulls::bot();
+        start_state.nonnulls = MustLocalSet::top();
 
         for i in 1..=self.info.inputs {
             let local = Local::from_usize(i);
