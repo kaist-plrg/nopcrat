@@ -351,7 +351,7 @@ pub fn analyze(
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
-                let exclude_paths: Vec<_> = alias_params
+                let alias_exclude_paths: Vec<_> = alias_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
@@ -416,7 +416,7 @@ pub fn analyze(
                     st.writes.remove(&nullable_params);
                     st.writes.remove(&alias_params);
 
-                    st.add_excludes(exclude_paths.iter().cloned());
+                    st.add_excludes(alias_exclude_paths.iter().cloned());
                     st.add_null_excludes(null_exclude_paths.iter().cloned());
 
                     st.null_excludes.remove(&nonnull_params);
