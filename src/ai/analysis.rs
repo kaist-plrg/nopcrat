@@ -39,7 +39,7 @@ use super::{
     semantics::{CallKind, TransferedTerminator},
 };
 use crate::{
-    compile_util::{self, body_to_str, LoHi},
+    compile_util::{self, LoHi},
     graph,
     may_analysis::{
         self,
@@ -297,7 +297,6 @@ pub fn analyze(
                         body.local_decls.len()
                     );
                 }
-                let debug_f = tcx.def_path_str(*def_id).contains("_uuconf_ihdb_system_internal");
                 let AnalyzedBody {
                     states,
                     writes_map,
@@ -333,11 +332,6 @@ pub fn analyze(
                     analyzer.get_nullable_candidates(&return_states)
                 };
 
-                if debug_f {
-                    println!("Candidates: {:?}", candidates);
-                    println!("Nonnull Params: {:?}", nonnull_params);
-                }
-
                 let nullable_params = analyzer.find_nullable_params(
                     tcx,
                     &states,
@@ -346,15 +340,6 @@ pub fn analyze(
                     &call_info_map,
                     candidates,
                 );
-
-                if debug_f {
-                    println!("Nullable Params: {:?}", nullable_params);
-                    println!("{}", body_to_str(body));
-                    println!(
-                        "{}",
-                        analysis_result_to_string(body, &states, tcx.sess.source_map()).unwrap()
-                    );
-                }
 
                 let alias_params = if conf.check_global_alias {
                     analyzer.check_reachable_globals(&info_map, &pre_data.globals)
