@@ -81,7 +81,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.into_iter());
             let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
-            new_state.add_nonnulls(nonnulls.into_iter());
+            if !self.is_merged {
+                new_state.add_nonnulls(nonnulls.into_iter());
+            }
             (new_state, writes)
         } else {
             (state.clone(), BTreeSet::new())
@@ -189,7 +191,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     new_state.add_reads(reads.into_iter());
                     let (writes, nonnulls) =
                         new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
-                    new_state.add_nonnulls(nonnulls.into_iter());
+                    if !self.is_merged {
+                        new_state.add_nonnulls(nonnulls.into_iter());
+                    }
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
@@ -273,7 +277,9 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     writes.iter().cloned().chain(writes_ret),
                     &self.ptr_params_inv,
                 );
-                new_state.add_nonnulls(nonnulls.into_iter());
+                if !self.is_merged {
+                    new_state.add_nonnulls(nonnulls.into_iter());
+                }
                 (new_state, writes)
             })
             .unzip();
@@ -358,7 +364,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let mut callee_writes = vec![];
             let mut callee_nonnulls = BTreeSet::new();
             for write in return_state.writes.iter() {
-                let idx: usize = write.base.index() - 1;
+                let idx = write.base.index() - 1;
                 let AbsPtr::Set(ptrs) = &args[idx].ptrv else {
                     continue;
                 };
@@ -371,7 +377,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if array_access {
                     continue;
                 }
-                let local = Local::from_usize(idx);
+                let local: Local = Local::from_usize(write.base.index());
                 if return_state.nonnulls.contains(local) {
                     callee_nonnulls.insert(path.base);
                 }
@@ -392,8 +398,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 state.add_writes(callee_writes.into_iter(), &self.ptr_params_inv);
             let (writes, nonnulls) = state.add_writes(writes.into_iter(), &self.ptr_params_inv);
 
-            state.add_nonnulls(nonnulls.into_iter());
-            state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
+            if !self.is_merged {
+                state.add_nonnulls(nonnulls.into_iter());
+                state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
+            }
 
             ret_writes.extend(callee_writes.into_iter().chain(writes));
             states.push(state)

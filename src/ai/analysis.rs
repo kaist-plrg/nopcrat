@@ -297,7 +297,7 @@ pub fn analyze(
                         body.local_decls.len()
                     );
                 }
-                let debug_f = tcx.def_path_str(*def_id).contains("try_device");
+                let debug_f = tcx.def_path_str(*def_id).contains("_uuconf_ihdb_system_internal");
                 let AnalyzedBody {
                     states,
                     writes_map,
@@ -645,6 +645,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
     pub pre_context: PreAnalysisContext<'a>,
     pub write_locals: BTreeSet<Local>,
+    pub is_merged: bool,
 }
 
 struct AnalyzedBody {
@@ -679,6 +680,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             call_args: BTreeMap::new(),
             pre_context,
             write_locals: BTreeSet::new(),
+            is_merged: false,
         }
     }
 
@@ -1275,6 +1277,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         };
 
         let (states, writes_map, call_info_map) = 'analysis_loop: loop {
+            if !merging_blocks.is_empty() {
+                self.is_merged = true;
+            }
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -1420,7 +1425,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             writes_map,
             init_state,
             call_info_map,
-            is_merged: !merging_blocks.is_empty(),
+            is_merged: self.is_merged,
         }
     }
 

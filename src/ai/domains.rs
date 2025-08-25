@@ -121,7 +121,7 @@ impl AbsState {
     ) -> (BTreeSet<AbsPath>, BTreeSet<Local>) {
         let mut res = BTreeSet::new();
         let mut nonnull_cands = BTreeSet::new();
-        let locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+        let mut locals = self.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
 
         for path in paths {
             if !self.reads.contains(&path) && !self.excludes.contains(&path) {
@@ -129,6 +129,7 @@ impl AbsState {
                 let arg = ptr_params_inv.get(&l).unwrap();
                 if !locals.contains(&l) && self.nulls.is_top(*arg) {
                     nonnull_cands.insert(l);
+                    locals.insert(l);
                 }
                 self.writes.insert(path.clone());
                 res.insert(path);
