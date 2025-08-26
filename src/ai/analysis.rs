@@ -319,7 +319,7 @@ pub fn analyze(
                     .cloned()
                     .unwrap_or_default();
 
-                // If there is a merged block, always check if every parameter is nullable
+                // If there is a merged block, always check all parameters
                 let (candidates, nonnull_params) = if is_merged {
                     (
                         (1..=(analyzer.info.inputs))
