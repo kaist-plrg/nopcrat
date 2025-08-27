@@ -134,8 +134,8 @@ pub struct AliasResults {
     pub globals: FxHashMap<LocalDefId, Loc>,
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
     pub non_fn_globals: HybridBitSet<Loc>,
-    pub locals_map: FxHashMap<DefId, HybridBitSet<Loc>>,
-    pub locals_index_map: FxHashMap<DefId, FxHashMap<Loc, Local>>,
+    pub local_locs: FxHashMap<DefId, HybridBitSet<Loc>>,
+    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>,
 }
 
 #[derive(Debug)]
@@ -571,8 +571,8 @@ pub fn compute_alias<'tcx>(
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<Local>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<_, FxHashSet<Local>>> = FxHashMap::default();
-    let mut locals_map: FxHashMap<_, HybridBitSet<Loc>> = FxHashMap::default();
-    let mut locals_index_map: FxHashMap<_, FxHashMap<Loc, Local>> = FxHashMap::default();
+    let mut local_locs: FxHashMap<_, HybridBitSet<Loc>> = FxHashMap::default();
+    let mut index_locals: FxHashMap<_, FxHashMap<Loc, Local>> = FxHashMap::default();
     let non_fn_globals = pre.non_fn_globals.iter().fold(
         HybridBitSet::new_empty(pre.index_info.len()),
         |mut acc, g| {
@@ -634,8 +634,8 @@ pub fn compute_alias<'tcx>(
 
         aliases.insert(*def_id, fun_alias);
         inv_params.insert(*def_id, inv_param);
-        locals_map.insert(*def_id, locals);
-        locals_index_map.insert(*def_id, locals_index);
+        local_locs.insert(*def_id, locals);
+        index_locals.insert(*def_id, locals_index);
     }
 
     AliasResults {
@@ -645,8 +645,8 @@ pub fn compute_alias<'tcx>(
         globals: pre.globals,
         var_nodes: pre.var_nodes,
         non_fn_globals,
-        locals_map,
-        locals_index_map,
+        local_locs,
+        index_locals,
     }
 }
 

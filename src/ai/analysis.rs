@@ -137,7 +137,7 @@ pub struct PreAnalysisContext<'a> {
     pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>,
     pub ends: &'a IndexVec<Loc, Loc>,
     pub locals: &'a HybridBitSet<Loc>,
-    pub locals_index: &'a FxHashMap<Loc, Local>,
+    pub index_local_map: &'a FxHashMap<Loc, Local>,
     pub globals: &'a HybridBitSet<Loc>,
     pub solutions: &'a Solutions,
     pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
@@ -150,8 +150,8 @@ impl<'a> PreAnalysisContext<'a> {
             alias: pre_data.aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
             ends: &pre_data.ends,
-            locals: pre_data.locals_map.get(&def_id).unwrap(),
-            locals_index: pre_data.locals_index_map.get(&def_id).unwrap(),
+            locals: pre_data.local_locs.get(&def_id).unwrap(),
+            index_local_map: pre_data.index_locals.get(&def_id).unwrap(),
             globals: &pre_data.non_fn_globals,
             var_nodes: &pre_data.var_nodes,
             solutions,
@@ -764,7 +764,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let mut sol = self.pre_context.solutions[loc].clone();
         sol.intersect(self.pre_context.locals);
-        locals.extend(sol.iter().map(|loc| self.pre_context.locals_index[&loc]));
+        locals.extend(sol.iter().map(|loc| self.pre_context.index_local_map[&loc]));
         true
     }
 
@@ -779,21 +779,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
                 let call_info = call_info_map.get(loc).unwrap();
-                // check the destination of call
                 if destination.local == Local::ZERO {
                     return false;
                 }
 
                 let is_indirection = destination.is_indirect_first_projection();
 
-                if destination.local != param
-                    && is_indirection
+                if is_indirection
+                    && destination.local != param
                     && !self.check_indirect_pure(destination.local, local_writes)
                 {
                     return false;
                 }
 
-                if destination.local != param || !is_indirection {
+                if !is_indirection {
                     local_writes.insert(destination.local);
                 }
 
@@ -833,13 +832,13 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     ) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
             let local = place.local;
-            if local == param {
-                return true;
-            }
             if local == Local::ZERO {
                 return false;
             }
             if place.is_indirect_first_projection() {
+                if local == param {
+                    return true;
+                }
                 return self.check_indirect_pure(local, locals);
             }
 
