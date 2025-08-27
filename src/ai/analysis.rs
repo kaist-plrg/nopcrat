@@ -136,17 +136,25 @@ pub struct PreAnalysisContext<'a> {
     pub alias: &'a FxHashSet<Local>,
     pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>,
     pub ends: &'a IndexVec<Loc, Loc>,
+    pub locals: &'a HybridBitSet<Loc>,
+    pub locals_index: &'a FxHashMap<Loc, Local>,
     pub globals: &'a HybridBitSet<Loc>,
+    pub solutions: &'a Solutions,
+    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
 }
 
 impl<'a> PreAnalysisContext<'a> {
-    fn new(def_id: DefId, pre_data: &'a AliasResults) -> Self {
+    fn new(def_id: DefId, pre_data: &'a AliasResults, solutions: &'a Solutions) -> Self {
         Self {
             local_def_id: def_id.as_local().unwrap(),
             alias: pre_data.aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
             ends: &pre_data.ends,
+            locals: pre_data.locals_map.get(&def_id).unwrap(),
+            locals_index: pre_data.locals_index_map.get(&def_id).unwrap(),
             globals: &pre_data.non_fn_globals,
+            var_nodes: &pre_data.var_nodes,
+            solutions,
         }
     }
 
@@ -284,7 +292,7 @@ pub fn analyze(
             for def_id in def_ids {
                 let start = std::time::Instant::now();
 
-                let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
+                let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
 
                 let mut analyzer =
                     Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -432,8 +440,7 @@ pub fn analyze(
                     )
                 });
 
-                has_side_effects = has_side_effects
-                    || analyzer.check_global_writes(&solutions, &pre_data.var_nodes);
+                has_side_effects = has_side_effects || analyzer.check_global_writes();
 
                 let summary = FunctionSummary::new(init_state, return_states, has_side_effects);
                 results.insert(*def_id, states);
@@ -457,7 +464,7 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let pre_context = PreAnalysisContext::new(*def_id, &pre_data);
+                    let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
@@ -745,6 +752,20 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         true
     }
 
+    fn check_indirect_pure(&self, local: Local, locals: &mut BTreeSet<Local>) -> bool {
+        let var_nodes = self.pre_context.var_nodes;
+        let loc = var_nodes[&(self.pre_context.local_def_id, local)].index;
+
+        if self.check_may_points_global(std::iter::once(loc)) {
+            return false;
+        }
+
+        let mut sol = self.pre_context.solutions[loc].clone();
+        sol.intersect(self.pre_context.locals);
+        locals.extend(sol.iter().map(|loc| self.pre_context.locals_index[&loc]));
+        true
+    }
+
     fn check_terminator_pure(
         &self,
         loc: &Location,
@@ -760,7 +781,17 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 if destination.local == Local::ZERO {
                     return false;
                 }
-                if destination.local != param || !destination.is_indirect_first_projection() {
+
+                let is_indirection = destination.is_indirect_first_projection();
+
+                if destination.local != param
+                    && is_indirection
+                    && !self.check_indirect_pure(destination.local, local_writes)
+                {
+                    return false;
+                }
+
+                if destination.local != param || !is_indirection {
                     local_writes.insert(destination.local);
                 }
 
@@ -794,18 +825,23 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(
         &self,
-        locs: &mut BTreeSet<Local>,
+        locals: &mut BTreeSet<Local>,
         param: Local,
         stmt: &StatementKind<'_>,
     ) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            if place.local == param && place.is_indirect_first_projection() {
+            let local = place.local;
+            if local == param {
                 return true;
             }
-            if place.local == Local::ZERO {
+            if local == Local::ZERO {
                 return false;
             }
-            locs.insert(place.local);
+            if place.is_indirect_first_projection() {
+                return self.check_indirect_pure(local, locals);
+            }
+
+            locals.insert(place.local);
             true
         } else {
             unreachable!("{:?}", stmt)
@@ -993,23 +1029,25 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
-    fn check_global_writes(
-        &self,
-        solutions: &Solutions,
-        var_nodes: &FxHashMap<(LocalDefId, Local), LocNode>,
-    ) -> bool {
-        self.write_locals
-            .iter()
-            .flat_map(|local| {
-                let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
-                let end = self.pre_context.ends[start];
-                start..=end
-            })
-            .any(|loc| {
-                let mut sol = solutions[loc].clone();
-                sol.intersect(self.pre_context.globals);
-                !sol.is_empty()
-            })
+    fn check_may_points_global<I: Iterator<Item = Loc>>(&self, locs: I) -> bool {
+        for loc in locs {
+            let mut sol = self.pre_context.solutions[loc].clone();
+            sol.intersect(self.pre_context.globals);
+
+            if !sol.is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_global_writes(&self) -> bool {
+        self.write_locals.iter().any(|local| {
+            let var_nodes = self.pre_context.var_nodes;
+            let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
+            let end = self.pre_context.ends[start];
+            self.check_may_points_global(start..=end)
+        })
     }
 
     fn find_output_params(
