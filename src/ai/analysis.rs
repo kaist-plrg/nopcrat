@@ -196,6 +196,7 @@ pub fn analyze(
     }
     let (graph, elems) = graph::compute_sccs(&call_graph);
     let inv_graph = graph::inverse(&graph);
+    let transitive = graph::transitive_closure(&call_graph);
     let po: Vec<_> = graph::post_order(&graph, &inv_graph)
         .into_iter()
         .flatten()
@@ -215,7 +216,6 @@ pub fn analyze(
             let loop_blocks = get_loop_blocks(body, &pre_rpo_map);
             let rpo_map = compute_rpo_map(body, &loop_blocks);
             let dead_locals = get_dead_locals(body, tcx);
-            let tran_callees = visit_transitive_callees(*def_id, &call_graph);
             let fn_ptr = visitor.fn_ptrs.contains(def_id);
             global_visitor.visit_body(body);
             let globals = std::mem::take(&mut global_visitor.globals);
@@ -227,7 +227,6 @@ pub fn analyze(
                 dead_locals,
                 fn_ptr,
                 globals,
-                tran_callees,
             };
             (*def_id, info)
         })
@@ -350,7 +349,11 @@ pub fn analyze(
                 );
 
                 let alias_params = if conf.check_global_alias {
-                    analyzer.check_reachable_globals(&info_map, &pre_data.globals)
+                    analyzer.check_reachable_globals(
+                        &info_map,
+                        &pre_data.globals,
+                        transitive.get(def_id).unwrap(),
+                    )
                 } else {
                     BTreeSet::new()
                 };
@@ -607,7 +610,6 @@ struct FuncInfo {
     dead_locals: IndexVec<BasicBlock, DenseBitSet<Local>>,
     fn_ptr: bool,
     globals: FxHashSet<DefId>,
-    tran_callees: FxHashSet<DefId>,
 }
 
 impl FuncInfo {
@@ -978,23 +980,21 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     ) -> (BTreeSet<Local>, BTreeSet<Local>) {
         let mut candidates = BTreeSet::new();
         let mut nonnull_params = BTreeSet::new();
-        'outer: for i in 1..=(self.info.inputs) {
+        for i in 1..=(self.info.inputs) {
             let l = Local::from_usize(i);
             let Some(arg) = self.ptr_params_inv.get(&l) else {
                 continue;
             };
 
-            for st in return_states.values() {
+            if return_states.values().all(|st| {
                 let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
-                if (!writes.contains(&l) && st.nulls.is_top(*arg))
+                (!writes.contains(&l) && st.nulls.is_top(*arg))
                     || (writes.contains(&l) && st.nonnulls.contains(l))
-                {
-                    continue;
-                }
+            }) {
+                nonnull_params.insert(l);
+            } else {
                 candidates.insert(l);
-                continue 'outer;
             }
-            nonnull_params.insert(l);
         }
         (candidates, nonnull_params)
     }
@@ -1005,9 +1005,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
         globals: &FxHashMap<LocalDefId, Loc>,
+        callees: &FxHashSet<DefId>,
     ) -> BTreeSet<Local> {
         let mut indexes = FxHashSet::default();
-        let callees = &self.info.tran_callees;
 
         for callee in callees {
             let globals = info_map[callee]
@@ -2026,25 +2026,6 @@ fn expand_projections(
             })
             .collect()
     }
-}
-
-fn visit_transitive_callees(
-    initial_id: DefId,
-    call_graph: &FxHashMap<DefId, FxHashSet<DefId>>,
-) -> FxHashSet<DefId> {
-    let mut visited = FxHashSet::default();
-    let mut stack = vec![initial_id];
-
-    while let Some(callee) = stack.pop() {
-        if !visited.insert(callee) {
-            continue;
-        }
-
-        if let Some(callees) = call_graph.get(&callee) {
-            stack.extend(callees.iter());
-        }
-    }
-    visited
 }
 
 #[allow(unused)]
