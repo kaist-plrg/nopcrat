@@ -754,7 +754,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         true
     }
 
-    fn check_indirect_pure(&self, local: Local, locals: &mut BTreeSet<Local>) -> bool {
+    fn check_indirect_pure(&self, local: Local, local_writes: &mut BTreeSet<Local>) -> bool {
         let var_nodes = self.pre_context.var_nodes;
         let loc = var_nodes[&(self.pre_context.local_def_id, local)].index;
 
@@ -764,7 +764,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
         let mut sol = self.pre_context.solutions[loc].clone();
         sol.intersect(self.pre_context.locals);
-        locals.extend(sol.iter().map(|loc| self.pre_context.index_local_map[&loc]));
+        local_writes.extend(sol.iter().map(|loc| self.pre_context.index_local_map[&loc]));
         true
     }
 
@@ -826,7 +826,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(
         &self,
-        locals: &mut BTreeSet<Local>,
+        local_writes: &mut BTreeSet<Local>,
         param: Local,
         stmt: &StatementKind<'_>,
     ) -> bool {
@@ -839,10 +839,10 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 if local == param {
                     return true;
                 }
-                return self.check_indirect_pure(local, locals);
+                return self.check_indirect_pure(local, local_writes);
             }
 
-            locals.insert(place.local);
+            local_writes.insert(place.local);
             true
         } else {
             unreachable!("{:?}", stmt)
