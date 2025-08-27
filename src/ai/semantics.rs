@@ -377,8 +377,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if array_access {
                     continue;
                 }
-                let local: Local = Local::from_usize(write.base.index());
-                if return_state.nonnulls.contains(local) {
+                if return_state.nonnulls.contains(write.base) {
                     callee_nonnulls.insert(path.base);
                 }
 
