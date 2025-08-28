@@ -132,15 +132,14 @@ enum Write {
 
 #[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
-    pub local_def_id: LocalDefId,
-    pub alias: &'a FxHashSet<Local>,
-    pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>,
-    pub ends: &'a IndexVec<Loc, Loc>,
-    pub locals: &'a HybridBitSet<Loc>,
-    pub index_local_map: &'a FxHashMap<Loc, Local>,
-    pub globals: &'a HybridBitSet<Loc>,
-    pub solutions: &'a Solutions,
-    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
+    pub local_def_id: LocalDefId,    // the function being analyzed
+    pub alias: &'a FxHashSet<Local>, // set of parameters that may alias each other
+    pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>, /* a location to the set of parameters that may point to it */
+    pub ends: &'a IndexVec<Loc, Loc>,                    // maps global index to its end index
+    pub index_local_map: &'a FxHashMap<Loc, Local>, /* maps a global index to the corresponding local in the function */
+    pub globals: &'a HybridBitSet<Loc>,             // set of global indexes of global variables
+    pub solutions: &'a Solutions,                   // the solutions of the may-points-to analysis
+    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>, /* maps (function, local) to the corresponding node */
 }
 
 impl<'a> PreAnalysisContext<'a> {
@@ -150,7 +149,6 @@ impl<'a> PreAnalysisContext<'a> {
             alias: pre_data.aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
             ends: &pre_data.ends,
-            locals: pre_data.local_locs.get(&def_id).unwrap(),
             index_local_map: pre_data.index_locals.get(&def_id).unwrap(),
             globals: &pre_data.non_fn_globals,
             var_nodes: &pre_data.var_nodes,
@@ -196,7 +194,7 @@ pub fn analyze(
     }
     let (graph, elems) = graph::compute_sccs(&call_graph);
     let inv_graph = graph::inverse(&graph);
-    let transitive = graph::transitive_closure(&call_graph);
+    let transitive = graph::reflexive_transitive_closure(&call_graph);
     let po: Vec<_> = graph::post_order(&graph, &inv_graph)
         .into_iter()
         .flatten()
@@ -638,7 +636,7 @@ pub struct Analyzer<'a, 'tcx> {
     pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
     pub pre_context: PreAnalysisContext<'a>,
-    pub write_locals: BTreeSet<Local>,
+    pub indirect_assigns: BTreeSet<Local>,
     pub is_merged: bool,
 }
 
@@ -673,7 +671,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             ptr_params_inv: FxHashMap::default(),
             call_args: BTreeMap::new(),
             pre_context,
-            write_locals: BTreeSet::new(),
+            indirect_assigns: BTreeSet::new(),
             is_merged: false,
         }
     }
@@ -758,13 +756,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let var_nodes = self.pre_context.var_nodes;
         let loc = var_nodes[&(self.pre_context.local_def_id, local)].index;
 
-        if self.check_may_points_global(std::iter::once(loc)) {
+        if self.check_may_points_global(loc) {
             return false;
         }
 
-        let mut sol = self.pre_context.solutions[loc].clone();
-        sol.intersect(self.pre_context.locals);
-        local_writes.extend(sol.iter().map(|loc| self.pre_context.index_local_map[&loc]));
+        let sol = self.pre_context.solutions[loc].clone();
+        local_writes.extend(
+            sol.iter()
+                .flat_map(|loc| self.pre_context.index_local_map.get(&loc)),
+        );
         true
     }
 
@@ -1004,12 +1004,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
         globals: &FxHashMap<LocalDefId, Loc>,
-        callees: &FxHashSet<DefId>,
+        reachables: &FxHashSet<DefId>,
     ) -> BTreeSet<Local> {
         let mut indexes = FxHashSet::default();
 
-        for callee in callees {
-            let globals = info_map[callee]
+        for reachable in reachables {
+            let globals = info_map[reachable]
                 .globals
                 .iter()
                 .filter_map(|def_id| {
@@ -1028,24 +1028,23 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect()
     }
 
-    fn check_may_points_global<I: Iterator<Item = Loc>>(&self, locs: I) -> bool {
-        for loc in locs {
-            let mut sol = self.pre_context.solutions[loc].clone();
-            sol.intersect(self.pre_context.globals);
+    fn check_may_points_global(&self, loc: Loc) -> bool {
+        let mut sol = self.pre_context.solutions[loc].clone();
+        sol.intersect(self.pre_context.globals);
 
-            if !sol.is_empty() {
-                return true;
-            }
+        if !sol.is_empty() {
+            return true;
         }
         false
     }
 
     fn check_global_writes(&self) -> bool {
-        self.write_locals.iter().any(|local| {
+        self.indirect_assigns.iter().any(|local| {
             let var_nodes = self.pre_context.var_nodes;
+            // We only check start since the local is a pointer
+            // If the local is the first parameter of the function, ends[loc] may not be the same as start
             let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
-            let end = self.pre_context.ends[start];
-            self.check_may_points_global(start..=end)
+            self.check_may_points_global(start)
         })
     }
 

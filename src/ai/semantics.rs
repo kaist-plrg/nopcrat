@@ -1231,7 +1231,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let writes = if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local);
-            self.write_locals.insert(place.local);
+            self.indirect_assigns.insert(place.local);
             self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
             self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {

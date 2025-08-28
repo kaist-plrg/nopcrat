@@ -128,14 +128,13 @@ pub type Solutions = IndexVec<Loc, HybridBitSet<Loc>>; // Send not implemented f
 
 #[derive(Debug)]
 pub struct AliasResults {
-    pub aliases: FxHashMap<DefId, FxHashSet<Local>>,
-    pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>,
-    pub ends: IndexVec<Loc, Loc>,
-    pub globals: FxHashMap<LocalDefId, Loc>,
-    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
-    pub non_fn_globals: HybridBitSet<Loc>,
-    pub local_locs: FxHashMap<DefId, HybridBitSet<Loc>>,
-    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>,
+    pub aliases: FxHashMap<DefId, FxHashSet<Local>>, // set of parameters that may alias each other
+    pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>, /* maps a location to the set of parameters that may point to it */
+    pub ends: IndexVec<Loc, Loc>, // maps global index to its end index
+    pub globals: FxHashMap<LocalDefId, Loc>, // maps a static item to the corresponding global index
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>, /* maps (function, local) to the corresponding node */
+    pub non_fn_globals: HybridBitSet<Loc>, // set of global indexes of global variables
+    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>, /* maps a global index to the corresponding local */
 }
 
 #[derive(Debug)]
@@ -571,7 +570,6 @@ pub fn compute_alias<'tcx>(
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<Local>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<_, FxHashSet<Local>>> = FxHashMap::default();
-    let mut local_locs: FxHashMap<_, HybridBitSet<Loc>> = FxHashMap::default();
     let mut index_locals: FxHashMap<_, FxHashMap<Loc, Local>> = FxHashMap::default();
     let non_fn_globals = pre.non_fn_globals.iter().fold(
         HybridBitSet::new_empty(pre.index_info.len()),
@@ -595,7 +593,8 @@ pub fn compute_alias<'tcx>(
 
         for (local, decl) in body.local_decls.iter_enumerated() {
             let g_index = pre.var_nodes[&(local_def_id, local)].index;
-            locals_index.insert(g_index, local);
+            let g_index_end = pre.index_info.ends[g_index];
+            locals_index.extend((g_index..=g_index_end).map(|loc| (loc, local)));
 
             if (1..=*inputs).contains(&local.index()) {
                 let ty = decl.ty;
@@ -634,7 +633,6 @@ pub fn compute_alias<'tcx>(
 
         aliases.insert(*def_id, fun_alias);
         inv_params.insert(*def_id, inv_param);
-        local_locs.insert(*def_id, locals);
         index_locals.insert(*def_id, locals_index);
     }
 
@@ -645,7 +643,6 @@ pub fn compute_alias<'tcx>(
         globals: pre.globals,
         var_nodes: pre.var_nodes,
         non_fn_globals,
-        local_locs,
         index_locals,
     }
 }
