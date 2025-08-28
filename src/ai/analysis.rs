@@ -134,12 +134,12 @@ enum Write {
 pub struct PreAnalysisContext<'a> {
     pub local_def_id: LocalDefId,    // the function being analyzed
     pub alias: &'a FxHashSet<Local>, // set of parameters that may alias each other
-    pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>, // a location to the set of parameters that may point to it
+    pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>, /* a location to the set of parameters that may point to it */
     pub ends: &'a IndexVec<Loc, Loc>,                    // maps global index to its end index
-    pub index_local_map: &'a FxHashMap<Loc, Local>, // maps a global index to the corresponding local in the function
+    pub index_local_map: &'a FxHashMap<Loc, Local>, /* maps a global index to the corresponding local in the function */
     pub globals: &'a HybridBitSet<Loc>,             // set of global indexes of global variables
     pub solutions: &'a Solutions,                   // the solutions of the may-points-to analysis
-    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>, // maps (function, local) to the corresponding node
+    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>, /* maps (function, local) to the corresponding node */
 }
 
 impl<'a> PreAnalysisContext<'a> {

@@ -129,12 +129,12 @@ pub type Solutions = IndexVec<Loc, HybridBitSet<Loc>>; // Send not implemented f
 #[derive(Debug)]
 pub struct AliasResults {
     pub aliases: FxHashMap<DefId, FxHashSet<Local>>, // set of parameters that may alias each other
-    pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>, // maps a location to the set of parameters that may point to it
+    pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>, /* maps a location to the set of parameters that may point to it */
     pub ends: IndexVec<Loc, Loc>, // maps global index to its end index
     pub globals: FxHashMap<LocalDefId, Loc>, // maps a static item to the corresponding global index
-    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>, // maps (function, local) to the corresponding node
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>, /* maps (function, local) to the corresponding node */
     pub non_fn_globals: HybridBitSet<Loc>, // set of global indexes of global variables
-    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>, // maps a global index to the corresponding local
+    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>, /* maps a global index to the corresponding local */
 }
 
 #[derive(Debug)]
