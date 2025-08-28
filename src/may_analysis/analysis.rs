@@ -128,11 +128,20 @@ pub type Solutions = IndexVec<Loc, HybridBitSet<Loc>>; // Send not implemented f
 
 #[derive(Debug)]
 pub struct AliasResults {
+    /// set of parameters that may alias each other
     pub aliases: FxHashMap<DefId, FxHashSet<Local>>,
+    /// maps a location to the set of parameters that may point to it
     pub inv_params: FxHashMap<DefId, FxHashMap<Loc, FxHashSet<Local>>>,
+    /// maps a Loc to its end Loc
     pub ends: IndexVec<Loc, Loc>,
+    /// maps a static item to the corresponding Loc
     pub globals: FxHashMap<LocalDefId, Loc>,
+    /// maps (function, local) to the corresponding node
+    pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
+    /// set of Locs of global variables
     pub non_fn_globals: HybridBitSet<Loc>,
+    /// maps a Loc to the corresponding local
+    pub index_locals: FxHashMap<DefId, FxHashMap<Loc, Local>>,
 }
 
 #[derive(Debug)]
@@ -560,7 +569,7 @@ fn collect_param_alias<'tcx>(
 // Computes the aliasing information for the function parameters
 pub fn compute_alias<'tcx>(
     pre: PreAnalysisData<'tcx>,
-    solutions: Solutions,
+    solutions: &Solutions,
     inputs_map: &FxHashMap<DefId, usize>,
     tcx: TyCtxt<'tcx>,
     check_global_alias: bool,
@@ -568,6 +577,7 @@ pub fn compute_alias<'tcx>(
 ) -> AliasResults {
     let mut aliases: FxHashMap<_, FxHashSet<Local>> = FxHashMap::default();
     let mut inv_params: FxHashMap<_, FxHashMap<_, FxHashSet<Local>>> = FxHashMap::default();
+    let mut index_locals: FxHashMap<_, FxHashMap<Loc, Local>> = FxHashMap::default();
     let non_fn_globals = pre.non_fn_globals.iter().fold(
         HybridBitSet::new_empty(pre.index_info.len()),
         |mut acc, g| {
@@ -581,6 +591,8 @@ pub fn compute_alias<'tcx>(
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut params = vec![];
         let mut locals = HybridBitSet::new_empty(pre.index_info.len());
+        let mut index_local = FxHashMap::default();
+
         // Aliases of the function parameters
         let mut fun_alias = FxHashSet::default();
         // Map of location to set of parameters that may point to the location
@@ -588,6 +600,8 @@ pub fn compute_alias<'tcx>(
 
         for (local, decl) in body.local_decls.iter_enumerated() {
             let g_index = pre.var_nodes[&(local_def_id, local)].index;
+            let g_index_end = pre.index_info.ends[g_index];
+            index_local.extend((g_index..=g_index_end).map(|loc| (loc, local)));
 
             if (1..=*inputs).contains(&local.index()) {
                 let ty = decl.ty;
@@ -606,15 +620,7 @@ pub fn compute_alias<'tcx>(
                 if fun_alias.len() == params.len() {
                     break;
                 }
-                collect_param_alias(
-                    &pre,
-                    &solutions,
-                    &locals,
-                    args,
-                    &params,
-                    &mut fun_alias,
-                    tcx,
-                )
+                collect_param_alias(&pre, solutions, &locals, args, &params, &mut fun_alias, tcx)
             }
         }
 
@@ -634,6 +640,7 @@ pub fn compute_alias<'tcx>(
 
         aliases.insert(*def_id, fun_alias);
         inv_params.insert(*def_id, inv_param);
+        index_locals.insert(*def_id, index_local);
     }
 
     AliasResults {
@@ -641,7 +648,9 @@ pub fn compute_alias<'tcx>(
         inv_params,
         ends: pre.index_info.ends,
         globals: pre.globals,
+        var_nodes: pre.var_nodes,
         non_fn_globals,
+        index_locals,
     }
 }
 

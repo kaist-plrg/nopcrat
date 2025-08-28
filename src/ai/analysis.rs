@@ -43,7 +43,8 @@ use crate::{
     graph,
     may_analysis::{
         self,
-        analysis::{AliasResults, Loc},
+        analysis::{AliasResults, Loc, LocNode, Solutions},
+        bitset::HybridBitSet,
     },
 };
 
@@ -131,19 +132,35 @@ enum Write {
 
 #[derive(Clone, Debug)]
 pub struct PreAnalysisContext<'a> {
+    /// the function being analyzed
     pub local_def_id: LocalDefId,
+    /// set of parameters that may alias each other
     pub alias: &'a FxHashSet<Local>,
+    /// a location to the set of parameters that may point to it
     pub inv_param: &'a FxHashMap<Loc, FxHashSet<Local>>,
+    /// maps a Loc to its end Loc
     pub ends: &'a IndexVec<Loc, Loc>,
+    // maps a Loc to the corresponding local in the function
+    pub index_local_map: &'a FxHashMap<Loc, Local>,
+    /// set of Locs of global variables
+    pub globals: &'a HybridBitSet<Loc>,
+    /// the solutions of the may-points-to analysis
+    pub solutions: &'a Solutions,
+    /// maps (function, local) to the corresponding node
+    pub var_nodes: &'a FxHashMap<(LocalDefId, Local), LocNode>,
 }
 
 impl<'a> PreAnalysisContext<'a> {
-    fn new(def_id: DefId, pre_data: &'a AliasResults) -> Self {
+    fn new(def_id: DefId, pre_data: &'a AliasResults, solutions: &'a Solutions) -> Self {
         Self {
             local_def_id: def_id.as_local().unwrap(),
             alias: pre_data.aliases.get(&def_id).unwrap(),
             inv_param: pre_data.inv_params.get(&def_id).unwrap(),
             ends: &pre_data.ends,
+            index_local_map: pre_data.index_locals.get(&def_id).unwrap(),
+            globals: &pre_data.non_fn_globals,
+            var_nodes: &pre_data.var_nodes,
+            solutions,
         }
     }
 
@@ -185,6 +202,7 @@ pub fn analyze(
     }
     let (graph, elems) = graph::compute_sccs(&call_graph);
     let inv_graph = graph::inverse(&graph);
+    let transitive = graph::reflexive_transitive_closure(&call_graph);
     let po: Vec<_> = graph::post_order(&graph, &inv_graph)
         .into_iter()
         .flatten()
@@ -220,33 +238,29 @@ pub fn analyze(
         })
         .collect();
 
-    let pre_data = if conf.check_global_alias || conf.check_param_alias {
-        let arena = Arena::new();
-        let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
-        let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
-        let solutions = if let Some(path) = &conf.use_sol {
-            let arr = std::fs::read(path).unwrap();
-            may_analysis::analysis::deserialize_solutions(&arr)
-        } else {
-            may_analysis::analysis::analyze(&pre, &tss, tcx)
-        };
-
-        if let Some(path) = &conf.dump_sol {
-            let arr = may_analysis::analysis::serialize_solutions(&solutions);
-            std::fs::write(path, arr).unwrap();
-        }
-
-        Some(may_analysis::analysis::compute_alias(
-            pre,
-            solutions,
-            &inputs_map,
-            tcx,
-            conf.check_global_alias,
-            conf.check_param_alias,
-        ))
+    let arena = Arena::new();
+    let tss = may_analysis::ty_shape::get_ty_shapes(&arena, tcx);
+    let pre = may_analysis::analysis::pre_analyze(&tss, tcx);
+    let solutions = if let Some(path) = &conf.use_sol {
+        let arr = std::fs::read(path).unwrap();
+        may_analysis::analysis::deserialize_solutions(&arr)
     } else {
-        None
+        may_analysis::analysis::analyze(&pre, &tss, tcx)
     };
+
+    if let Some(path) = &conf.dump_sol {
+        let arr = may_analysis::analysis::serialize_solutions(&solutions);
+        std::fs::write(path, arr).unwrap();
+    }
+
+    let pre_data = may_analysis::analysis::compute_alias(
+        pre,
+        &solutions,
+        &inputs_map,
+        tcx,
+        conf.check_global_alias,
+        conf.check_param_alias,
+    );
 
     let mut ptr_params_map = FxHashMap::default();
     let mut ptr_params_inv_map = FxHashMap::default();
@@ -283,9 +297,7 @@ pub fn analyze(
             for def_id in def_ids {
                 let start = std::time::Instant::now();
 
-                let pre_context = pre_data
-                    .as_ref()
-                    .map(|pre_data| PreAnalysisContext::new(*def_id, pre_data));
+                let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
 
                 let mut analyzer =
                     Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
@@ -303,6 +315,7 @@ pub fn analyze(
                     writes_map,
                     init_state,
                     call_info_map,
+                    is_merged,
                 } = analyzer.analyze_body(body);
                 if conf.print_functions.contains(&tcx.def_path_str(def_id)) {
                     tracing::info!(
@@ -312,25 +325,53 @@ pub fn analyze(
                     );
                 }
 
-                let mut nullable_params =
-                    analyzer.find_nullable_params(tcx, &states, body, &writes_map, &call_info_map);
+                let ret_location = return_location(body);
 
-                if conf.check_global_alias {
-                    let alias_params = analyzer.check_reachable_globals(
+                let mut return_states = ret_location
+                    .and_then(|ret| states.get(&ret))
+                    .cloned()
+                    .unwrap_or_default();
+
+                // If there is a merged block, always check all parameters
+                let (candidates, nonnull_params) = if is_merged {
+                    (
+                        (1..=(analyzer.info.inputs))
+                            .map(Local::from_usize)
+                            .collect::<BTreeSet<Local>>(),
+                        BTreeSet::new(),
+                    )
+                } else {
+                    // If not, we filter the parameters which are implicity non-null
+                    analyzer.get_nullable_candidates(&return_states)
+                };
+
+                let nullable_params = analyzer.find_nullable_params(
+                    tcx,
+                    &states,
+                    body,
+                    &writes_map,
+                    &call_info_map,
+                    candidates,
+                );
+
+                let alias_params = if conf.check_global_alias {
+                    analyzer.check_reachable_globals(
                         &info_map,
-                        &pre_data.as_ref().unwrap().globals,
-                        *def_id,
-                        &call_graph,
-                    );
-                    nullable_params.extend(alias_params);
-                }
+                        &pre_data.globals,
+                        transitive.get(def_id).unwrap(),
+                    )
+                } else {
+                    BTreeSet::new()
+                };
 
-                let exclude_paths: Vec<_> = nullable_params
+                let null_exclude_paths: Vec<_> = nullable_params
                     .iter()
                     .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
                     .collect();
-
-                let ret_location = return_location(body);
+                let alias_exclude_paths: Vec<_> = alias_params
+                    .iter()
+                    .flat_map(|p| analyzer.expands_path(&AbsPath::new(*p, vec![])))
+                    .collect();
 
                 let mut wbr = vec![];
                 let mut bb_must = BTreeMap::new();
@@ -387,15 +428,30 @@ pub fn analyze(
                 bb_musts.insert(*def_id, bb_must);
                 is_units.insert(*def_id, stack.is_empty());
 
-                let mut return_states = ret_location
-                    .and_then(|ret| states.get(&ret))
-                    .cloned()
-                    .unwrap_or_default();
+                // Handle unremovable parameters
                 for st in return_states.values_mut() {
                     st.writes.remove(&nullable_params);
-                    st.add_excludes(exclude_paths.iter().cloned());
+                    st.writes.remove(&alias_params);
+
+                    st.add_excludes(alias_exclude_paths.iter().cloned());
+                    st.add_null_excludes(null_exclude_paths.iter().cloned());
+
+                    st.null_excludes.remove(&nonnull_params);
                 }
-                let summary = FunctionSummary::new(init_state, return_states);
+
+                let mut has_side_effects = call_info_map.values().flatten().any(|kind| {
+                    matches!(
+                        kind,
+                        CallKind::TOP
+                            | CallKind::RustEffect(_)
+                            | CallKind::CEffect
+                            | CallKind::IntraEffect
+                    )
+                });
+
+                has_side_effects = has_side_effects || analyzer.check_global_writes();
+
+                let summary = FunctionSummary::new(init_state, return_states, has_side_effects);
                 results.insert(*def_id, states);
                 ptr_params_map.insert(*def_id, analyzer.ptr_params);
                 ptr_params_inv_map.insert(*def_id, analyzer.ptr_params_inv);
@@ -417,9 +473,7 @@ pub fn analyze(
 
             if !need_rerun {
                 for def_id in def_ids {
-                    let pre_context = pre_data
-                        .as_ref()
-                        .map(|pre_data| PreAnalysisContext::new(*def_id, pre_data));
+                    let pre_context = PreAnalysisContext::new(*def_id, &pre_data, &solutions);
                     let mut analyzer =
                         Analyzer::new(tcx, &info_map[def_id], conf, &summaries, pre_context);
                     analyzer.ptr_params = ptr_params_map.remove(def_id).unwrap();
@@ -589,7 +643,9 @@ pub struct Analyzer<'a, 'tcx> {
     pub ptr_params: IndexVec<ArgIdx, Local>,
     pub ptr_params_inv: FxHashMap<Local, ArgIdx>,
     pub call_args: BTreeMap<Location, BTreeMap<usize, usize>>,
-    pub pre_context: Option<PreAnalysisContext<'a>>,
+    pub pre_context: PreAnalysisContext<'a>,
+    pub indirect_assigns: BTreeSet<Local>,
+    pub is_merged: bool,
 }
 
 struct AnalyzedBody {
@@ -597,6 +653,7 @@ struct AnalyzedBody {
     writes_map: BTreeMap<Location, BTreeSet<AbsPath>>,
     init_state: AbsState,
     call_info_map: BTreeMap<Location, Vec<CallKind>>,
+    is_merged: bool,
 }
 
 enum StatementCheck {
@@ -611,7 +668,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         info: &'a FuncInfo,
         conf: &'a AnalysisConfig,
         summaries: &'a FxHashMap<DefId, FunctionSummary>,
-        pre_context: Option<PreAnalysisContext<'a>>,
+        pre_context: PreAnalysisContext<'a>,
     ) -> Self {
         Self {
             tcx,
@@ -622,6 +679,8 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             ptr_params_inv: FxHashMap::default(),
             call_args: BTreeMap::new(),
             pre_context,
+            indirect_assigns: BTreeSet::new(),
+            is_merged: false,
         }
     }
 
@@ -701,6 +760,22 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         true
     }
 
+    fn check_indirect_pure(&self, local: Local, local_writes: &mut BTreeSet<Local>) -> bool {
+        let var_nodes = self.pre_context.var_nodes;
+        let loc = var_nodes[&(self.pre_context.local_def_id, local)].index;
+
+        if self.check_may_points_global(loc) {
+            return false;
+        }
+
+        let sol = self.pre_context.solutions[loc].clone();
+        local_writes.extend(
+            sol.iter()
+                .flat_map(|loc| self.pre_context.index_local_map.get(&loc)),
+        );
+        true
+    }
+
     fn check_terminator_pure(
         &self,
         loc: &Location,
@@ -712,20 +787,33 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         match &term.kind {
             TerminatorKind::Call { destination, .. } => {
                 let call_info = call_info_map.get(loc).unwrap();
-                // check the destination of call
                 if destination.local == Local::ZERO {
                     return false;
                 }
-                if destination.local != param || !destination.is_indirect_first_projection() {
+
+                let is_indirection = destination.is_indirect_first_projection();
+
+                if is_indirection
+                    && destination.local != param
+                    && !self.check_indirect_pure(destination.local, local_writes)
+                {
+                    return false;
+                }
+
+                if !is_indirection {
                     local_writes.insert(destination.local);
                 }
 
                 // check the writes of callee
                 call_info.iter().all(|kind| match kind {
-                    CallKind::Method | CallKind::RustPure => true,
-                    CallKind::C | CallKind::TOP | CallKind::RustEffect(None) | CallKind::Intra => {
-                        false
-                    }
+                    CallKind::Method
+                    | CallKind::RustPure
+                    | CallKind::CPure
+                    | CallKind::IntraPure => true,
+                    CallKind::CEffect
+                    | CallKind::TOP
+                    | CallKind::RustEffect(None)
+                    | CallKind::IntraEffect => false,
                     CallKind::RustEffect(Some(bases)) => {
                         bases.iter().all(|p| match p {
                             AbsBase::Local(idx) => {
@@ -746,18 +834,23 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 
     fn check_assign_pure(
         &self,
-        locs: &mut BTreeSet<Local>,
+        local_writes: &mut BTreeSet<Local>,
         param: Local,
         stmt: &StatementKind<'_>,
     ) -> bool {
         if let StatementKind::Assign(box (place, _)) = stmt {
-            if place.local == param && place.is_indirect_first_projection() {
-                return true;
-            }
-            if place.local == Local::ZERO {
+            let local = place.local;
+            if local == Local::ZERO {
                 return false;
             }
-            locs.insert(place.local);
+            if place.is_indirect_first_projection() {
+                if local == param {
+                    return true;
+                }
+                return self.check_indirect_pure(local, local_writes);
+            }
+
+            local_writes.insert(place.local);
             true
         } else {
             unreachable!("{:?}", stmt)
@@ -768,11 +861,11 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
     fn compute_nonnull_null_locs(
         &self,
         result: &BTreeMap<Location, BTreeMap<(MustPathSet, AbsNulls), AbsState>>,
-    ) -> Vec<(BTreeSet<Location>, BTreeSet<Location>)> {
-        let inputs = self.info.inputs;
+        candidates: BTreeSet<Local>,
+    ) -> Vec<(Local, BTreeSet<Location>, BTreeSet<Location>)> {
         let mut locs = vec![];
 
-        for i in 1..=inputs {
+        for l in candidates {
             let mut nonnull_locs = BTreeSet::new();
             let mut null_locs = BTreeSet::new();
             // collection of locations except non-null or null
@@ -780,7 +873,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let mut non_null_locs = BTreeSet::new();
             for (loc, sts) in result {
                 for (_, nulls) in sts.keys() {
-                    if let Some(arg) = self.ptr_params_inv.get(&Local::from_usize(i)) {
+                    if let Some(arg) = self.ptr_params_inv.get(&l) {
                         match nulls.get(*arg) {
                             AbsNull::Null => {
                                 null_locs.insert(*loc);
@@ -804,7 +897,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
                 .cloned()
                 .collect();
             let null_locs = null_locs.difference(&non_null_locs).cloned().collect();
-            locs.push((nonnull_locs, null_locs));
+            locs.push((l, nonnull_locs, null_locs));
         }
         locs
     }
@@ -819,16 +912,15 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         body: &Body<'tcx>,
         writes_map: &BTreeMap<Location, BTreeSet<AbsPath>>,
         call_info_map: &BTreeMap<Location, Vec<CallKind>>,
+        candidates: BTreeSet<Local>,
     ) -> BTreeSet<Local> {
-        self.compute_nonnull_null_locs(result)
+        self.compute_nonnull_null_locs(result, candidates)
             .into_iter()
-            .enumerate()
-            .filter_map(|(i, (nonnull, null))| {
+            .filter_map(|(param, nonnull, null)| {
                 if null.is_empty() && nonnull.is_empty() {
                     return None;
                 }
 
-                let param = Local::from_usize(i + 1);
                 let nonnull_diff = nonnull.iter().fold(
                     BTreeMap::new(),
                     |mut acc: BTreeMap<BasicBlock, BTreeSet<Location>>, loc| {
@@ -886,46 +978,82 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .collect::<BTreeSet<_>>()
     }
 
+    // We consider a parameter p is implicitly non-null if every execution either:
+    // 1. effectively writes to the parameter when p -> Top
+    // 2. does not write to the parameter and p -> Top (no null check)
+    fn get_nullable_candidates(
+        &self,
+        return_states: &BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+    ) -> (BTreeSet<Local>, BTreeSet<Local>) {
+        let mut candidates = BTreeSet::new();
+        let mut nonnull_params = BTreeSet::new();
+        for i in 1..=(self.info.inputs) {
+            let l = Local::from_usize(i);
+            let Some(arg) = self.ptr_params_inv.get(&l) else {
+                continue;
+            };
+
+            if return_states.values().all(|st| {
+                let writes = st.writes.iter().map(|p| p.base).collect::<FxHashSet<_>>();
+                (!writes.contains(&l) && st.nulls.is_top(*arg))
+                    || (writes.contains(&l) && st.nonnulls.contains(l))
+            }) {
+                nonnull_params.insert(l);
+            } else {
+                candidates.insert(l);
+            }
+        }
+        (candidates, nonnull_params)
+    }
+
     // Check if the global variables that is reachable from the function
     // is an alias of the function parameters
     fn check_reachable_globals(
         &self,
         info_map: &FxHashMap<DefId, FuncInfo>,
         globals: &FxHashMap<LocalDefId, Loc>,
-        initial_id: DefId,
-        call_graph: &FxHashMap<DefId, FxHashSet<DefId>>,
+        reachables: &FxHashSet<DefId>,
     ) -> BTreeSet<Local> {
         let mut indexes = FxHashSet::default();
-        let mut visited = FxHashSet::default();
-        let mut stack = vec![initial_id];
-        let pre_context = self.pre_context.as_ref().unwrap();
 
-        while let Some(callee) = stack.pop() {
-            if !visited.insert(callee) {
-                continue;
-            }
-
-            let globals = info_map[&callee]
+        for reachable in reachables {
+            let globals = info_map[reachable]
                 .globals
                 .iter()
                 .filter_map(|def_id| {
                     let local_id = def_id.as_local()?;
                     let start = globals.get(&local_id).copied()?;
-                    let end = pre_context.ends[start];
+                    let end = self.pre_context.ends[start];
                     Some(start..=end)
                 })
                 .flatten();
             indexes.extend(globals);
-
-            if let Some(callees) = call_graph.get(&callee) {
-                stack.extend(callees.iter());
-            }
         }
 
         indexes
             .into_iter()
-            .flat_map(|index| pre_context.check_index_global(index))
+            .flat_map(|index| self.pre_context.check_index_global(index))
             .collect()
+    }
+
+    fn check_may_points_global(&self, loc: Loc) -> bool {
+        let mut sol = self.pre_context.solutions[loc].clone();
+        sol.intersect(self.pre_context.globals);
+
+        if !sol.is_empty() {
+            return true;
+        }
+        false
+    }
+
+    fn check_global_writes(&self) -> bool {
+        self.indirect_assigns.iter().any(|local| {
+            let var_nodes = self.pre_context.var_nodes;
+            // We only check start since the local is a pointer
+            // If the local is the first parameter of the function, ends[loc] may not be the same as start
+            let start = var_nodes[&(self.pre_context.local_def_id, *local)].index;
+            self.check_may_points_global(start)
+        })
     }
 
     fn find_output_params(
@@ -944,6 +1072,12 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             .flat_map(|st| st.reads.as_set())
             .map(|p| p.base)
             .collect();
+        let null_excludes: BTreeSet<_> = summary
+            .return_states
+            .values()
+            .flat_map(|st| st.null_excludes.as_set())
+            .map(|p| p.base)
+            .collect();
         let excludes: BTreeSet<_> = summary
             .return_states
             .values()
@@ -957,6 +1091,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             let i = Local::from_usize(i);
             if reads.contains(&i)
                 || excludes.contains(&i)
+                || null_excludes.contains(&i)
                 || return_ptrs.contains(&i)
                 || self.info.param_tys[i] == TypeInfo::Union
             {
@@ -1125,6 +1260,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         let mut start_state = AbsState::bot();
         start_state.writes = MustPathSet::top();
         start_state.nulls = AbsNulls::bot();
+        start_state.nonnulls = MustLocalSet::top();
 
         for i in 1..=self.info.inputs {
             let local = Local::from_usize(i);
@@ -1143,8 +1279,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         }
 
         if self.conf.check_param_alias {
-            let pre_context = self.pre_context.as_ref().unwrap();
-            for a in pre_context.alias {
+            for a in self.pre_context.alias {
                 start_state.excludes.insert(AbsPath::new(*a, vec![]));
             }
         }
@@ -1171,6 +1306,9 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
         };
 
         let (states, writes_map, call_info_map) = 'analysis_loop: loop {
+            if !merging_blocks.is_empty() {
+                self.is_merged = true;
+            }
             let mut work_list = WorkList::new(&self.info.rpo_map);
             work_list.push(start_label.clone());
 
@@ -1316,6 +1454,7 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
             writes_map,
             init_state,
             call_info_map,
+            is_merged: self.is_merged,
         }
     }
 
@@ -1336,16 +1475,19 @@ impl<'a, 'tcx> Analyzer<'a, 'tcx> {
 pub struct FunctionSummary {
     pub init_state: AbsState,
     pub return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+    pub has_side_effects: bool,
 }
 
 impl FunctionSummary {
     fn new(
         init_state: AbsState,
         return_states: BTreeMap<(MustPathSet, AbsNulls), AbsState>,
+        has_side_effects: bool,
     ) -> Self {
         Self {
             init_state,
             return_states,
+            has_side_effects,
         }
     }
 
@@ -1353,6 +1495,7 @@ impl FunctionSummary {
         Self {
             init_state: AbsState::bot(),
             return_states: BTreeMap::new(),
+            has_side_effects: false,
         }
     }
 
@@ -1375,15 +1518,18 @@ impl FunctionSummary {
                 (k, v)
             })
             .collect();
-        Self::new(init_state, return_states)
+        let has_side_effects = self.has_side_effects || other.has_side_effects;
+        Self::new(init_state, return_states, has_side_effects)
     }
 
     fn ord(&self, other: &Self) -> bool {
-        self.init_state.ord(&other.init_state) && {
-            self.return_states
-                .iter()
-                .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
-        }
+        self.init_state.ord(&other.init_state)
+            && {
+                self.return_states
+                    .iter()
+                    .all(|(k, v)| other.return_states.get(k).is_some_and(|w| v.ord(w)))
+            }
+            && self.has_side_effects == other.has_side_effects
     }
 }
 

@@ -2,15 +2,27 @@ use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::Idx;
 
-pub fn transitive_closure<T: Idx + std::hash::Hash>(
+pub fn transitive_closure<T: Clone + Eq + std::hash::Hash>(
     graph: &FxHashMap<T, FxHashSet<T>>,
 ) -> FxHashMap<T, FxHashSet<T>> {
-    let len = graph.len();
+    for succs in graph.values() {
+        for succ in succs {
+            assert!(graph.contains_key(succ));
+        }
+    }
+    let id_to_v: Vec<_> = graph.keys().cloned().collect();
+    let v_to_id: FxHashMap<_, _> = id_to_v
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(k, v)| (v, k))
+        .collect();
+    let len = id_to_v.len();
 
     let mut reachability = vec![vec![false; len]; len];
     for (v, succs) in graph.iter() {
         for succ in succs {
-            reachability[v.index()][succ.index()] = true;
+            reachability[v_to_id[v]][v_to_id[succ]] = true;
         }
     }
 
@@ -30,13 +42,23 @@ pub fn transitive_closure<T: Idx + std::hash::Hash>(
             .enumerate()
             .filter_map(|(to, is_reachable)| {
                 if *is_reachable {
-                    Some(T::new(to))
+                    Some(id_to_v[to].clone())
                 } else {
                     None
                 }
             })
             .collect();
-        new_graph.insert(T::new(i), neighbors);
+        new_graph.insert(id_to_v[i].clone(), neighbors);
+    }
+    new_graph
+}
+
+pub fn reflexive_transitive_closure<T: Clone + Eq + std::hash::Hash>(
+    graph: &FxHashMap<T, FxHashSet<T>>,
+) -> FxHashMap<T, FxHashSet<T>> {
+    let mut new_graph = transitive_closure(graph);
+    for v in graph.keys() {
+        new_graph.get_mut(v).unwrap().insert(v.clone());
     }
     new_graph
 }

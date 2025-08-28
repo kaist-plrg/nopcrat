@@ -26,11 +26,13 @@ pub struct TransferedTerminator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallKind {
-    Intra,
+    IntraEffect,
+    IntraPure,
     Method,
     RustEffect(Option<Vec<AbsBase>>),
     RustPure,
-    C,
+    CEffect,
+    CPure,
     TOP,
 }
 
@@ -69,7 +71,7 @@ impl TransferedTerminator {
 #[allow(clippy::only_used_in_recursion)]
 impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     pub fn transfer_statement(
-        &self,
+        &mut self,
         stmt: &Statement<'tcx>,
         state: &AbsState,
     ) -> (AbsState, BTreeSet<AbsPath>) {
@@ -78,7 +80,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             let (mut new_state, writes) = self.assign(place, new_v, state);
             new_state.add_excludes(cmps.into_iter());
             new_state.add_reads(reads.into_iter());
-            let writes = new_state.add_writes(writes.into_iter());
+            let (writes, nonnulls) = new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+            if !self.is_merged {
+                new_state.add_nonnulls(nonnulls.into_iter());
+            }
             (new_state, writes)
         } else {
             (state.clone(), BTreeSet::new())
@@ -184,7 +189,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                         .flat_map(|arg| self.get_read_paths_of_ptr(&arg.ptrv, &[]));
                     reads.extend(reads2);
                     new_state.add_reads(reads.into_iter());
-                    let writes = new_state.add_writes(writes.into_iter());
+                    let (writes, nonnulls) =
+                        new_state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+                    if !self.is_merged {
+                        new_state.add_nonnulls(nonnulls.into_iter());
+                    }
                     for arg in &args {
                         self.indirect_assign(&arg.ptrv, &AbsValue::top(), &[], &mut new_state);
                     }
@@ -238,11 +247,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 return self
                     .transfer_intra_call(callee, summary, args, dst, state, location, reads);
             } else if name.contains("{extern#0}") {
-                (
-                    vec![self.transfer_c_call(callee, args, &mut state, &mut reads)],
-                    vec![],
-                    CallKind::C,
-                )
+                self.transfer_c_call(callee, args, &mut state, &mut reads)
             } else if name.contains("{impl#") {
                 (
                     vec![self.transfer_method_call(callee, args, &mut reads)],
@@ -268,7 +273,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 let (mut new_state, writes_ret) = self.assign(dst, v, &state);
                 new_state.add_excludes(offsets.iter().cloned());
                 new_state.add_reads(reads.iter().cloned());
-                let writes = new_state.add_writes(writes.iter().cloned().chain(writes_ret));
+                let (writes, nonnulls) = new_state.add_writes(
+                    writes.iter().cloned().chain(writes_ret),
+                    &self.ptr_params_inv,
+                );
+                if !self.is_merged {
+                    new_state.add_nonnulls(nonnulls.into_iter());
+                }
                 (new_state, writes)
             })
             .unzip();
@@ -301,8 +312,13 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         location: Location,
         mut reads: Vec<AbsPath>,
     ) -> (Vec<AbsState>, BTreeSet<AbsPath>, CallKind) {
+        let call_kind = if summary.has_side_effects {
+            CallKind::IntraEffect
+        } else {
+            CallKind::IntraPure
+        };
         if summary.return_states.is_empty() {
-            return (vec![], BTreeSet::new(), CallKind::Intra);
+            return (vec![], BTreeSet::new(), call_kind);
         }
 
         let mut ptr_maps = BTreeMap::new();
@@ -330,6 +346,11 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             }
             let ret_v = ret_v.subst(&ptr_maps);
             let (mut state, writes) = self.assign(dst, ret_v, &state);
+            let callee_null_excludes: Vec<_> = return_state
+                .null_excludes
+                .iter()
+                .flat_map(|exclude| self.get_caller_path(exclude, args))
+                .collect();
             let callee_excludes: Vec<_> = return_state
                 .excludes
                 .iter()
@@ -341,6 +362,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 .flat_map(|read| self.get_caller_path(read, args))
                 .collect();
             let mut callee_writes = vec![];
+            let mut callee_nonnulls = BTreeSet::new();
             for write in return_state.writes.iter() {
                 let idx = write.base.index() - 1;
                 let AbsPtr::Set(ptrs) = &args[idx].ptrv else {
@@ -355,6 +377,10 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                 if array_access {
                     continue;
                 }
+                if return_state.nonnulls.contains(write.base) {
+                    callee_nonnulls.insert(path.base);
+                }
+
                 path.projections.extend(write.projections.clone());
                 callee_writes.push(path.clone());
                 self.call_args
@@ -363,13 +389,23 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
                     .insert(path.base.index() - 1, idx);
             }
             state.add_excludes(callee_excludes.into_iter());
+            state.add_null_excludes(callee_null_excludes.into_iter());
             state.add_reads(reads.clone().into_iter());
             state.add_reads(callee_reads.into_iter());
-            let writes = state.add_writes(callee_writes.into_iter().chain(writes));
-            ret_writes.extend(writes);
+
+            let (callee_writes, callee_nonnull_cands) =
+                state.add_writes(callee_writes.into_iter(), &self.ptr_params_inv);
+            let (writes, nonnulls) = state.add_writes(writes.into_iter(), &self.ptr_params_inv);
+
+            if !self.is_merged {
+                state.add_nonnulls(nonnulls.into_iter());
+                state.add_nonnulls(callee_nonnull_cands.intersection(&callee_nonnulls).cloned());
+            }
+
+            ret_writes.extend(callee_writes.into_iter().chain(writes));
             states.push(state)
         }
-        (states, ret_writes, CallKind::Intra)
+        (states, ret_writes, call_kind)
     }
 
     fn transfer_method_call(
@@ -417,7 +453,23 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         args: &[AbsValue],
         state: &mut AbsState,
         reads: &mut Vec<AbsPath>,
-    ) -> AbsValue {
+    ) -> (Vec<AbsValue>, Vec<(Local, ArgIdx, AbsNull)>, CallKind) {
+        let name = self.def_id_to_string(callee);
+        let mut segs: Vec<_> = name.split("::").collect();
+        let segs0 = segs.pop().unwrap_or_default();
+
+        let call_kind = match segs0 {
+            "__ctype_toupper_loc"
+            | "towlower"
+            | "towupper"
+            | "gettimeofday"
+            | "strlen"
+            | "strspn"
+            | "strerror"
+            | "__errno_location" => CallKind::CPure,
+            _ => CallKind::CEffect,
+        };
+
         let sig = self.tcx.fn_sig(callee).skip_binder();
         let inputs = sig.inputs().skip_binder();
         let output = sig.output().skip_binder();
@@ -457,13 +509,15 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
             self.indirect_assign(&args[arg].ptrv, &AbsValue::top(), &[], state);
         }
 
-        if output.is_primitive() || output.is_unit() || output.is_never() {
+        let v = if output.is_primitive() || output.is_unit() || output.is_never() {
             self.top_value_of_ty(&output)
         } else if output.is_raw_ptr() {
             AbsValue::heap_or_null()
         } else {
             AbsValue::top()
-        }
+        };
+
+        (vec![v], vec![], call_kind)
     }
 
     fn transfer_rust_call(
@@ -1168,7 +1222,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
     }
 
     fn assign(
-        &self,
+        &mut self,
         place: &Place<'tcx>,
         new_v: AbsValue,
         state: &AbsState,
@@ -1177,6 +1231,7 @@ impl<'tcx> super::analysis::Analyzer<'_, 'tcx> {
         let writes = if place.is_indirect_first_projection() {
             let projection = self.abstract_projection(&place.projection[1..], state);
             let ptr = state.local.get(place.local);
+            self.indirect_assigns.insert(place.local);
             self.indirect_assign(&ptr.ptrv, &new_v, &projection, &mut new_state);
             self.get_write_paths_of_ptr(&ptr.ptrv, &projection)
         } else {
