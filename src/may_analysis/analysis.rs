@@ -584,7 +584,7 @@ pub fn compute_alias<'tcx>(
         let local_def_id = some_or!(def_id.as_local(), continue);
         let mut params = vec![];
         let mut locals = HybridBitSet::new_empty(pre.index_info.len());
-        let mut locals_index = FxHashMap::default();
+        let mut index_local = FxHashMap::default();
 
         // Aliases of the function parameters
         let mut fun_alias = FxHashSet::default();
@@ -594,7 +594,7 @@ pub fn compute_alias<'tcx>(
         for (local, decl) in body.local_decls.iter_enumerated() {
             let g_index = pre.var_nodes[&(local_def_id, local)].index;
             let g_index_end = pre.index_info.ends[g_index];
-            locals_index.extend((g_index..=g_index_end).map(|loc| (loc, local)));
+            index_local.extend((g_index..=g_index_end).map(|loc| (loc, local)));
 
             if (1..=*inputs).contains(&local.index()) {
                 let ty = decl.ty;
@@ -633,7 +633,7 @@ pub fn compute_alias<'tcx>(
 
         aliases.insert(*def_id, fun_alias);
         inv_params.insert(*def_id, inv_param);
-        index_locals.insert(*def_id, locals_index);
+        index_locals.insert(*def_id, index_local);
     }
 
     AliasResults {
