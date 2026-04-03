@@ -759,12 +759,13 @@ fn as_int_lit(expr: &Expr<'_>) -> Option<u128> {
 
 fn get_parent(hir_id: HirId, tcx: TyCtxt<'_>) -> Option<&Expr<'_>> {
     let hir = tcx.hir();
-    let Node::Expr(e) = hir.find_parent(hir_id)? else {
-        return None;
-    };
-    match e.kind {
-        ExprKind::DropTemps(_) | ExprKind::Cast(_, _) => get_parent(e.hir_id, tcx),
-        _ => Some(e),
+    match hir.find_parent(hir_id)? {
+        Node::Expr(e) => match e.kind {
+            ExprKind::DropTemps(_) | ExprKind::Cast(_, _) => get_parent(e.hir_id, tcx),
+            _ => Some(e),
+        },
+        Node::Block(block) => get_parent(block.hir_id, tcx),
+        _ => None,
     }
 }
 
